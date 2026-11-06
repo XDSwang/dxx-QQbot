@@ -1,0 +1,83 @@
+【怎么跑】
+只用一个 Python 命令（Windows / 手机 Termux / QPython 完全一样）：
+    python qq_bot.py
+没有任何 .bat / .sh 启动脚本，没有 set / export 之类命令，也不用改代码。
+
+【怎么改设置 · 先看这段】
+配置分两份：
+  - python/config.txt 是【纯净模板】：不含任何凭证，会上传 GitHub，别在里面填密钥。
+  - python/data/config.txt 才是【真正生效】的：把模板复制一份到 data/ 下
+    （文件名仍是 config.txt，没有 data/ 文件夹就自己建一个），
+    再用记事本填 WM_QQ_APPID / WM_QQ_SECRET。程序只读 data/config.txt，
+    只改模板不会生效。
+  - data/groups.txt 也在 data/ 下，自己新建，每行一个 group_openid；
+    不建也行 = 默认不监控任何群（私聊照常可用）。
+  - 项目根目录 .gitignore 已排除整个 data/：密钥、群白名单、缓存、日志都不会上传。
+    别手动把 data/ 加进版本控制。
+改完保存 → 重跑 python qq_bot.py 即生效。每一项都有中文注释，常用的就这几项：
+    WM_CACHE_MINUTES = 60       # 缓存新鲜度（分钟），想改成 15 分钟就把 60 改成 15
+    WM_QQ_APPID / WM_QQ_SECRET  # q.qq.com 申请的机器人凭证（必填）
+    WM_QQ_BACKEND = official    # official 官方 / onebot 社区方案
+    WM_QQ_ALLOW_ALL_GROUPS = 0  # 正式运行必须是 0
+data/config.txt 含 AppSecret，别截图、别发群、别传网盘。
+
+【路径】
+整个文件夹拷到电脑 / 手机任意位置都能跑；路径全部基于 Python 文件自身目录解析，
+不写死盘符、不依赖当前工作目录、不出现 ../ 上层路径。数据都在同目录 data/ 下。
+
+# ---- 命令行查价 ----
+python wm.py "WM Boltor Prime"
+python wm.py "ZK Tigris"
+python wm.py "/报错 WM Boltor Prime"
+
+# ---- 缓存规则 ----
+# 只缓存用户实际查过的「类型:名称」，落在 data/cache.json；不预拉全站清单、不自启轮询。
+# 缓存新鲜度 = data/config.txt 的 WM_CACHE_MINUTES（单位分钟，默认 60）。
+# 用户发起查询时才判断：未超间隔直接回缓存（秒回）；超间隔（哪怕隔了几个月）
+#   → 先联网刷新缓存再回复，绝不把旧缓存发给用户。
+# 刷新失败：立即明确报错（不拿旧数据顶包），1/3/7 分钟重试交给后台线程继续，
+#   不让机器人假死 11 分钟；后台成功后自动写缓存，重发同一指令即可秒回。
+# 连不上 WM 时改 data/config.txt 的 WM_API_BASE（代理/镜像）、WM_HTTP_TIMEOUT（超时秒数）。
+# 每个 HTTP 请求（含订单列表）访问前都先过 3~5 秒同域名节流，mock 演示也真等、不可快进。
+# 名称 → slug：只按用户输入的这一个名称做少量候选探测，不拉全站清单。
+#   Boltor Prime 优先试 boltor_prime_set（WM 上挂订单的是套装/部件，boltor_prime 会 404）。
+#   命中的 slug 自动记进 data/slug.json（程序自己维护，不用手改），以后同物品只发 1 个请求。
+#   物品名写全（Boltor Prime Set / Boltor Prime Blueprint）可少发一次请求；需用标准英文名。
+#   每个候选请求仍各自走 3~5 秒节流；只有明确 404 才试下一个，超时/5xx 立即失败。
+#   全部候选 404 会提示改用完整名称，且不启动后台重试（重试也不会变）。
+
+# ---- 接入 QQ ----
+# 把 q.qq.com 申请的 appid / secret 填进 data/config.txt，然后 python qq_bot.py。
+# 群里必须【从 @ 列表点选机器人】后发：WM <物品名|中文名> / ZK <武器名> / 翻译 <名称> / /报错 WM <名称>
+#   WM 支持中文名（如 螺钉步枪，先翻英文再查价）；翻译 <名称> 只做名称中英对照
+#   （如 翻译 Boltor / 翻译 螺钉步枪），回复带「英文名 / 中文名」+ 两个 wiki 链接。
+#   首次发「翻译 同步」联网拉全量词库（约 3447 条），之后查询纯本地、不再联网。
+#   注意：wiki 正文（获取方式/锻造材料等）机器人抓不到，请点回复里的链接自己看。
+# 白名单 data/groups.txt 填 group_openid（字符串，不是 QQ 显示的数字群号）。
+# 备选 OneBot：把 data/config.txt 里 WM_QQ_BACKEND 改成 onebot、WM_QQ_MODE 改成 server、
+#   WM_QQ_URL 改成监听地址，保存后重跑即可。
+
+# ---- 抓群 openid（第一次接入某个群时）----
+# 方式一：data/config.txt 里 WM_QQ_ALLOW_ALL_GROUPS 临时改成 1，跑 python qq_bot.py
+# 方式二：直接跑 python qq_bot.py --allow-all-groups（不改配置文件）
+# 然后在群里从 @ 列表点选机器人发 WM Boltor Prime，
+# 打开 data/bot_flow.log 抄「群@消息 group_openid=...」后面那串，
+# 单独一行写进 data/groups.txt；关掉程序、开关改回 0、重跑 python qq_bot.py。
+# 白名单永远是纯手工填写，程序不会自动发现 / 自动写入 openid。
+
+【移到手机前】
+1. 先关掉电脑上还在跑的 python qq_bot.py：同一个 AppID 只能有一个在线连接，
+   两端同时开就会互相顶掉、群里收不到回复。
+2. data/config.txt 和 data/groups.txt 都不用改：凭证、群 openid 跟机器人 AppID 走，换设备不变。
+3. 整个文件夹拷过去即可；测试文件、__pycache__、bot_flow.log、
+   data/items_index.json（旧版全站索引残留）、data/cache.json.mockbak 不用带，代码都不读。
+4. 手机开自动校时；Termux 挂机先执行 termux-wake-lock，避免锁屏被杀掉长连接。
+5. 手机要能访问 api.bot.qq.com 和 api.warframe.market；群里发指令仍要从 @ 列表点选机器人。
+
+# ---- 离线测试（不连真实 QQ、不发 HTTP）----
+python test_config.py          # data/config.txt 解析 / 开关 / 路径 / 无启动脚本
+python test_cache_policy.py   # 缓存策略（含真等 3~5 秒的端到端刷新）
+python test_slug_resolution.py  # 名称→slug 候选、确定性 404、候选间真等 3~5 秒
+python test_official.py       # 官方对接 10 项
+python test_onebot.py         # OneBot 7 项
+python test_pace_guard.py     # 硬时间规则（3~5 秒节流不可规避）

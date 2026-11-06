@@ -1,0 +1,8 @@
+# 兜底规则：即使只把 python/ 这一层单独拷走 / 单独 git init，
+# 也不会把运行数据（含 AppSecret、群 openid、缓存、日志）带上去。
+# 项目根目录已有同名 .gitignore；这份是给「只上传 python 文件夹」的场景加保险。
+data/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
