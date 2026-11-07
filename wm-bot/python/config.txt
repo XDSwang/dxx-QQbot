@@ -164,6 +164,9 @@ WM_QQ_TOKEN =
 #   字体：默认自动找 微软雅黑 / 思源黑体 / Noto / 文泉驿；都找不到就自动退回纯文字。
 #   要指定字体（例如 Linux 服务器）：
 # WM_CARD_FONT = /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+#   ★ 跨平台提醒：这个路径必须和【运行设备】一致！在 Windows 上配的 C:\...\wqy.ttf
+#     同步到 Termux/手机端会失效（盘符/反斜杠在 Linux 上无效，自检会报 ⚠ 告警）。
+#     最省事：把字体直接丢进 python/fonts/（随 python/ 同步，自动识别，无需本项）。
 # 注意：渲染依赖 Pillow（pip install pillow）；没装 Pillow 时自动退回纯文字，不报错。
 #       发图失败（无权限 / 图片过大）同样退回纯文字。
 #

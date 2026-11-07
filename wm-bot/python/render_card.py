@@ -16,7 +16,9 @@ render_card.py — 把世界状态文本渲染成白底卡片图片（PNG）
 
 import os
 import re
+import sys
 import time
+import platform
 from pathlib import Path
 
 try:                                     # Pillow 是可选依赖，缺失时整个模块降级
@@ -65,18 +67,46 @@ _FONT_PAIRS = [
     ("DroidSansFallback.ttf", "DroidSansFallback.ttf"),
 ]
 
-_PREFIX = os.environ.get("PREFIX") or "/data/data/com.termux/files/usr"
-_FONT_DIRS = [
-    "C:/Windows/Fonts",
-    "/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/fonts/truetype",
-    "/System/Library/Fonts", "/Library/Fonts",
-    str(Path.home() / ".fonts"), str(Path.home() / ".local/share/fonts"),
-    str(Path(__file__).resolve().parent / "fonts"),   # 便携：字体丢在 python/fonts 下
-    # 手机端：Termux 的 $PREFIX 与 Android 系统字体目录
-    _PREFIX + "/share/fonts", _PREFIX + "/share/fonts/noto",
-    _PREFIX + "/etc/fonts", "/system/fonts", "/system/fonts/noto",
-    "/data/data/com.termux/files/usr/share/fonts",
-]
+# ------------------------------ 运行平台判断 ------------------------------
+# 跨平台核心：用 Python 标准库判定当前 OS，路径统一用 pathlib 自动适配分隔符，
+# 绝不在代码里写死 Windows 盘符、也不假定某一种分隔符（Windows \ / Termux / 古老 / 等）。
+_SYS = (platform.system() or "").lower()          # windows / linux / darwin / android ...
+_IS_TERMUX = bool(os.environ.get("TERMUX_VERSION")) \
+    or "/com.termux/" in (os.environ.get("PREFIX", "") or "") \
+    or Path("/data/data/com.termux").exists()
+_PREFIX = Path(os.environ.get("PREFIX") or "/data/data/com.termux/files/usr")
+
+
+def _system_font_dirs():
+    """按当前平台给出系统字体目录（字符串列表）。全部用 Path 拼，跨 Windows/Termux/Linux/macOS。
+
+    关键点：不同系统字体目录差异很大，绝不能把所有目录堆在一起后靠 Path 容错——
+    例如在手机端列出 Windows 盘符路径虽不报错但永不可达；这里按 _SYS 精确分支。
+    """
+    home = Path.home()
+    if "windows" in _SYS:
+        return [str(Path("C:/Windows/Fonts")),
+                str(home / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts")]
+    if "darwin" in _SYS:
+        return [str(Path("/System/Library/Fonts")),
+                str(Path("/Library/Fonts")),
+                str(home / "Library" / "Fonts")]
+    # Linux / Android / Termux / 其它 POSIX
+    dirs = [str(Path("/usr/share/fonts")),
+            str(Path("/usr/local/share/fonts")),
+            str(Path("/usr/share/fonts/truetype")),
+            str(home / ".fonts"),
+            str(home / ".local" / "share" / "fonts")]
+    if _IS_TERMUX:
+        dirs += [str(_PREFIX / "share" / "fonts"),
+                 str(_PREFIX / "share" / "fonts" / "noto"),
+                 str(_PREFIX / "etc" / "fonts")]
+    dirs += [str(Path("/system/fonts")), str(Path("/system/fonts/noto"))]
+    return dirs
+
+
+# 系统字体目录（按平台自动选）；便携的 python/fonts 由 _portable_font_dirs 单独处理
+_FONT_DIRS = _system_font_dirs()
 
 _font_cache = {}
 _font_ready = None      # None=还没探测；False=没有可用中文字体
@@ -92,11 +122,35 @@ def _portable_font_dirs():
     ]
 
 
+_env_font_warn = ""   # 跨平台路径告警（Windows 盘符路径误用在手机端时填充），供 diagnose 显示
+
+
+def _env_font_path(key):
+    """读 WM_CARD_FONT / WM_CARD_FONT_BOLD 并规整。
+
+    若在非 Windows 平台发现 Windows 风格盘符（如 `C:\\...` 或 `C:/...`）或反斜杠路径，
+    记下告警——这种路径在 Termux/Android 上必然找不到，多半是 PC 上配的路径被同步到了手机。
+    """
+    global _env_font_warn
+    raw = os.environ.get(key)
+    if not raw:
+        return None
+    low = raw.replace("\\", "/").lower()
+    if "windows" not in _SYS and (len(raw) > 1 and raw[1:2] == ":"
+                                  or "\\" in raw or low.startswith("c:/")
+                                  or low.startswith("d:/") or low.startswith("e:/")):
+        _env_font_warn = ("WM_CARD_FONT 含 Windows 风格路径「%s」，但当前是 %s 平台，"
+                          "盘符/反斜杠在手机端无效；请改成 Termux 上的真实路径，"
+                          "或把字体放进 python/fonts/ 后删除该配置项"
+                          % (raw, _SYS or "非Windows"))
+    return str(Path(raw))   # Path 自动按当前 OS 规整分隔符
+
+
 def _candidate_files():
     """列出所有可能的中文字体文件（环境变量 > 候选名 × 候选目录）。"""
-    env = os.environ.get("WM_CARD_FONT")
+    env = _env_font_path("WM_CARD_FONT")
     if env:
-        yield env, os.environ.get("WM_CARD_FONT_BOLD") or env
+        yield env, _env_font_path("WM_CARD_FONT_BOLD") or env
     for bold, reg in _FONT_PAIRS:
         for d in _FONT_DIRS:
             for name in (bold, reg):
@@ -164,6 +218,8 @@ def diagnose():
         return "OK：Pillow + 中文字体可用，可正常出图"
     # 找不到：给出实际检索位置与命中情况，便于定位
     lines = ["Pillow 已装但找不到可用中文字体。检索情况："]
+    lines.append("  平台 = %s%s | 路径分隔符 = %r"
+                 % (_SYS or "未知", " (Termux)" if _IS_TERMUX else "", os.sep))
     for d in _portable_font_dirs():
         if d.is_dir():
             files = [p.name for p in d.iterdir()
@@ -181,6 +237,8 @@ def diagnose():
             load_errs.append("%s → %s" % (Path(reg_p).name, e))
     if load_errs:
         lines.append("  发现字体但加载失败：" + " | ".join(load_errs[:3]))
+    if _env_font_warn:
+        lines.append("  ⚠ " + _env_font_warn)
     lines.append("  解决：把任意中文字体（wqy-microhei.ttc 等）放进上面的 fonts/ 目录，"
                  "或在 data/config.txt 设 WM_CARD_FONT=/绝对路径/字体.ttf 后重启")
     return "\n".join(lines)
