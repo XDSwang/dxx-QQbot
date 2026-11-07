@@ -59,7 +59,9 @@ DEFAULT_FILTER_FILE = HERE / "data" / "ws_filters.json"  # 裂缝维度过滤（
 
 _sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text) -> bool
 _monitors = {}                       # (channel, target_id) -> set(types)
-_fissure_filters = {}                # (channel, target_id) -> {"fissures":[token...], "steel":[token...]}
+_fissure_filters = {}                # (channel, target_id) -> {栏目键: [token...]}
+                                     # 栏目维度过滤：裂缝(纪/星球/任务) 与 赏金(集团/地区) 共用
+                                     # 这张表（键是栏目名 fissures/steel/bounty）
 _switches = {}                       # (channel, target_id) -> {type: bool}  聊天指令设的开关
 _pending = {}                        # (channel, target_id) -> {"text":str,"at":float,"fails":int}
 _attached_at = {}                    # (channel, target_id) -> 上次随查询附带的时刻
@@ -722,7 +724,7 @@ def _pick(p, covered):
 
 
 def _col_text(state, t, key):
-    """格式化某栏目；对 fissures / steel 应用本会话的维度过滤（key 为会话）。"""
+    """格式化某栏目；对 fissures / steel / bounty 应用本会话的维度过滤（key 为会话）。"""
     toks = (_fissure_filters.get(key) or {}).get(t) if key else None
     try:
         return ws.TYPES[t][1](state, toks) if toks else ws.TYPES[t][1](state)

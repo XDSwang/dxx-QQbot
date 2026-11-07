@@ -448,6 +448,13 @@ def _clean(v):
     return v
 
 
+def _reward(r):
+    """赏金奖励归一项：{name, count}。数据源偶尔直接给字符串，两种都兜底。"""
+    if isinstance(r, dict):
+        return {"name": _clean(r.get("name")) or "?", "count": r.get("count") or 1}
+    return {"name": _clean(r) or "?", "count": 1}
+
+
 def _wfwiki_to_state(raw):
     """把 wf.wiki 的 initialData 转成内部统一的 state 结构（与 warframestat 同键），
     这样调度 / 缓存 / 查询 / 监控全部零改动。"""
@@ -619,11 +626,15 @@ def _wfwiki_to_state(raw):
         }
 
     # 开放世界赏金任务板（Ostron / 索拉里斯 / 英择谛 …）
+    # 每档带 rewards（wf.wiki 页面上那一堆「蓄能重划 / 奥席金属 ×100 …」），
+    # 之前只取目标/等级/阶段把它丢了，用户对着网页看会对不上。
     board = []
     for b in (raw.get("bountyBoard") or []):
         jobs = [{"objective": _clean(j.get("objective")) or "?",
                  "minLevel": j.get("minLevel"), "maxLevel": j.get("maxLevel"),
-                 "stages": j.get("stages")}
+                 "stages": j.get("stages"),
+                 "isVault": bool(_clean(j.get("isVault")) or False),
+                 "rewards": [_reward(r) for r in (j.get("rewards") or [])]}
                 for j in (b.get("jobs") or [])]
         board.append({"name": _clean(b.get("name")) or "?", "tag": b.get("tag"),
                       "expiry": _ms(b.get("expiry")), "jobs": jobs})
@@ -641,10 +652,12 @@ def _wfwiki_to_state(raw):
             "rotRewards": [_rw(r) for r in (bt.get("rotRewards") or [])],
             "vaultRot": bt.get("vaultRot"),
             "vaultRewards": [_rw(r) for r in (bt.get("vaultRewards") or [])],
-            "groups": [{"name": _clean(g.get("name")) or "?",
+            "groups": [{"name": _clean(g.get("name")) or "?", "tag": g.get("tag"),
                         "jobs": [{"node": _clean(j.get("node")) or "?",
                                   "mission": _clean(j.get("mission")) or "?",
-                                  "challenge": _clean(j.get("challenge")) or ""}
+                                  "challenge": _clean(j.get("challenge")) or "",
+                                  # 六人组（1999）每条带同伴名：阿米尔 / 昆西 / 亚瑟 / 碧 / 莱蒂
+                                  "ally": _clean(j.get("ally")) or ""}
                                  for j in (g.get("jobs") or [])]}
                        for g in (bt.get("groups") or [])],
         }
@@ -1743,6 +1756,95 @@ def _bounty_board_rot(b):
     return f" · {_human(left)} 后换"
 
 
+# 六个赏金集团所属地区：数据源只给集团名，不给地区
+# （坚守者在扎里曼、科维兽在火卫二的 Sanctum、六人组在 1999）
+BOUNTY_REGION = {
+    "Ostron": "希图斯",
+    "索拉里斯": "福尔图娜",
+    "英择谛": "魔胎之境",
+    "坚守者": "扎里曼",
+    "科维兽": "火卫二",
+    "六人组": "1999",
+}
+
+# 赏金过滤别名：用户可能按集团名、地区名或英文写，统一归一到上面那张表里的名字
+BOUNTY_ALIAS = {
+    "ostron": "Ostron", "cetus": "希图斯", "希图斯": "希图斯", "地球": "希图斯",
+    "solaris": "索拉里斯", "fortuna": "福尔图娜", "福尔图娜": "福尔图娜", "金星": "福尔图娜",
+    "entrati": "英择谛", "魔胎": "魔胎之境", "deimos": "魔胎之境",
+    "holdfast": "扎里曼", "zariman": "扎里曼",
+    "cavia": "科维兽", "sanctum": "科维兽", "火卫二": "科维兽",
+    "hex": "六人组", "hollvania": "1999",
+}
+
+# 归一后可被赏金板匹配的名字（集团名 + 地区名），用于判断过滤词是否认得
+BOUNTY_KNOWN = frozenset(BOUNTY_REGION) | frozenset(BOUNTY_REGION.values())
+
+
+def parse_bounty_tokens(text):
+    """赏金过滤词：把「Ostron / 坚守者 / 扎里曼 / fortuna」等归一成集团名或地区名。
+
+    空列表表示不过滤（6 个集团全给）；无法识别的残留原样返回，
+    由格式化阶段如实回「没有匹配 … 的赏金板」，不会静默变成整栏。
+    """
+    t = (text or "").lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return []
+    toks = []
+    for alias in sorted(BOUNTY_ALIAS, key=len, reverse=True):
+        if alias and alias in t:
+            norm = BOUNTY_ALIAS[alias]
+            if norm not in toks:
+                toks.append(norm)
+            t = t.replace(alias, "")
+    t = re.sub(r"\s+", "", t)
+    if t:
+        toks.append(t)
+    return toks
+
+
+def _bounty_all(s):
+    """六个赏金集团合一：bountyBoard 给 Ostron / 索拉里斯 / 英择谛（带奖励），
+    bounties.groups 给 坚守者 / 科维兽 / 六人组（带节点 / 任务 / 挑战 / 同伴）。"""
+    out = []
+    for b in (s.get("bountyBoard") or []):
+        name = b.get("name") or "?"
+        out.append({"name": name, "region": BOUNTY_REGION.get(name, ""),
+                    "expiry": b.get("expiry"), "jobs": b.get("jobs") or []})
+    bt = s.get("bounties") or {}
+    for g in (bt.get("groups") or []):
+        name = g.get("name") or "?"
+        out.append({"name": name, "region": BOUNTY_REGION.get(name, ""),
+                    "expiry": bt.get("expiry"), "jobs": g.get("jobs") or []})
+    return out
+
+
+def _bounty_job_line(j):
+    """一档赏金：奖励型给「目标 LvX-Y · N 阶段」；挑战型给「节点 · 任务 · 挑战（同伴）」。"""
+    if j.get("node"):
+        line = f"{j.get('node')} · {j.get('mission') or '?'}"
+        if j.get("challenge"):
+            line += f" · {j['challenge']}"
+        if j.get("ally"):
+            line += f"（{j['ally']}）"
+        return line
+    return _job_text(j)
+
+
+def _reward_text(j, limit):
+    """奖励摘要：取前 limit 项，数量 >1 才写 ×N，超出补「等 N 项」。"""
+    rs = j.get("rewards") or []
+    if not rs:
+        return ""
+    parts = []
+    for r in rs[:limit]:
+        c = r.get("count")
+        parts.append(str(r.get("name") or "?")
+                     + (f"×{c}" if isinstance(c, int) and c > 1 else ""))
+    return "、".join(parts) + (f" 等 {len(rs)} 项" if len(rs) > limit else "")
+
+
 def _fmt_upgrades(s):
     ups = s.get("globalUpgrades") or []
     if not ups:
@@ -1784,25 +1886,57 @@ def _fmt_coda(s):
     return "\n".join([head] + _weapon_lines(items, _cap(10, 4)))
 
 
-def _fmt_bounty(s):
-    board = s.get("bountyBoard") or []
+def _fmt_bounty(s, tokens=None):
+    """赏金任务板：六个集团一次列全，每档带奖励摘要。
+
+    带 tokens（集团名 / 地区名）时只留匹配的集团，并把该集团每档奖励全列出来
+    （整栏时只给前几项，避免一条消息长到超出 QQ 上限）。
+    """
+    board = _bounty_all(s)
+    only = [t.lower() for t in (tokens or []) if t]
+    if only:
+        board = [b for b in board
+                 if any(t in (b.get("name") or "").lower()
+                        or t in (b.get("region") or "").lower() for t in only)]
+        if not board:
+            return "🧾 赏金：没有匹配「%s」的赏金板" % "、".join(tokens)
     if not board:
         return "🧾 赏金：（当前无）"
-    out = [f"🧾 开放世界赏金（{len(board)} 个集团）"]
-    for b in board[:_cap(4, 2)]:
+    one = bool(only) and len(board) == 1       # 单集团：全部档位 + 全部奖励
+    n_jobs = 99 if only else _cap(3, 2)        # 带过滤时全列，整栏时只给前几档
+    n_rw = 99 if only else _cap(5, 3)
+    out = []
+    if one:
+        b0 = board[0]
+        tail = f" · {b0['region']}" if b0.get("region") else ""
+        out.append(f"🧾 {b0.get('name')} 赏金"
+                   f"（{len(b0.get('jobs') or [])} 个{tail}{_bounty_board_rot(b0)}）")
+    else:
+        out.append(f"🧾 开放世界赏金（{len(board)} 个集团）")
+    for b in board:
         jobs = b.get("jobs") or []
-        out.append(f"  · {b.get('name') or '?'}（{len(jobs)} 个"
-                   f"{_bounty_board_rot(b)}）")
-        for j in jobs[:_cap(5, 2)]:
-            out.append(f"      - {_job_text(j)}")
-        if len(jobs) > 5:
-            out.append(f"      …… 还有 {len(jobs) - 5} 个")
-    # 说明「赏金」和「平原」的关系：同一份赏金板的不同视图，免得用户以为两套数据
-    out.append("（与「平原」各区域附带的任务板是同一份数据；发「平原」可看各区昼夜 + 对应赏金）")
+        if not one:
+            tail = f" · {b['region']}" if b.get("region") else ""
+            out.append(f"  · {b.get('name') or '?'}（{len(jobs)} 个{tail}"
+                       f"{_bounty_board_rot(b)}）")
+        for j in jobs[:n_jobs]:
+            out.append(f"      - {_bounty_job_line(j)}")
+            rw = _reward_text(j, n_rw)
+            if rw:
+                out.append(f"        奖励：{rw}")
+        if len(jobs) > n_jobs:
+            out.append(f"      …… 还有 {len(jobs) - n_jobs} 个"
+                       f"（发「赏金 {b.get('name') or ''}」看全部）")
+    if not one and not only:
+        # 说明「赏金」和「平原」的关系：同一份赏金板的不同视图，免得用户以为两套数据
+        out.append("（与「平原」各区域附带的任务板是同一份数据；"
+                   "发「赏金 <集团名>」可看单个集团全部档位与奖励）")
     return "\n".join(out)
 
 
 def _fmt_bounty_rot(s):
+    """赏金轮换：只讲本轮/宝库奖励，各集团的具体任务与奖励归「赏金」栏目，
+    两边不重复（否则监控两个栏目时会看到同一批内容各推一次）。"""
     bt = s.get("bounties") or {}
     if not bt:
         return "🔄 赏金轮换：（当前无）"
@@ -1810,17 +1944,14 @@ def _fmt_bounty_rot(s):
     out = [f"🔄 赏金轮换（本轮 {rot}{_rot_note(bt.get('expiry'))}）"]
     rw = bt.get("rotRewards") or []
     if rw:
-        out.append("  本轮奖励：" + "、".join(str(x) for x in rw[:6]))
+        out.append("  本轮奖励：" + "、".join(str(x) for x in rw[:_cap(8, 6)]))
     vw = bt.get("vaultRewards") or []
     if vw:
-        out.append(f"  宝库轮换 {bt.get('vaultRot') or '?'}：" + "、".join(str(x) for x in vw[:6]))
-    for g in (bt.get("groups") or [])[:_cap(3, 2)]:
-        jobs = g.get("jobs") or []
-        out.append(f"  · {g.get('name') or '?'}（{len(jobs)} 个）")
-        for j in jobs[:_cap(3, 2)]:
-            chal = j.get("challenge") or ""
-            out.append(f"      - {j.get('node') or '?'} · {j.get('mission') or '?'}"
-                       + (f" · {chal}" if chal else ""))
+        out.append(f"  宝库轮换 {bt.get('vaultRot') or '?'}："
+                   + "、".join(str(x) for x in vw[:_cap(8, 6)]))
+    if not rw and not vw:
+        out.append("  （本轮奖励数据源暂未给出）")
+    out.append("（坚守者 / 科维兽 / 六人组 等集团的任务与奖励在「赏金」里）")
     return "\n".join(out)
 
 
@@ -2080,6 +2211,12 @@ def parse_ws_command(text):
         spec = parse_fissure_spec(t)
         if spec is not None:
             return {"action": "query", "types": [spec["column"]], "filter": spec["tokens"]}
+    # 赏金可按集团 / 地区缩小（连写也行：「赏金Ostron」「赏金坚守者」「赏金 扎里曼」）；
+    # 「赏金轮换」是另一个栏目，必须排除，否则会被当成按「轮换」过滤
+    if first.startswith(("赏金", "悬赏")) and not first.startswith("赏金轮换"):
+        rest = t[len(first[:2]):]
+        return {"action": "query", "types": ["bounty"],
+                "filter": parse_bounty_tokens(rest)}
     key = KEYWORDS.get(first)
     if not key and t in KEYWORDS:
         key = KEYWORDS[t]
@@ -2104,6 +2241,16 @@ def _parse_monitor(rest):
             continue
         if kw in low:
             other_cols.add(k)
+    # 赏金可按集团 / 地区缩小：「监控 赏金 Ostron」「监控 赏金坚守者」
+    bounty_toks = []
+    if ("赏金" in low or "悬赏" in low) and "赏金轮换" not in low:
+        rest = low.replace("悬赏", "").replace("赏金", "")
+        for kw, k in KEYWORDS.items():          # 其它栏目词是并列栏目，不是赏金条件
+            if k in ("bounty", "bountyrot", "__all__"):
+                continue
+            if kw in rest:
+                rest = rest.replace(kw, "")
+        bounty_toks = parse_bounty_tokens(rest)
     # 只有在「没有其它栏目」或「显式写了裂缝/钢铁裂缝」时才解析裂缝过滤，
     # 否则「监控 平原」里的杂词会被误当成裂缝条件。
     explicit_fis = any(w in low for w in ("裂缝", "裂隙", "fissure", "steel"))
@@ -2138,9 +2285,15 @@ def _parse_monitor(rest):
         types.add(spec["column"])
     if not types:
         return {"action": "monitor_hint"}
+    # 赏金只按集团 / 地区过滤；写了不属于这儿的词（如「赏金 火星」）按不认识处理，
+    # 绝不默默开一个永远推不出东西的过滤监控
+    if bounty_toks and not all(t in BOUNTY_KNOWN for t in bounty_toks):
+        return {"action": "monitor_hint"}
     out = {"action": "monitor", "types": sorted(types)}
     if spec is not None and spec["tokens"]:
         out["fissure_filter"] = {spec["column"]: spec["tokens"]}
+    if bounty_toks:
+        out["bounty_filter"] = bounty_toks
     return out
 
 
@@ -2150,7 +2303,9 @@ HELP_TEXT = (
     "  战斗：裂缝（常规星球在上、九重天在下，各按 古→前→中→后→安魂→全能 排序）\n"
     "        钢铁裂缝 / 突击 / 仲裁 / 入侵 / 警报 / 活动\n"
     "  轮换：商人 / 瓦奇娅 / 特惠 / 电波 / 加成\n"
-    "  赏金：赏金（开放世界任务板）/ 赏金轮换\n"
+    "  赏金：赏金（六个集团一次给全，每档带奖励）/ 赏金轮换（本轮 + 宝库奖励）\n"
+    "        单个集团：赏金 Ostron / 赏金 坚守者 / 赏金 扎里曼（也可 监控 赏金 Ostron）\n"
+    "        六集团：Ostron · 索拉里斯 · 英择谛 · 坚守者(扎里曼) · 科维兽(火卫二) · 六人组(1999)\n"
     "  装备：信条 / 终幕\n"
     "  其它：新闻 / 全部\n"
     "  监控 <词>     在本会话开启推送（如 监控 警报 / 监控 裂缝 / 监控 平原）\n"
@@ -2373,17 +2528,27 @@ _MOCK_WS = {
     },
     "bountyBoard": [
         {"name": "Ostron", "tag": "CetusSyndicate", "expiry": int(time.time() + 5400),
-         "jobs": [{"objective": "削减", "minLevel": 5, "maxLevel": 15, "stages": 3},
-                  {"objective": "捕获", "minLevel": 10, "maxLevel": 20, "stages": 2}]},
+         "jobs": [{"objective": "削减", "minLevel": 5, "maxLevel": 15, "stages": 3,
+                   "isVault": False,
+                   "rewards": [{"name": "奥席金属", "count": 100},
+                               {"name": "内融核心", "count": 1},
+                               {"name": "Gara 机体 蓝图", "count": 1}]},
+                  {"objective": "捕获", "minLevel": 10, "maxLevel": 20, "stages": 2,
+                   "rewards": [{"name": "夜灵之息", "count": 5}]}]},
         {"name": "索拉里斯", "tag": "SolarisSyndicate", "expiry": int(time.time() + 5400),
-         "jobs": [{"objective": "挖掘", "minLevel": 15, "maxLevel": 25, "stages": 3}]},
+         "jobs": [{"objective": "挖掘", "minLevel": 15, "maxLevel": 25, "stages": 3,
+                   "rewards": [{"name": "心肌菌孢子", "count": 5}]}]},
     ],
     "bounties": {
         "expiry": int(time.time() + 5400), "rot": "C",
         "rotRewards": ["Caliban 头部神经光元", "雷霆暴君"],
         "vaultRot": "B", "vaultRewards": ["孢丝感染枪 枪机"],
         "groups": [{"name": "坚守者", "jobs": [
-            {"node": "奥金工场", "mission": "虚空决战", "challenge": "击杀 2 名虚空天使"}]}],
+            {"node": "奥金工场", "mission": "虚空决战", "challenge": "击杀 2 名虚空天使",
+             "ally": ""}]},
+            {"name": "六人组", "jobs": [
+                {"node": "传承种收割", "mission": "传承种收割",
+                 "challenge": "从上方击杀 10 名敌人", "ally": "阿米尔"}]}],
     },
     "varzia": {"active": True, "node": "Maroo 的市集",
                "activation": int(time.time()) - 86400,
