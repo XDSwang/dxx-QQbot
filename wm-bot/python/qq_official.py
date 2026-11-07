@@ -750,7 +750,7 @@ class OfficialBot:
             reply = f"⚠️ 处理出错：{e}"
             flog(f"handler 抛出异常: {e}")
         if not reply:
-            flog("handler 返回空（未触发 WM/ZK 指令 或 白名单外群静默），不回复")
+            flog("handler 返回空（闲聊未带 D/XX/ 前缀 / 白名单外群静默），不回复")
             return
         # 全量群消息（没 @ 机器人）：优先【不带 msg_id】发一条普通群消息，
         # 不 @ 任何人、也不显示「引用某条消息」；@ 消息才走被动引用回复。
@@ -820,6 +820,7 @@ class OfficialBot:
             # 没图属于「通道拿不到素材」，不是业务发送失败：即便调试时关了
             # WM_QQ_MD_FALLBACK，也要让富媒体把卡片图发出去。
             if not qq_markdown.fallback_enabled() and not no_image:
+                flog(f"⚠️ 回复未送达（Markdown 失败且已关闭回退）: {kind} {target_id} msg_id={msg_id}")
                 return
 
         # ② 默认并进【同一条】图文混排消息（msg_type=7 + content）
@@ -850,7 +851,9 @@ class OfficialBot:
         ok, info = _send_text(text_out)
         if not ok:
             print(f"[official] 发送失败: {info}", file=sys.stderr)
-            flog(f"发送失败: {info}")
+            # 明确标记「用户没收到」：QQ 侧频控/权限/网络全失败时用户看不到任何东西，
+            # 只能靠这行日志定位（含 msg_id，可对着用户反馈的时间点排查）。
+            flog(f"⚠️ 回复未送达（文字通道也失败）: {kind} {target_id} msg_id={msg_id} 原因={info}")
         else:
             print(f"[official] 已回复 {kind} {target_id}", file=sys.stderr)
             flog(f"发送成功: {kind} {target_id}")

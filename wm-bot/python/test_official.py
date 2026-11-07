@@ -655,26 +655,36 @@ class TestConnectIdentify(unittest.TestCase):
         got = {}
 
         def gateway():
+            conn = None
             try:
                 conn, _ = srv.accept()
             except Exception as e:
                 got["err"] = "accept: %s" % e
-                return
             try:
-                onebot.server_handshake(conn)
-                ws = onebot.WSConn(conn, client_mask=False)   # 服务端发不掩码
-                ws.send_text(json.dumps({"op": 10, "d": {"heartbeat_interval": 45000}}))
-                typ, payload = ws.recv_message()
-                msg = json.loads(payload.decode("utf-8"))
-                got["op"] = msg.get("op")
-                got["token"] = msg.get("d", {}).get("token")
-                got["intents"] = msg.get("d", {}).get("intents")
-                ws.send_close()
+                if conn is not None:
+                    onebot.server_handshake(conn)
+                    ws = onebot.WSConn(conn, client_mask=False)   # 服务端发不掩码
+                    ws.send_text(json.dumps({"op": 10, "d": {"heartbeat_interval": 45000}}))
+                    typ, payload = ws.recv_message()
+                    msg = json.loads(payload.decode("utf-8"))
+                    got["op"] = msg.get("op")
+                    got["token"] = msg.get("d", {}).get("token")
+                    got["intents"] = msg.get("d", {}).get("intents")
+                    ws.send_close()
             except Exception as e:
                 got["err"] = str(e)
             finally:
-                conn.close()
-                srv.close()
+                # accept 失败（超时）时也必须关掉监听：否则客户端后面连上来会
+                # 被内核 backlog 接住、却没人 accept/回包，只能空等 90s 读超时。
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                try:
+                    srv.close()
+                except Exception:
+                    pass
 
         th = threading.Thread(target=gateway, daemon=True)
         th.start()

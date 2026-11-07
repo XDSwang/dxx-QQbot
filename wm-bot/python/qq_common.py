@@ -44,6 +44,15 @@ GLOBAL_HELP_WORDS = {"帮助", "help", "?", "菜单", "指令", "命令", "功�
 # 「?」故意不放进来（单字符太容易误触），要它仍可发 D/XX/? 。
 BARELESS_HELP_WORDS = GLOBAL_HELP_WORDS - {"?"}
 
+# 带前缀但没识别到任何指令时的提示（以前这里静默 return None，用户会以为机器人挂了）
+UNKNOWN_CMD_HINT = (
+    "⚠️ 没识别到这条指令（可能是栏目名写错或打错字）\n"
+    "· 看全部指令：发「帮助」（这个不用前缀）\n"
+    "· 世界状态：平原 / 希图斯 / 裂缝 / 突击 / 仲裁 / 警报 / 活动 / 商人 / 电波\n"
+    "· 市场查价：wm <物品名> / zk <紫卡> / 翻译 <名称>\n"
+    "· 其它指令要带前缀，例如 D/XX/突击、D/XX/wm Boltor Prime"
+)
+
 
 def _is_global_help(text):
     """整句或首词命中全局帮助词（帮助 / ? / 菜单 / 指令 …）。"""
@@ -465,7 +474,13 @@ def make_handler(allowed_groups=None, allow_all=False):
                              force_text=force_txt)
         # WM 查询（wm / zk / 紫卡 / 翻译）：带前缀才触发
         if not is_wm_command(q):
-            return None
+            # 走到这里说明：消息带了 D/XX/ 前缀（明确在跟机器人说话），
+            # 但既不是世界状态指令、也不是 WM 指令 —— 很可能打错字/写错栏目名。
+            # 以前这里直接 return None 会导致「发了指令却一条回复都没有」，
+            # 所以改成回一条提示，让用户知道没被静默吞掉、也知道下一步发什么。
+            return finalize(UNKNOWN_CMD_HINT, ctx,
+                            force_image=force_img, force_text=force_txt,
+                            title="星际战甲 · 指令提示")
         cmd = wm.parse_command(q)
         if not cmd:
             return finalize(wm.format_reply({"served": "help"}), ctx,
