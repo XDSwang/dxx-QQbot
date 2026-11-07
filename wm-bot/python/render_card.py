@@ -19,7 +19,36 @@ import re
 import sys
 import time
 import platform
+import ctypes
 from pathlib import Path
+
+
+def _preload_raqm():
+    """Android / QPython 等环境里，Pillow 的 _imagingft 在加载字体时会需要原生库
+    libraqm.so，但运行环境常没装（报错 'library libraqm.so not found'）。
+    在导入 PIL 前，把设备上可能存在的 libraqm.so 先用 ctypes 加载进来，
+    这样后续 _imagingft 的 DT_NEEDED 依赖就能被「已加载的库」满足，字体即可正常加载。
+    找不到就跳过——本函数绝不抛错，也不影响 Windows / macOS 正常环境。
+    """
+    if platform.system().lower() in ("windows", "darwin"):
+        return
+    cands = [
+        str(Path(__file__).resolve().parent / "libs" / "libraqm.so"),  # 项目自带（用户放进来即可）
+        os.environ.get("PREFIX", "") + "/lib/libraqm.so",              # Termux
+        "/data/data/com.termux/files/usr/lib/libraqm.so",
+        "/system/lib64/libraqm.so", "/vendor/lib64/libraqm.so",
+        "/system/lib/libraqm.so",
+    ]
+    for c in cands:
+        if c and os.path.exists(c):
+            try:
+                ctypes.CDLL(c)
+                break
+            except Exception:
+                pass
+
+
+_preload_raqm()
 
 try:                                     # Pillow 是可选依赖，缺失时整个模块降级
     from PIL import Image, ImageDraw, ImageFont
@@ -113,13 +142,13 @@ _font_ready = None      # None=还没探测；False=没有可用中文字体
 
 
 def _portable_font_dirs():
-    """用户可能放字体的几个位置：脚本同目录、运行目录、项目根。"""
+    """唯一默认字体目录：脚本所在目录（python/）下的 fonts/。
+
+    不依赖运行目录(CWD)，也不扫项目根——避免 PC→手机同步后多路径混乱与重复显示。
+    字体随 python/ 同步到手机，天然跟着代码走；高级用户可用 WM_CARD_FONT 环境变量覆盖。
+    """
     here = Path(__file__).resolve().parent
-    return [
-        here / "fonts",            # python/fonts（推荐，随 python/ 同步）
-        Path.cwd() / "fonts",      # 运行 qq_bot.py 所在目录下的 fonts/
-        here.parent / "fonts",     # 项目根 fonts/
-    ]
+    return [here / "fonts"]
 
 
 # 项目内唯一含敏感数据的目录（密钥 / 群白名单 / 缓存 / 日志），绝不外泄。
@@ -161,18 +190,15 @@ def _env_font_path(key):
 
 
 def _candidate_files():
-    """列出所有可能的中文字体文件（环境变量 > 候选名 × 候选目录）。"""
+    """字体候选：环境变量 WM_CARD_FONT（高级） > 默认 python/fonts 下任意字体文件。
+
+    只认这一个默认目录，不再扫系统字体目录——手机端 /system/fonts 里的
+    NotoSansCJK 之类的字体依赖 libraqm，加载失败会污染诊断信息，且和我们的
+    自带字体无关；统一用 python/fonts 里的字体最可控。
+    """
     env = _env_font_path("WM_CARD_FONT")
     if env:
         yield env, _env_font_path("WM_CARD_FONT_BOLD") or env
-    for bold, reg in _FONT_PAIRS:
-        for d in _FONT_DIRS:
-            for name in (bold, reg):
-                p = Path(d) / name
-                if p.exists():
-                    yield str(p), str(Path(d) / bold)
-    # 便携：上面任一 fonts/ 目录下的任意中文字体文件（不要求特定文件名；
-    # 后面 _load_fonts 会用「星」字渲染校验是否真含中文）
     for d in _portable_font_dirs():
         if d.is_dir():
             for ext in ("*.ttf", "*.ttc", "*.otf"):
@@ -221,40 +247,41 @@ def available():
 def diagnose():
     """说明「图片为什么没出来」，供开机自检与日志使用。
 
-    找不到中文字体时，直接报出实际检索路径、各路径是否存在、fonts 里有没有文件、
-    以及发现字体却加载失败的具体报错，方便定位（多半是字体没同步到正确位置，
-    或文件传输损坏）。手机端最常见的两种：没装 Pillow、或装了但没有中文字体。
+    找不到中文字体时，只报默认字体目录是否存在、里面有无字体文件，
+    以及发现字体却加载失败的具体报错（多半是缺原生库 libraqm，而非字体问题）。
     """
     if not _PIL_OK:
         return ("缺 Pillow：pip install pillow（Termux 也可 pkg install python-pillow）；"
                 "当前只能发纯文字")
     if available():
         return "OK：Pillow + 中文字体可用，可正常出图"
-    # 找不到：给出实际检索位置与命中情况，便于定位
-    lines = ["Pillow 已装但找不到可用中文字体。检索情况："]
-    lines.append("  平台 = %s%s | 路径分隔符 = %r"
-                 % (_SYS or "未知", " (Termux)" if _IS_TERMUX else "", os.sep))
-    for d in _portable_font_dirs():
-        if d.is_dir():
-            files = [p.name for p in d.iterdir()
-                     if p.suffix.lower() in (".ttf", ".ttc", ".otf")]
-            lines.append("  ✔ %s（存在，字体文件：%s）" % (_safe(d), files or "无"))
-        else:
-            lines.append("  ✘ %s（不存在）" % _safe(d))
-    lines.append("  运行目录 CWD = %s" % _safe(Path.cwd()))
-    # 若发现了字体但加载失败，报具体错误（如文件损坏 / PIL 不支持该格式）
-    load_errs = []
+    d = _portable_font_dirs()[0]
+    lines = ["Pillow 已装但找不到可用中文字体。"]
+    lines.append("  默认字体目录 = %s" % _safe(d))
+    if d.is_dir():
+        files = [p.name for p in d.iterdir()
+                 if p.suffix.lower() in (".ttf", ".ttc", ".otf")]
+        lines.append("  ✔ 存在，字体文件：%s" % (files or "无（目录为空，请放入中文字体）"))
+    else:
+        lines.append("  ✘ 不存在 → 请新建该目录并放入任意中文字体（如 wqy-microhei.ttc）后重启")
+    # 发现字体但加载失败 → 报具体错误（最常见：libraqm.so 缺失）
+    seen = set()
     for bold_p, reg_p in _candidate_files():
         try:
             ImageFont.truetype(reg_p, 10)
         except Exception as e:
-            load_errs.append("%s → %s" % (Path(reg_p).name, e))
-    if load_errs:
-        lines.append("  发现字体但加载失败：" + " | ".join(load_errs[:3]))
+            msg = "%s → %s" % (Path(reg_p).name, e)
+            if msg not in seen:
+                seen.add(msg)
+                lines.append("  字体加载失败：" + msg)
     if _env_font_warn:
         lines.append("  ⚠ " + _env_font_warn)
-    lines.append("  解决：把任意中文字体（wqy-microhei.ttc 等）放进上面的 fonts/ 目录，"
-                 "或在 data/config.txt 设 WM_CARD_FONT=/绝对路径/字体.ttf 后重启")
+    if any("libraqm" in l for l in lines):
+        lines.append("  ↳ libraqm.so 是 Pillow 在手机端渲染文字需要的原生库，环境没装才会加载失败；")
+        lines.append("    这不是字体问题。修法：①改用 Termux 运行并 pkg install python-pillow libraqm；")
+        lines.append("    ②或把 libraqm.so 放进 python/libs/ 后重启（程序会自动预加载）。")
+    else:
+        lines.append("  解决：确保默认字体目录存在且含中文字体后重启。")
     return "\n".join(lines)
 
 
