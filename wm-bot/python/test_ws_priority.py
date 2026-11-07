@@ -156,7 +156,10 @@ def main():
     sent = once(mk([A1, A2], [E1]))
     t("新增一条警报 → sent=1", sent == 1)
     t("只发一条消息", len(calls) == 1)
-    t("带了主推标题", "🚨 世界状态主推" in calls[0])
+    t("主推内容首行就是栏目名（标签才匹配得上）",
+      calls[0].startswith("📢 警报"))
+    t("主推消息的标签不是通用【监控信息如下】",
+      M.monitor_label(calls[0]) == "【警报监控信息如下】")
     t("带新警报节点", "火星/Wahiba" in calls[0])
     t("带奖励内容", "Forma" in calls[0])
     t("周期通道的 300 秒限频没拦住它", M._last_sent.get(KA, (None,))[0] == "周期刚推过")
@@ -176,6 +179,17 @@ def main():
     t("只装变化的栏目（不含警报正文）",
       "🎉 活动" in calls[-1] and "📢 警报" not in calls[-1])
     t("带新活动描述", "TennoCon" in calls[-1])
+
+    # ---------- 6.5) 主推按栏目拆分：警报/活动各一条，各带自己的标签 ----------
+    print("[主推按栏目拆分]")
+    M._priority_sent_at.pop(KA, None)
+    n0 = len(calls)
+    sent = once(mk([A1, A2, _alert("冥王星/Outer Terminus")],
+                   [E1, _event("TennoCon 预热：免费纹章"), _event("Gargoyle 的祝福")]))
+    t("警报+活动同时新增 → 两条独立消息", sent == 1 and len(calls) - n0 == 2)
+    t("各带自己的标签（不再掉进通用【监控信息如下】）",
+      sorted(M.monitor_label(x) for x in calls[n0:])
+      == ["【活动监控信息如下】", "【警报监控信息如下】"])
 
     # ---------- 7) 条目结束静默，不推「活动结束」 ----------
     print("[条目结束静默]")
@@ -222,7 +236,9 @@ def main():
     M.set_sender(lambda ch, tid, text: calls2.append(text) or True)
     M._next_probe = 0.0
     sent = once(mk([A1, A2], [E1]))
-    t("下一轮自动重试并成功", sent == 1 and "🚨" in calls2[0])
+    t("下一轮自动重试并成功",
+      sent == 1 and "火星/Wahiba" in calls2[0]
+      and M.monitor_label(calls2[0]) == "【警报监控信息如下】")
     t("成功后暂存清空", M.pending_count() == 0)
     t("成功后基线推进到 2 条", len(M._seen_priority[KA]["alerts"]) == 2)
 

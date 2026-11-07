@@ -82,6 +82,7 @@ import time
 import ssl
 import socket
 import base64
+import queue
 import threading
 import urllib.parse
 import urllib.request
@@ -330,6 +331,12 @@ class OfficialBot:
         self._stop = threading.Event()
         self._seq = None
         self._hb_timer = None
+        # 用户查询的异步处理：每个会话一条串行队列 + 一个工作线程。
+        # 只有真的跑起网关主循环（_loop）时才开启；测试里直接调 _dispatch_reply
+        # 仍是同步执行，断言不受影响。
+        self._async_replies = False
+        self._reply_queues = {}
+        self._reply_qlock = threading.Lock()
 
     def stop(self):
         self._stop.set()
@@ -497,6 +504,11 @@ class OfficialBot:
 
     # ---- 网关收发主循环 ----
     def _loop(self, conn, token):
+        # 用户查询改走「每会话一条串行队列」，网关读取循环立刻回来读下一帧：
+        # 这样某一问要跑网络/重试时，不会把后面的消息全堵在 socket 里
+        # （那种堵法看起来就像「回复排了长队、回的是上一句」）。
+        # 监控推送本来就在自己的 ws-push 线程里串行发，两边互不占线。
+        self._async_replies = True
         while not self._stop.is_set():
             try:
                 typ, payload = conn.recv_message()
@@ -652,6 +664,83 @@ class OfficialBot:
             flog(f"未处理的事件类型 t={t}（已忽略）")
 
     def _dispatch_reply(self, token, kind, target_id, text, ctx, msg_id):
+        """回复入口：网关循环只负责「登记」，真正的查询/发图交给工作线程。
+
+        每会话单独一条队列 + 一个线程：同一会话仍按顺序一问一答（不会串台、
+        不会乱序），不同会话之间并行，谁都别被别人的慢查询或监控推送拖住。
+        """
+        if not target_id:
+            return
+        if not self._async_replies:
+            self._do_reply(token, kind, target_id, text, ctx, msg_id)
+            return
+        key = "%s:%s" % (kind, target_id)
+        flog(f"用户查询入队 key={key} msg_id={msg_id} 文本={text!r}")
+
+        def job():
+            flog(f"用户查询开始处理 key={key} msg_id={msg_id} 文本={text!r}")
+            try:
+                tok = self.token_mgr.get_token()     # 排队久了 token 可能过期，重新取
+            except Exception:
+                tok = token
+            mon = None
+            try:
+                # 查询期间给推送线程打「让行」标记：推送排队，查询不排队
+                import ws_monitor as _mon
+                mon = _mon
+                mon.query_begin()
+            except Exception:
+                mon = None
+            try:
+                self._do_reply(tok, kind, target_id, text, ctx, msg_id)
+            finally:
+                if mon is not None:
+                    try:
+                        mon.query_end()
+                    except Exception:
+                        pass
+
+        self._submit_reply(key, job)
+
+    def _submit_reply(self, key, job):
+        with self._reply_qlock:
+            q = self._reply_queues.get(key)
+            if q is None:
+                q = queue.Queue()
+                self._reply_queues[key] = q
+                th = threading.Thread(target=self._reply_worker, args=(key, q),
+                                      daemon=True, name="reply-%s" % key)
+                th.start()
+        q.put(job)
+
+    def _reply_worker(self, key, q):
+        """单会话串行执行；空闲 5 分钟自动退出并注销，避免线程越积越多。
+
+        等待用 1 秒一轮的 get，好处是 bot.stop() 时能立刻退出（不然要等满超时）。
+        """
+        idle = 0.0
+        while not self._stop.is_set():
+            try:
+                job = q.get(timeout=1.0)
+            except queue.Empty:
+                idle += 1.0
+                if idle >= 300:
+                    with self._reply_qlock:
+                        if q.empty() and self._reply_queues.get(key) is q:
+                            self._reply_queues.pop(key, None)
+                            return
+                    idle = 0.0
+                continue
+            idle = 0.0
+            try:
+                job()
+            except Exception as e:
+                flog(f"用户查询处理异常 key={key}: {e}")
+        with self._reply_qlock:
+            if self._reply_queues.get(key) is q:
+                self._reply_queues.pop(key, None)
+
+    def _do_reply(self, token, kind, target_id, text, ctx, msg_id):
         if not target_id:
             return
         flog(f"进入回复分发 kind={kind} target_id={target_id} msg_id={msg_id} 文本={text!r}")

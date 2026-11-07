@@ -165,6 +165,11 @@ class TestMixedImageMessage(unittest.TestCase):
         qq_official.send_message = self._fake_text
 
     def tearDown(self):
+        # 异步用例会留工作线程：先叫停，等它们退出，再还原被 monkeypatch 的函数，
+        # 否则上一轮的在途发送会落到下一组用例的假 send_message 上（串扰）。
+        self.bot._stop.set()
+        self._wait_for(lambda: not self.bot._reply_queues, timeout=2.0)
+        time.sleep(0.1)
         (qq_official.upload_image, qq_official.send_image,
          qq_official.send_message) = self._orig
 
@@ -253,6 +258,71 @@ class TestMixedImageMessage(unittest.TestCase):
         self.assertEqual(len(self.text_calls), 1)
         self.assertIn("价格列表正文", self.text_calls[0][0])
         self.assertIn("/w Seller", self.text_calls[0][0])
+
+    # ---- 用户查询不排队：网关循环只登记，处理交给每会话串行工作线程 ----
+    def _wait_for(self, cond, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_async_dispatch_returns_at_once(self):
+        """_dispatch_reply 在异步模式下必须立刻返回，别把网关读取循环堵住。"""
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow(t, c):
+            started.set()
+            gate.wait(5)
+            return qq_common.ImageReply("价格列表正文", [b"\x89PNG"])
+
+        self.assertFalse(self.bot._async_replies, "默认同步，老测试不受影响")
+        self.bot._async_replies = True
+        self.bot.handler = slow
+        t0 = time.time()
+        self.bot._dispatch_reply("TOK", "group", "G1", "wm boltor", {}, "M1")
+        self.assertLess(time.time() - t0, 1.0, "登记后应立即返回")
+        self.assertTrue(started.wait(5), "查询应已在别的线程里开跑")
+        self.assertEqual(self.image_calls, [], "还在处理中，尚未发送")
+        gate.set()
+        self.assertTrue(self._wait_for(lambda: len(self.image_calls) == 1))
+
+    def test_async_same_conversation_keeps_order(self):
+        """同一会话仍一问一答按顺序来，不会因为并行而串台/乱序。"""
+        self.bot._async_replies = True
+        seen = []
+
+        def h(t, c):
+            seen.append(t)
+            time.sleep(0.05)
+            return qq_common.ImageReply(t, [b"\x89PNG"])
+
+        self.bot.handler = h
+        for i in range(3):
+            self.bot._dispatch_reply("TOK", "group", "G1", "q%d" % i, {}, "M%d" % i)
+        self.assertTrue(self._wait_for(lambda: len(seen) == 3))
+        self.assertEqual(seen, ["q0", "q1", "q2"], "同会话必须串行且有序")
+
+    def test_async_other_conversation_not_blocked(self):
+        """一个会话的慢查询不能拖住另一个会话（各跑各的线程）。"""
+        self.bot._async_replies = True
+        gate = threading.Event()
+
+        def h(t, c):
+            if t == "slow":
+                gate.wait(5)
+            return qq_common.ImageReply(t, [b"\x89PNG"])
+
+        self.bot.handler = h
+        self.bot._dispatch_reply("TOK", "group", "G1", "slow", {}, "M1")
+        self.bot._dispatch_reply("TOK", "group", "G2", "fast", {}, "M2")
+        self.assertTrue(self._wait_for(lambda: len(self.image_calls) == 1),
+                        "另一会话不该等慢查询")
+        gate.set()
+        self.assertTrue(self._wait_for(lambda: len(self.image_calls) == 2))
+
 
 
 class TestOnEvent(unittest.TestCase):

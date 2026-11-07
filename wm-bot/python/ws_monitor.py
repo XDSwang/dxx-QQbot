@@ -70,6 +70,8 @@ _next_probe = 0.0                    # 下次允许尝试主动发送的时刻�
 _lock = threading.RLock()
 _push_thread = None
 _stop = threading.Event()
+# 正在处理的「用户查询」计数：>0 时推送线程让行（用户查询优先，推送才排队）。
+_query_depth = [0]
 
 PROBE_GAP = 300.0                    # 主动通道不通时，每 5 分钟才再试一次（别空打接口）
 # 默认【不】开主推即时推：警报 / 活动不再一出现就立刻单独发一条，而是随周期全量
@@ -85,6 +87,26 @@ def _num(name, default):
         return float(os.environ.get(name) or default)
     except (TypeError, ValueError):
         return float(default)
+
+
+# ---------------- 用户查询优先：查询在处理时，推送让行 ----------------
+# 规则只有一条：**推送排队，查询不排队**。用户发指令时（取数 / 渲染 / 发图）
+# 推送线程不再发起新的主动发送，等查询处理完再继续，避免「回复要等前面
+# 一堆监控图发完」的体感。推送本身已经按栏目串行 + 间隔，被让行的一轮下轮补。
+def query_begin():
+    with _lock:
+        _query_depth[0] += 1
+
+
+def query_end():
+    with _lock:
+        if _query_depth[0] > 0:
+            _query_depth[0] -= 1
+
+
+def query_busy():
+    with _lock:
+        return _query_depth[0] > 0
 
 
 def attach_enabled():
@@ -654,20 +676,6 @@ def _event_keys(state, t):
         return None
 
 
-def _priority_text(state, changed, added):
-    """主推消息：只装发生变化的栏目，短小、能一眼看到新警报的奖励。"""
-    blocks = ["🚨 世界状态主推 · 新增 %d 条" % added]
-    for t in changed:
-        try:
-            txt = ws.TYPES[t][1](state)
-        except Exception:
-            txt = ""
-        if txt:
-            blocks.append(txt)
-    blocks.append("（新内容即时推送，不等周期；发「停止监控」可关闭）")
-    return "\n\n".join(blocks)
-
-
 # ---------------- 监控推送的文字标签（图文混排时放在图片前面） ----------------
 # 只做关键字匹配，不碰任何渲染逻辑，原图完全不变。
 # 顺序即优先级：更具体、或被更宽泛词包含的来源必须排前面
@@ -792,34 +800,62 @@ def _push_priority(ch, tid, key, state, prio, now):
         last_at = _priority_sent_at.get(key, 0.0)
     if now - last_at < priority_min_gap():
         return 0                      # 防抖；基线仍是旧的，下轮还能补
-    text = _priority_text(state, changed,
-                          sum(len(v) for v in added_by_type.values()))
-    ok = False
-    if _sender is not None and now >= _next_probe:
+    if query_busy():
+        return 0                      # 用户查询优先：本轮不发，基线不动，下轮补
+    # 主推也【按栏目拆分】成一条条发：每条的内容首行就是栏目标题
+    # （「📢 警报（共 N）」「🎉 活动（共 N）」），send_active 才能匹配出
+    # 【警报监控信息如下】/【活动监控信息如下】。以前拼成一条带
+    # 「🚨 世界状态主推 · 新增 N 条」抬头的消息，抬头不是栏目名 →
+    # 标签永远掉进通用的【监控信息如下】，而且和「分开一条条发」的约定相悖。
+    total_added = sum(len(v) for v in added_by_type.values())
+    sent_types, failed_parts, sent_any = [], [], False
+    for t in changed:
         try:
-            ok = bool(_sender(ch, tid, text))
+            body = ws.TYPES[t][1](state)
         except Exception:
-            ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
-        _note_probe(ok)
-    with _lock:
-        if ok:
-            _seen_priority[key] = fresh
-            _priority_sent_at[key] = now
-            _pending.pop(key, None)
-            return 1
-        parts = []
-        for t in changed:
+            body = ""
+        if not body:
+            continue
+        x = body + ("\n\n（新增 %d 条 · 即时推送，不等周期；发「停止监控」可关闭）"
+                    % total_added)
+        ok = False
+        if _sender is not None and now >= _next_probe:
             try:
-                parts.append((t, ws.TYPES[t][1](state)))
+                ok = bool(_sender(ch, tid, x))
             except Exception:
-                pass
+                ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
+            _note_probe(ok)
+        if ok:
+            sent_types.append(t)
+            sent_any = True
+        else:
+            failed_parts.append((t, body))
+    with _lock:
+        if not failed_parts:
+            # 全发成功：整份基线推进（顺带静默消化已结束的条目）
+            _seen_priority[key] = fresh
+            if sent_any:
+                _priority_sent_at[key] = now
+                _pending.pop(key, None)
+            return 1 if sent_any else 0
+        # 部分/全部失败：只有发成功的栏目推进基线，失败栏目保留旧基线，
+        # 下轮仍判定为「新增」自动重试，不会把新警报悄悄吞掉。
+        prev_seen = dict(_seen_priority.get(key) or {})
+        for t in sent_types:
+            prev_seen[t] = fresh[t]
+        _seen_priority[key] = prev_seen
+        if sent_any:
+            _priority_sent_at[key] = now
         prev = _pending.get(key) or {}
+        merged = list(prev.get("parts") or []) if prev.get("priority") else []
+        have = {t for t, _ in merged}
+        merged.extend((t, body) for t, body in failed_parts if t not in have)
         _pending[key] = {
-            "text": text,
+            "text": "\n\n".join(b for _, b in merged),
             "at": now,
             "fails": int(prev.get("fails") or 0) + 1,
-            "types": set(changed),
-            "parts": parts,
+            "types": {t for t, _ in merged},
+            "parts": merged,
             "priority": True,         # 标记：别被周期推送的成功/失败覆盖掉
         }
         return -1
@@ -910,6 +946,8 @@ def push_once():
         interval = push_interval()
         sent_any = False
         for t, x in parts[:split_max]:
+            if query_busy():
+                break                       # 用户查询优先：剩下的下轮再发
             sig_t = stable_sig(x)
             with _lock:
                 rec = (_last_sent.get(key) or {}).get(t)
@@ -939,12 +977,22 @@ def push_once():
                         prev["fails"] = int(prev.get("fails") or 0) + 1
                         _pending[key] = prev
                     else:
+                        # 多个栏目同时发不出去时要【累加】暂存：以前这里整份覆盖，
+                        # 只留下最后失败的那个栏目，前面失败的栏目就悄悄丢了
+                        # （用户最后随回复只拿到「仲裁」，看不到同一轮的「裂缝」）。
+                        merged = list(prev.get("parts") or [])
+                        have = {pt for pt, _ in merged}
+                        if t not in have:
+                            merged.append((t, x))
+                        else:
+                            merged = [(pt, x if pt == t else px)
+                                      for pt, px in merged]
                         _pending[key] = {
-                            "text": x,
+                            "text": "\n\n".join(px for _, px in merged),
                             "at": now,
                             "fails": int(prev.get("fails") or 0) + 1,
-                            "types": {t},
-                            "parts": [(t, x)],
+                            "types": {pt for pt, _ in merged},
+                            "parts": merged,
                         }
             if interval and ok:
                 time.sleep(interval)        # 相邻两条之间稍歇，防官方频控

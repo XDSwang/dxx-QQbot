@@ -231,7 +231,10 @@ def main():
         t("未开启的栏目新增不推", len(calls) == 0)
         once(mk([A1, A2], [E1, E2]))                    # 新增活动
         t("已开启栏目新增立即推", len(calls) == 1)
-        t("推的是主推精简消息", bool(calls) and "世界状态主推" in calls[0])
+        t("推的是该栏目内容（活动）+ 即时推送说明",
+          bool(calls) and "🎉 活动" in calls[0] and "即时推送" in calls[0])
+        t("标签是【活动监控信息如下】而非通用",
+          bool(calls) and M.monitor_label(calls[0]) == "【活动监控信息如下】")
         t("只装活动不装警报", bool(calls)
           and "Forma 赠送活动" in calls[0] and "火星/Wahiba" not in calls[0])
 

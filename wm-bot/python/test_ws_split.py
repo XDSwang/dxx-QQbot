@@ -213,6 +213,22 @@ def main():
         except OSError:
             pass
 
+    # ---------- 9) 用户查询优先：查询进行中推送让行 ----------
+    print("[用户查询优先·推送让行]")
+    bind(monitored)
+    calls.clear()
+    M.query_begin()
+    try:
+        busy_sent = once({}, monitored)
+        t("查询处理中 → 推送一条都不发", busy_sent == 0 and len(calls) == 0)
+        t("让行时不推进去重（下轮还能补）",
+          not (M._last_sent.get(KA) or {}))
+    finally:
+        M.query_end()
+    t("查询结束后不再让行", M.query_busy() is False)
+    after = once({}, monitored)
+    t("查询结束后正常补发（4 条）", after == 1 and len(calls) == 4)
+
     print("\n拆分测试：%d/%d 通过" % (ok, total))
     return 0 if ok == total else 1
 

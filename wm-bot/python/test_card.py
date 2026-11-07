@@ -122,7 +122,10 @@ def main():
             ok += check("分页每页回到单栏宽",
                         all(_I.open(BytesIO(p)).size[0] == R.W_SINGLE for p in huge))
             total += 1
-            ok += check("分页数量有上限（≤4 页）", len(huge) <= 4)
+            # 页数上限由 WS_CARD_MAX_PAGES 控制（默认 10，可调）：
+            # 以前写死 4 页会把「监控全部」的后续内容直接截掉。
+            _cap = int(os.environ.get("WS_CARD_MAX_PAGES") or 10)
+            ok += check("分页数量有上限（≤%d 页）" % _cap, len(huge) <= _cap)
 
     # 5) 无字体/无 Pillow：render 返回 None，不抛异常
     with patch.object(R, "_load_fonts", lambda: None):
