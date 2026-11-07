@@ -82,6 +82,16 @@ _font_cache = {}
 _font_ready = None      # None=还没探测；False=没有可用中文字体
 
 
+def _portable_font_dirs():
+    """用户可能放字体的几个位置：脚本同目录、运行目录、项目根。"""
+    here = Path(__file__).resolve().parent
+    return [
+        here / "fonts",            # python/fonts（推荐，随 python/ 同步）
+        Path.cwd() / "fonts",      # 运行 qq_bot.py 所在目录下的 fonts/
+        here.parent / "fonts",     # 项目根 fonts/
+    ]
+
+
 def _candidate_files():
     """列出所有可能的中文字体文件（环境变量 > 候选名 × 候选目录）。"""
     env = os.environ.get("WM_CARD_FONT")
@@ -93,14 +103,14 @@ def _candidate_files():
                 p = Path(d) / name
                 if p.exists():
                     yield str(p), str(Path(d) / bold)
-    # 便携：python/fonts/ 下任意字体文件（用户自己下载丢进去的最小中文字体即可，
-    # 不要求特定文件名；后面 _load_fonts 会用「星」字渲染校验是否真含中文）
-    _portable_fonts = Path(__file__).resolve().parent / "fonts"
-    if _portable_fonts.is_dir():
-        for ext in ("*.ttf", "*.ttc", "*.otf"):
-            for p in sorted(_portable_fonts.glob(ext)):
-                s = str(p)
-                yield s, s
+    # 便携：上面任一 fonts/ 目录下的任意中文字体文件（不要求特定文件名；
+    # 后面 _load_fonts 会用「星」字渲染校验是否真含中文）
+    for d in _portable_font_dirs():
+        if d.is_dir():
+            for ext in ("*.ttf", "*.ttc", "*.otf"):
+                for p in sorted(d.glob(ext)):
+                    s = str(p)
+                    yield s, s
 
 
 def _load_fonts():
@@ -141,18 +151,39 @@ def available():
 
 
 def diagnose():
-    """一句话说明「图片为什么没出来」，供开机自检与日志使用。
+    """说明「图片为什么没出来」，供开机自检与日志使用。
 
-    手机端最常见的两种：没装 Pillow、或装了但没有中文字体（Termux 默认没有），
-    表现就是回复变成一大段纯文字、红/蓝/灰昵称也跟着没了。
+    找不到中文字体时，直接报出实际检索路径、各路径是否存在、fonts 里有没有文件、
+    以及发现字体却加载失败的具体报错，方便定位（多半是字体没同步到正确位置，
+    或文件传输损坏）。手机端最常见的两种：没装 Pillow、或装了但没有中文字体。
     """
     if not _PIL_OK:
         return ("缺 Pillow：pip install pillow（Termux 也可 pkg install python-pillow）；"
                 "当前只能发纯文字")
-    if not available():
-        return ("Pillow 已装但找不到可用中文字体：Termux 执行 pkg install noto-cjk-fonts，"
-                "或用 WM_CARD_FONT 指定一个中文 TTF/TTC 路径；当前只能发纯文字")
-    return "OK：Pillow + 中文字体可用，可正常出图"
+    if available():
+        return "OK：Pillow + 中文字体可用，可正常出图"
+    # 找不到：给出实际检索位置与命中情况，便于定位
+    lines = ["Pillow 已装但找不到可用中文字体。检索情况："]
+    for d in _portable_font_dirs():
+        if d.is_dir():
+            files = [p.name for p in d.iterdir()
+                     if p.suffix.lower() in (".ttf", ".ttc", ".otf")]
+            lines.append("  ✔ %s（存在，字体文件：%s）" % (d, files or "无"))
+        else:
+            lines.append("  ✘ %s（不存在）" % d)
+    lines.append("  运行目录 CWD = %s" % Path.cwd())
+    # 若发现了字体但加载失败，报具体错误（如文件损坏 / PIL 不支持该格式）
+    load_errs = []
+    for bold_p, reg_p in _candidate_files():
+        try:
+            ImageFont.truetype(reg_p, 10)
+        except Exception as e:
+            load_errs.append("%s → %s" % (Path(reg_p).name, e))
+    if load_errs:
+        lines.append("  发现字体但加载失败：" + " | ".join(load_errs[:3]))
+    lines.append("  解决：把任意中文字体（wqy-microhei.ttc 等）放进上面的 fonts/ 目录，"
+                 "或在 data/config.txt 设 WM_CARD_FONT=/绝对路径/字体.ttf 后重启")
+    return "\n".join(lines)
 
 
 # ------------------------------ 文本处理 ------------------------------
