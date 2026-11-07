@@ -122,6 +122,20 @@ def _portable_font_dirs():
     ]
 
 
+# 项目内唯一含敏感数据的目录（密钥 / 群白名单 / 缓存 / 日志），绝不外泄。
+# 自检要打印检索路径便于排障，但凡出现这个绝对路径就脱敏，项目其余路径照常可见。
+_DATA_DIR_STR = str(Path(__file__).resolve().parent / "data")
+
+
+def _safe(p):
+    """打印路径前把 data/ 真实绝对路径脱敏，避免泄露敏感目录。"""
+    s = str(p)
+    if _DATA_DIR_STR and _DATA_DIR_STR in s:
+        rel = s[len(_DATA_DIR_STR):].lstrip("/\\")
+        return "<项目>/data%s（已隐藏）" % ("/" + rel if rel else "")
+    return s
+
+
 _env_font_warn = ""   # 跨平台路径告警（Windows 盘符路径误用在手机端时填充），供 diagnose 显示
 
 
@@ -142,7 +156,7 @@ def _env_font_path(key):
         _env_font_warn = ("WM_CARD_FONT 含 Windows 风格路径「%s」，但当前是 %s 平台，"
                           "盘符/反斜杠在手机端无效；请改成 Termux 上的真实路径，"
                           "或把字体放进 python/fonts/ 后删除该配置项"
-                          % (raw, _SYS or "非Windows"))
+                          % (_safe(raw), _SYS or "非Windows"))
     return str(Path(raw))   # Path 自动按当前 OS 规整分隔符
 
 
@@ -224,10 +238,10 @@ def diagnose():
         if d.is_dir():
             files = [p.name for p in d.iterdir()
                      if p.suffix.lower() in (".ttf", ".ttc", ".otf")]
-            lines.append("  ✔ %s（存在，字体文件：%s）" % (d, files or "无"))
+            lines.append("  ✔ %s（存在，字体文件：%s）" % (_safe(d), files or "无"))
         else:
-            lines.append("  ✘ %s（不存在）" % d)
-    lines.append("  运行目录 CWD = %s" % Path.cwd())
+            lines.append("  ✘ %s（不存在）" % _safe(d))
+    lines.append("  运行目录 CWD = %s" % _safe(Path.cwd()))
     # 若发现了字体但加载失败，报具体错误（如文件损坏 / PIL 不支持该格式）
     load_errs = []
     for bold_p, reg_p in _candidate_files():
