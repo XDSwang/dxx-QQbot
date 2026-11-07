@@ -165,6 +165,7 @@ FIELD_LABELS = {
     "constructionProgress": "建造进度",
     # 主页面其它栏目（wf.wiki 主页一屏能看到的，全部都要能单独查）
     "duviriCycle": "双衍王境", "zarimanCycle": "扎里曼",
+    "circuit": "回廊",
     "globalUpgrades": "全局加成", "tenetCoda": "信条/终幕",
     "bountyBoard": "赏金", "bounties": "赏金轮换",
     "varzia": "瓦奇娅", "news": "新闻",
@@ -739,6 +740,41 @@ def _fetch_sortie():
             "expiry": exp, "variants": variants}
 
 
+# 无尽回廊也只在 DE 官方端点里：EndlessXpSchedule[0]。
+# EXC_NORMAL = 普通回廊本周三选一战甲；EXC_HARD = 钢铁回廊本周五把灵化武器。
+# 轮换是每周一 00:00 UTC 由服务端写的，能直接读到，不用本地静态表推算。
+_CIRCUIT_CAT = {"EXC_NORMAL": "normal", "EXC_HARD": "hard"}
+
+
+def _fetch_circuit():
+    """从 DE 官方端点抓本周回廊轮换（EndlessXpSchedule[0]）→ 内部 circuit 结构。
+
+    normal = 普通回廊 3 套战甲，hard = 钢铁回廊 5 把灵化武器；
+    名称保持官方英文原名（中文译名各服不一致，硬映射容易出错）。
+    """
+    dom = _domain_of(OFFICIAL_WS_URL)
+    wm.pace_gate_ex(dom, WS_PACE_MIN, WS_PACE_MAX)
+    d = _http_json(OFFICIAL_WS_URL, headers=WS_HTML_HEADERS)
+    arr = (d or {}).get("EndlessXpSchedule") or []
+    if not arr:
+        return None
+    it = arr[0] or {}
+    got = {}
+    for c in (it.get("CategoryChoices") or []):
+        key = _CIRCUIT_CAT.get(c.get("Category"))
+        if not key:
+            continue
+        got[key] = [x for x in (_clean(n) for n in (c.get("Choices") or [])) if x]
+    if not got:
+        return None
+    return {"activation": _ms(((it.get("Activation") or {}).get("$date")
+                               or {}).get("$numberLong")),
+            "expiry": _ms(((it.get("Expiry") or {}).get("$date")
+                           or {}).get("$numberLong")),
+            "normal": got.get("normal") or [],
+            "hard": got.get("hard") or []}
+
+
 # --------------------- 仲裁补源（arbi.wf.wiki 轮换表，本地推算）---------------------
 # 仲裁每小时整点换一张图。arbi.wf.wiki 并不「实时抓接口」，它把轮换表固化成了
 # 两张静态 JSON：schedule = {startTs, stepSec, nodes[节点码], seq[序号->nodes 下标]}，
@@ -883,6 +919,21 @@ def _fetch_wfwiki():
             _log(f"突击补抓失败（不影响其它数据）：{e}")
             if old:
                 state["sortie"] = old
+    # 回廊补源：同上，本周轮换结束前直接复用缓存（一周才变一次），否则现抓一次
+    old_c = (get_state() or {}).get("circuit")
+    if old_c and old_c.get("expiry") and old_c["expiry"] > time.time() + 60:
+        state["circuit"] = old_c
+    else:
+        try:
+            cc = _fetch_circuit()
+            if cc:
+                state["circuit"] = cc
+            elif old_c:
+                state["circuit"] = old_c
+        except Exception as e:
+            _log(f"回廊补抓失败（不影响其它数据）：{e}")
+            if old_c:
+                state["circuit"] = old_c
     # 仲裁补源：arbi.wf.wiki 轮换表本地推算（表 7 天一同步，平时零请求）
     try:
         arb = _arbi_state()
@@ -1632,6 +1683,24 @@ def _fmt_sortie(s):
     return "\n".join(out)
 
 
+def _fmt_circuit(s):
+    """无尽回廊本周轮换：普通回廊 3 套战甲 + 钢铁回廊 5 把灵化武器。"""
+    c = s.get("circuit") or {}
+    if not c:
+        return "🌀 无尽回廊：（暂时取不到，稍后自动重试）"
+    out = [f"🌀 无尽回廊（本周{_cycle_left(c.get('expiry'))}）"]
+    nrm = c.get("normal") or []
+    hard = c.get("hard") or []
+    if nrm:
+        out.append("  · 普通回廊 · 战甲三选一：" + "、".join(nrm))
+    if hard:
+        out.append("  · 钢铁回廊 · 灵化武器：" + "、".join(hard))
+    if not nrm and not hard:
+        out.append("  （本轮轮换数据为空，等刷新）")
+    out.append("（每周一 00:00 UTC 轮换；名称沿用官方原名）")
+    return "\n".join(out)
+
+
 def _fmt_arbitration(s):
     a = s.get("arbitration") or {}
     if not a:
@@ -2037,6 +2106,7 @@ TYPES = {
     "cambion":      ("魔胎之境", _fmt_cambion),
     "duviri":       ("双衍王境", _fmt_duviri),
     "zariman":      ("扎里曼", _fmt_zariman),
+    "circuit":      ("回廊", _fmt_circuit),
     "sortie":       ("突击", _fmt_sortie),
     "arbitration":  ("仲裁", _fmt_arbitration),
     "fissures":     ("裂缝", _fmt_fissures),
@@ -2072,6 +2142,11 @@ KEYWORDS = {
     "魔胎之境": "cambion", "火卫二": "cambion", "火卫二平原": "cambion",
     "双衍": "duviri", "duviri": "duviri", "王境": "duviri", "双衍王境": "duviri",
     "扎里曼": "zariman", "zariman": "zariman",
+    # 回廊（无尽回廊）只在 DE 官方端点 EndlessXpSchedule 里，wf.wiki 没有；
+    # 灵化 = 钢铁回廊的灵化武器轮换，同一个栏目。
+    "回廊": "circuit", "无尽回廊": "circuit", "circuit": "circuit",
+    "钢铁回廊": "circuit", "灵化": "circuit", "灵化武器": "circuit",
+    "incarnon": "circuit",
     "突击": "sortie", "sortie": "sortie",
     "仲裁": "arbitration", "arbitration": "arbitration", "arb": "arbitration",
     "裂缝": "fissures", "fissure": "fissures", "fissures": "fissures",
@@ -2206,9 +2281,13 @@ def parse_ws_command(text):
         return {"action": "help"}
     if t in PLAN_WORDS:
         return {"action": "plan"}
-    # 显式带「裂缝 / 钢铁裂缝」的查询也按维度过滤（监控与查询通用）
-    if any(w in t for w in ("裂缝", "裂隙", "fissure", "钢铁裂缝", "钢铁", "steel")):
-        spec = parse_fissure_spec(t)
+    # 显式带「裂缝 / 钢铁裂缝」的查询也按维度过滤（监控与查询通用）。
+    # 回廊词里的「钢铁」不是裂缝：先剔掉再判，否则「钢铁回廊」会被当钢铁裂缝。
+    fis_t = t
+    for w in ("无尽回廊", "钢铁回廊", "灵化武器", "灵化", "回廊", "incarnon", "circuit"):
+        fis_t = fis_t.replace(w, "")
+    if any(w in fis_t for w in ("裂缝", "裂隙", "fissure", "钢铁裂缝", "钢铁", "steel")):
+        spec = parse_fissure_spec(fis_t)
         if spec is not None:
             return {"action": "query", "types": [spec["column"]], "filter": spec["tokens"]}
     # 赏金可按集团 / 地区缩小（连写也行：「赏金Ostron」「赏金坚守者」「赏金 扎里曼」）；
@@ -2251,10 +2330,15 @@ def _parse_monitor(rest):
             if kw in rest:
                 rest = rest.replace(kw, "")
         bounty_toks = parse_bounty_tokens(rest)
+    # 回廊（无尽回廊 / 钢铁回廊 / 灵化）不是裂缝：先剔掉这些词再判裂缝，
+    # 否则「监控 钢铁回廊」里的「钢铁」会被当成钢铁裂缝，多开一个栏目。
+    fis_low = low
+    for w in ("无尽回廊", "钢铁回廊", "灵化武器", "灵化", "回廊", "incarnon", "circuit"):
+        fis_low = fis_low.replace(w, "")
     # 只有在「没有其它栏目」或「显式写了裂缝/钢铁裂缝」时才解析裂缝过滤，
     # 否则「监控 平原」里的杂词会被误当成裂缝条件。
-    explicit_fis = any(w in low for w in ("裂缝", "裂隙", "fissure", "steel"))
-    spec = parse_fissure_spec(low) if (explicit_fis or not other_cols) else None
+    explicit_fis = any(w in fis_low for w in ("裂缝", "裂隙", "fissure", "steel"))
+    spec = parse_fissure_spec(fis_low) if (explicit_fis or not other_cols) else None
     # 没写「裂缝/钢铁裂缝」又带无法识别的词 → 当不认识，绝不默默开一个永远空的过滤监控
     if spec is not None and not explicit_fis and spec.get("residual"):
         spec = None
@@ -2302,6 +2386,7 @@ HELP_TEXT = (
     "  平原：平原（五处时间一起给，各处附自己的赏金）/ 希图斯 / 奥布山谷 / 魔胎之境 / 双衍 / 扎里曼\n"
     "  战斗：裂缝（常规星球在上、九重天在下，各按 古→前→中→后→安魂→全能 排序）\n"
     "        钢铁裂缝 / 突击 / 仲裁 / 入侵 / 警报 / 活动\n"
+    "        回廊（本周普通回廊三选一战甲 + 钢铁回廊五把灵化武器，每周一 00:00 UTC 换）\n"
     "  轮换：商人 / 瓦奇娅 / 特惠 / 电波 / 加成\n"
     "  赏金：赏金（六个集团一次给全，每档带奖励）/ 赏金轮换（本轮 + 宝库奖励）\n"
     "        单个集团：赏金 Ostron / 赏金 坚守者 / 赏金 扎里曼（也可 监控 赏金 Ostron）\n"
@@ -2335,6 +2420,7 @@ HELP_TEXT = (
     "        睡到最快结束那条才查【一次】，查完重排，没到点零请求；\n"
     "        两次请求间隔按 10/20/50 秒节拍兜底，且每次都守同域名 3~5 秒底线；\n"
     "        仲裁来自 arbi.wf.wiki 的轮换表（本地推算，7 天同步一次，平时零请求）；\n"
+    "        突击与回廊来自 DE 官方 api.warframe.com（回廊一周才变，未过期复用缓存）；\n"
     "        查询与监控推送都只读缓存，不额外打接口。\n"
     "        监控推送分两路：警报/活动新条目立即主推；其余栏目内容变化才周期推。\n"
     "        两手准备：能主动发就发；官方主动消息未开通时会攒着，\n"
@@ -2474,6 +2560,10 @@ _MOCK_WS = {
                     "expiry": int(time.time() + 3600)},
     "zarimanCycle": {"state": "Corpus", "stateKey": "corpus",
                      "expiry": int(time.time() + 5400)},
+    "circuit": {"activation": int(time.time() - 86400),
+                "expiry": int(time.time() + 5 * 86400),
+                "normal": ["Ivara", "Inaros", "Titania"],
+                "hard": ["Braton", "Lato", "Skana", "Paris", "Kunai"]},
     "sortie": {"boss": "屠夫", "expiry": int(time.time() + 86400),
                "variants": [
                    {"node": "赛德娜/Hydron", "modifier": "神盾枪兵",
