@@ -1779,10 +1779,16 @@ TYPES = {
 KEYWORDS = {
     "警报": "alerts", "alert": "alerts", "alerts": "alerts",
     "平原": "cycles", "cycle": "cycles", "昼夜": "cycles", "cycles": "cycles",
-    "希图斯": "cetus", "cetus": "cetus",
+    "平原昼夜": "cycles",
+    # 区域名必须和推送标签一模一样：机器人推的是「奥布山谷/魔胎之境/双衍王境」，
+    # 用户照着打「奥布山谷=关闭」却匹配不上（旧表只有「奥布」「山谷」），
+    # 会静默无反应。这里把全名与常见别称都精确列进来（仍不做模糊匹配）。
+    "希图斯": "cetus", "cetus": "cetus", "地球平原": "cetus",
     "奥布": "vallis", "vallis": "vallis", "山谷": "vallis",
+    "奥布山谷": "vallis", "金星平原": "vallis",
     "魔胎": "cambion", "cambion": "cambion",
-    "双衍": "duviri", "duviri": "duviri", "王境": "duviri",
+    "魔胎之境": "cambion", "火卫二": "cambion", "火卫二平原": "cambion",
+    "双衍": "duviri", "duviri": "duviri", "王境": "duviri", "双衍王境": "duviri",
     "扎里曼": "zariman", "zariman": "zariman",
     "突击": "sortie", "sortie": "sortie",
     "仲裁": "arbitration", "arbitration": "arbitration", "arb": "arbitration",
@@ -1790,8 +1796,8 @@ KEYWORDS = {
     "钢铁": "steel", "钢铁裂缝": "steel", "steel": "steel", "steelpath": "steel",
     "赏金": "bounty", "悬赏": "bounty", "bounty": "bounty",
     "赏金轮换": "bountyrot", "轮换": "bountyrot", "bountyrot": "bountyrot",
-    "信条": "tenet", "tenet": "tenet",
-    "终幕": "coda", "coda": "coda", "coda武器": "coda",
+    "信条": "tenet", "tenet": "tenet", "信条武器": "tenet",
+    "终幕": "coda", "coda": "coda", "coda武器": "coda", "终幕武器": "coda",
     "加成": "upgrades", "双倍": "upgrades", "upgrades": "upgrades",
     "活动": "events", "event": "events", "events": "events",
     "入侵": "invasions", "invasion": "invasions", "invasions": "invasions",
@@ -1800,9 +1806,9 @@ KEYWORDS = {
     "voidtrader": "voidtrader", "白老头": "voidtrader",
     "特惠": "daily", "daily": "daily", "darvo": "daily",
     "瓦奇娅": "varzia", "varzia": "varzia", "原初": "varzia",
-    "信使": "outpost", "outpost": "outpost",
-    "集团": "syndicate", "syndicate": "syndicate",
-    "建造": "construction", "construction": "construction",
+    "信使": "outpost", "outpost": "outpost", "信使前哨": "outpost",
+    "集团": "syndicate", "syndicate": "syndicate", "集团任务": "syndicate",
+    "建造": "construction", "construction": "construction", "建造进度": "construction",
     "新闻": "news", "news": "news",
     "全部": "__all__", "all": "__all__", "全": "__all__",
 }

@@ -132,6 +132,49 @@ def main():
         t("status 也算状态查询",
           ws.parse_ws_command("status")["action"] == "switch_status")
 
+        # ---------- 1b) 区域全名：推送标签写的就是这个名字，必须能直接开关/查询 ----------
+        # 曾经「奥布山谷=关闭」静默无反应：KEYWORDS 里只有「奥布」「山谷」，
+        # 没有机器人自己印在标签上的「奥布山谷」全名。
+        print("[区域全名]")
+        for name, key in (("希图斯", "cetus"), ("奥布山谷", "vallis"),
+                          ("魔胎之境", "cambion"), ("双衍王境", "duviri"),
+                          ("扎里曼", "zariman"), ("地球平原", "cetus"),
+                          ("金星平原", "vallis"), ("火卫二", "cambion")):
+            c = ws.parse_ws_command("%s=关闭" % name)
+            t("%s=关闭 -> %s/off" % (name, key),
+              c.get("action") == "switch"
+              and c.get("items") == [{"types": key, "on": False}])
+            c = ws.parse_ws_command("%s=开启" % name)
+            t("%s=开启 -> %s/on" % (name, key),
+              c.get("action") == "switch"
+              and c.get("items") == [{"types": key, "on": True}])
+            t("%s 是 ws 指令（可直接查询）" % name,
+              qq_common.is_ws_command(name))
+        for s in ("奥布山谷 关闭", "关闭 奥布山谷"):
+            c = ws.parse_ws_command(s)
+            t("自然语序 %-12s" % s, c.get("action") == "switch"
+              and c.get("items") == [{"types": "vallis", "on": False}])
+
+        # ---------- 1c) 全覆盖：机器人推出来的每个标签名，都必须能直接开关 ----------
+        # 原则：标签上印什么名字，用户就该能拿这个名字关掉它（仍然只做精确匹配）。
+        print("[标签名全覆盖]")
+        names = {}
+        for _t in ws.TYPES:
+            try:
+                _txt = ws.TYPES[_t][1]({})
+            except Exception:
+                _txt = ""
+            _n = M.monitor_label(_txt).strip("【】").replace("监控信息如下", "")
+            names.setdefault(_n, []).append(_t)
+        for _n in names:
+            c = ws.parse_ws_command("%s=关闭" % _n)
+            t("标签名 %-6s 可关闭" % _n, c.get("action") == "switch")
+            t("标签名 %-6s 可开启" % _n,
+              ws.parse_ws_command("%s=开启" % _n).get("action") == "switch")
+        for chat in ("奥布山谷好玩吗", "我要去集团任务了", "建造进度慢死了",
+                     "信使前哨在哪", "集团任务做完了"):
+            t("闲聊不触发 %-12s" % chat, not qq_common.is_ws_command(chat))
+
         # ---------- 2) 不能把普通聊天 / 别的指令吞掉 ----------
         print("[触发词边界 / 防误判]")
         for s in ("你好呀", "裂缝", "监控 警报", "停止监控", "计划", "活动=哈哈哈",
@@ -142,6 +185,7 @@ def main():
         t("警报=关闭 是 ws 指令", qq_common.is_ws_command("警报=关闭"))
         t("主推状态 是 ws 指令", qq_common.is_ws_command("主推状态"))
         t("普通闲聊不是 ws 指令", not qq_common.is_ws_command("大家好啊"))
+        t("闲聊里含区域名也不触发", not qq_common.is_ws_command("奥布山谷好玩吗"))
         t("帮助文本写明开关用法", "活动=开启" in ws.HELP_TEXT
           and "主推状态" in ws.HELP_TEXT and "重启后自动恢复" in ws.HELP_TEXT)
 
@@ -278,6 +322,11 @@ def main():
         r = qq_common.handle_ws("活动=开启，警报=关闭", ctx)
         t("一条消息多组都生效", "已开启" in r and "已关闭" in r
           and M._switches[KA] == {"events": True, "alerts": False})
+        # 区域全名（标签上印的名字）端到端：能关、能给出「已关闭」回复
+        hr = qq_common.handle_ws("奥布山谷=关闭", ctx)
+        t("奥布山谷=关闭 有回复且写明已关闭",
+          "已关闭" in str(hr) and "奥布山谷" in str(hr))
+        t("奥布山谷=关闭 写进会话开关", M._switches[KA].get("vallis") is False)
         r = qq_common.handle_ws("主推状态", ctx)
         t("状态回复列出监控/主推/手动开关",
           "⚙️ 本会话主推开关" in r and "已手动开启" in r and "已手动关闭" in r)
