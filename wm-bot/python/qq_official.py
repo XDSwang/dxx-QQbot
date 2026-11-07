@@ -958,6 +958,10 @@ def main():
     if saved_n:
         print(f"[official] 已恢复 {saved_n} 个会话保存的主推开关"
               "（发「主推状态」可查看）", file=sys.stderr)
+    # 恢复裂缝类栏目的过滤条件（「监控 裂缝后纪中断」等），与开关各自独立存盘
+    saved_f = ws_monitor.load_filters()
+    if saved_f:
+        print(f"[official] 已恢复 {saved_f} 个会话的裂缝过滤条件", file=sys.stderr)
     # 可选：对白名单群自动注册「警报 / 活动」主推（默认关，见 WS_AUTO_PRIORITY）
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:

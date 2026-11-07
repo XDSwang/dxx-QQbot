@@ -283,7 +283,7 @@ def main():
         with patch.object(ws, "ensure_fresh", lambda: {}), \
              patch.object(ws, "activity_touch", lambda: None), \
              patch.object(M, "_parts_of",
-                          lambda state, types: [("fissures", content)]):
+                          lambda state, types, key=None: [("fissures", content)]):
             return M.push_once()
 
     s1 = _push_with("🔥 裂缝")

@@ -55,9 +55,11 @@ import worldstate as ws
 HERE = Path(__file__).resolve().parent
 DEFAULT_SWITCH_FILE = HERE / "data" / "ws_switches.json"
 LAST_SENT_FILE = HERE / "data" / "ws_last_sent.json"   # 按栏目去重记录（落盘，防重启重发）
+DEFAULT_FILTER_FILE = HERE / "data" / "ws_filters.json"  # 裂缝维度过滤（落盘，重启后恢复）
 
 _sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text) -> bool
 _monitors = {}                       # (channel, target_id) -> set(types)
+_fissure_filters = {}                # (channel, target_id) -> {"fissures":[token...], "steel":[token...]}
 _switches = {}                       # (channel, target_id) -> {type: bool}  聊天指令设的开关
 _pending = {}                        # (channel, target_id) -> {"text":str,"at":float,"fails":int}
 _attached_at = {}                    # (channel, target_id) -> 上次随查询附带的时刻
@@ -306,7 +308,17 @@ def set_switch(channel, target_id, types, on):
         if seen:
             for t in todo:
                 seen.pop(t, None)
+        # 关掉某栏目时，顺手清掉它的裂缝维度过滤（不再适用）
+        if not on:
+            ff = _fissure_filters.get(key)
+            if ff:
+                for t in todo:
+                    ff.pop(t, None)
+                if not ff:
+                    _fissure_filters.pop(key, None)
         _save_switches()
+        if not on and _fissure_filters:
+            _save_filters()
     if on:
         ws.ensure_active()
         _ensure_push_thread()
@@ -317,6 +329,59 @@ def reset_switches():
     """仅供离线测试：清空内存态开关，不动磁盘文件。"""
     with _lock:
         _switches.clear()
+
+
+def filter_file():
+    raw = os.environ.get("WS_FILTER_FILE")
+    return Path(raw) if raw else DEFAULT_FILTER_FILE
+
+
+def _save_filters():
+    """原子写盘裂缝维度过滤；磁盘不可写时静默降级为本次运行有效。"""
+    p = filter_file()
+    tmp = p.with_name(p.name + ".tmp")
+    payload = {"version": 1,
+               "sessions": {"%s|%s" % (ch, tid):
+                            {c: list(toks) for c, toks in f.items() if toks}
+                            for (ch, tid), f in _fissure_filters.items() if f}}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def load_filters():
+    """启动时恢复上次保存的裂缝维度过滤；坏文件 / 字段不认识都当空。"""
+    p = filter_file()
+    data = {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8-sig"))
+        sessions = (obj or {}).get("sessions") or {}
+        if isinstance(sessions, dict):
+            for k, v in sessions.items():
+                if not isinstance(k, str) or "|" not in k or not isinstance(v, dict):
+                    continue
+                ch, tid = k.split("|", 1)
+                if ch not in ("group", "private") or not tid:
+                    continue
+                f = {c: list(toks) for c, toks in v.items()
+                     if c in ("fissures", "steel") and isinstance(toks, list)}
+                if f:
+                    data[(ch, tid)] = f
+    except Exception:
+        data = {}
+    with _lock:
+        _fissure_filters.clear()
+        _fissure_filters.update(data)
+    return len(data)
 
 
 def effective_types(key, raw_types):
@@ -467,11 +532,33 @@ def restore_last_sent():
         len(restored), sum(len(m) for m in restored.values())))
 
 
-def start_monitor(channel, target_id, types):
-    """开启某会话的监控；types 为 worldstate.TYPES 的键集合。"""
+def start_monitor(channel, target_id, types, filters=None):
+    """开启某会话的监控；types 为 worldstate.TYPES 的键集合。
+
+    filters：可选 {栏目键: [过滤 token...]}，仅对 fissures / steel 有意义；
+    写盘后重启自动恢复。
+    """
     key = (channel, str(target_id))
     with _lock:
         _monitors[key] = set(types)
+        # 本次指令点到的栏目以本次为准：带条件就设条件，不带条件就清掉旧条件
+        # （否则「监控 裂缝」会静默沿用上次的「后纪中断」，看起来像没生效）
+        ff = _fissure_filters.setdefault(key, {})
+        for c in types:
+            toks = (filters or {}).get(c)
+            if toks:
+                ff[c] = list(toks)
+            else:
+                ff.pop(c, None)
+        for c, toks in (filters or {}).items():
+            if toks and c not in types:
+                ff[c] = list(toks)
+        if not ff:
+            _fissure_filters.pop(key, None)
+        # 有过滤就落盘；即使本次是把条件清空，只要磁盘上已有文件也要重写，
+        # 否则磁盘会残留上一次的条件，重启后又冒出来（不新建文件，避免无谓写盘）。
+        if _fissure_filters or filter_file().exists():
+            _save_filters()
     ws.ensure_active()               # 拉起世界状态后台刷新
     _ensure_push_thread()
 
@@ -490,10 +577,13 @@ def stop_monitor(channel, target_id):
         _seen_priority.pop(key, None)
         _priority_sent_at.pop(key, None)
         had_switch = bool(_switches.pop(key, None))
+        had_filter = bool(_fissure_filters.pop(key, None))
         if had_switch:
             _save_switches()
+        if had_filter:
+            _save_filters()
         removed = _monitors.pop(key, None) is not None
-        changed = removed or had_switch
+        changed = removed or had_switch or had_filter
     if changed:
         _save_last_sent()            # 把「已移除该会话」的去重记录落盘
     return changed
@@ -631,23 +721,32 @@ def _pick(p, covered):
     return p.get("text") or ""
 
 
-def _parts_of(state, types):
-    """按栏目拆分格式化结果，便于附带时精确剔除重复栏目（顺序按 TYPES 展示序）。"""
+def _col_text(state, t, key):
+    """格式化某栏目；对 fissures / steel 应用本会话的维度过滤（key 为会话）。"""
+    toks = (_fissure_filters.get(key) or {}).get(t) if key else None
+    try:
+        return ws.TYPES[t][1](state, toks) if toks else ws.TYPES[t][1](state)
+    except Exception:
+        return ""
+
+
+def _parts_of(state, types, key=None):
+    """按栏目拆分格式化结果，便于附带时精确剔除重复栏目（顺序按 TYPES 展示序）。
+
+    key：会话键；提供时 fissures / steel 会应用该会话的维度过滤。
+    """
     out = []
     for t in ws.TYPES:
         if t not in types:
             continue
-        try:
-            txt = ws.TYPES[t][1](state)
-        except Exception:
-            txt = ""
+        txt = _col_text(state, t, key)
         if txt:
             out.append((t, txt))
     return out
 
 
 # ---------------- 事件主推：新警报 / 新活动立刻推 ----------------
-def _event_keys(state, t):
+def _event_keys(state, t, key=None):
     """把某栏目的当前条目压成一组稳定键，用来判断「有没有新东西」。
 
     键里含 expiry（条目的固定结束时刻，不会随刷新漂移）和奖励 / 描述，
@@ -670,7 +769,9 @@ def _event_keys(state, t):
                     for e in (state.get("events") or [])}
         # 其它栏目没有「条目列表」结构：用稳定化后的整栏文本当一个键，
         # 粒度粗一些，但任何栏目都能被配成主推。
-        txt = ws.TYPES[t][1](state)
+        # fissures / steel 应用本会话维度过滤，使过滤后的「内容变化」才判定新增。
+        toks = (_fissure_filters.get(key) or {}).get(t) if key else None
+        txt = ws.TYPES[t][1](state, toks) if toks else ws.TYPES[t][1](state)
         return {stable_sig(txt)} if txt else set()
     except Exception:
         return None
@@ -779,7 +880,7 @@ def _push_priority(ch, tid, key, state, prio, now):
         seen = dict(_seen_priority.get(key) or {})
     fresh = {}
     for t in prio:
-        keys = _event_keys(state, t)
+        keys = _event_keys(state, t, key)
         if keys is None:
             return 0                  # 数据不可靠，本轮不动基线
         fresh[t] = keys
@@ -811,7 +912,7 @@ def _push_priority(ch, tid, key, state, prio, now):
     sent_types, failed_parts, sent_any = [], [], False
     for t in changed:
         try:
-            body = ws.TYPES[t][1](state)
+            body = _col_text(state, t, key)
         except Exception:
             body = ""
         if not body:
@@ -939,7 +1040,7 @@ def push_once():
         full = set(types)
         if prio and skip_full:
             full -= set(prio)
-        parts = _parts_of(state, full)
+        parts = _parts_of(state, full, key)
         if not parts:
             continue
         split_max = push_split_max()

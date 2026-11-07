@@ -93,9 +93,9 @@ def once(st, spy_parts=None, extra=()):
     if spy_parts is not None:
         real = M._parts_of
 
-        def _spy(state, types):
+        def _spy(state, types, key=None):
             spy_parts.append(set(types))
-            return real(state, types)
+            return real(state, types, key)
         ctx.append(patch.object(M, "_parts_of", _spy))
     ctx.extend(extra)
     with ExitStack() as stack:
@@ -279,7 +279,7 @@ def main():
     M._priority_sent_at[KA] = time.time()
     with patch.dict(os.environ, {"WS_PRIORITY_MIN_GAP": "300"}), \
          patch.object(M, "_parts_of",
-                      lambda state, types: [("fissures", "🔥 裂缝（共 1）")]):
+                      lambda state, types, key=None: [("fissures", "🔥 裂缝（共 1）")]):
         once(mk([A1, A2], [E1]))
     t("周期推送成功也没清掉主推暂存",
       M._pending[KA].get("priority") is True
@@ -329,7 +329,7 @@ def main():
          patch.object(ws, "activity_touch", lambda: None), \
          patch.object(ws, "ensure_active", lambda: None), \
          patch.object(M, "_parts_of",
-                      lambda state, types: [("fissures", next(texts))]):
+                      lambda state, types, key=None: [("fissures", next(texts))]):
         s1 = M.push_once()
         s2 = M.push_once()
     t("周期首次推送成功", s1 == 1)

@@ -582,12 +582,21 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
             return finalize("（无法识别会话，无法开启监控；群聊需在白名单内）", ctx,
                             force_image=force_image, force_text=force_text,
                             title="星际战甲 · 世界状态监控")
-        ws_monitor.start_monitor(ch, tid, set(cmd["types"]))
+        filters = cmd.get("fissure_filter") or None
+        ws_monitor.start_monitor(ch, tid, set(cmd["types"]), filters=filters)
         names = "、".join(worldstate.TYPES[t][0] for t in cmd["types"] if t in worldstate.TYPES)
         msg = ("✅ 已开始监控：%s\n每 %d 秒检查一次，内容有变化才推送"
                "（周期最小间隔 %d 秒，倒计时跳动不算变化）。"
                % (names, int(worldstate.WS_PUSH_SECONDS),
                   int(ws_monitor.active_min_gap())))
+        if filters:
+            conds = "、".join("「%s」" % " ".join(toks)
+                             for toks in filters.values() if toks)
+            msg += ("\n🔎 只推送同时满足 %s 的条目（其余已忽略）。"
+                    "\n💡 想改成整栏推送，再发一次不带条件的「监控 %s」即可。"
+                    % (conds, names))
+            if "steel" in filters:
+                msg += "\n⚠️ 钢铁裂缝数据源不提供任务类型，「钢铁裂缝 中断」这类任务过滤会一直为空。"
         prio = [t for t in ws_monitor.priority_types() if t in set(cmd["types"])]
         if prio:
             pn = "、".join(worldstate.TYPES[t][0] for t in prio)

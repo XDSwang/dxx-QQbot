@@ -58,9 +58,12 @@ def _run_onebot():
     import ws_monitor
     ws_monitor.set_sender(client.send_active)
     saved_n = ws_monitor.load_switches()
+    saved_f = ws_monitor.load_filters()
     if saved_n:
         print(f"[qq_bot] 已恢复 {saved_n} 个会话保存的主推开关"
               "（发「主推状态」可查看）", file=sys.stderr)
+    if saved_f:
+        print(f"[qq_bot] 已恢复 {saved_f} 个会话的裂缝过滤条件", file=sys.stderr)
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:
         print(f"[qq_bot] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "

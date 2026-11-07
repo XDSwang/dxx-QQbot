@@ -490,7 +490,8 @@ def _wfwiki_to_state(raw):
     for f in (raw.get("fissures") or []):
         item = {
             "node": loc(f.get("system"), f.get("node")),
-            "missionType": _clean(f.get("mission")) or "?",
+            # 任务类型在 wf.wiki 里是 missionType 字段（mission 常为 null），优先取它
+            "missionType": _clean(f.get("missionType") or f.get("mission")) or "?",
             "enemy": _clean(f.get("faction")) or "?",
             "tier": _clean(f.get("tier")) or "",
             "expiry": _ms(f.get("expiry")),
@@ -611,12 +612,15 @@ def _wfwiki_to_state(raw):
     # 赏金轮换（本轮奖励 + 宝库轮换 + 各集团赏金）
     bt = raw.get("bounties")
     if bt:
+        def _rw(x):
+            # 数据源偶尔把奖励名直接塞成字符串（而非 {name:...}），两种都兜底，避免整段崩溃
+            return _clean(x.get("name")) or "?" if isinstance(x, dict) else (_clean(x) or "?")
         s["bounties"] = {
             "expiry": _ms(bt.get("expiry")),
             "rot": bt.get("rot"),
-            "rotRewards": [_clean(r.get("name")) or "?" for r in (bt.get("rotRewards") or [])],
+            "rotRewards": [_rw(r) for r in (bt.get("rotRewards") or [])],
             "vaultRot": bt.get("vaultRot"),
-            "vaultRewards": [_clean(r.get("name")) or "?" for r in (bt.get("vaultRewards") or [])],
+            "vaultRewards": [_rw(r) for r in (bt.get("vaultRewards") or [])],
             "groups": [{"name": _clean(g.get("name")) or "?",
                         "jobs": [{"node": _clean(j.get("node")) or "?",
                                   "mission": _clean(j.get("mission")) or "?",
@@ -1371,6 +1375,125 @@ TIER_ALIAS = {
 }
 RAILJACK_MARKERS = ("比邻星域", "proxima", "empyrean", "railjack", "九重天")
 
+# 裂缝过滤用的「任务类型」词表（中文优先，附带英文；长词在前，避免「移动防御」
+# 被「防御」抢先截断）。用来把「火星中断」「后纪中断」这类连写过滤词切成独立条件。
+# 星球/地点名单独放在下面的 FISSURE_LOCATION_TOKENS，切完后再整体当子串匹配节点。
+FISSURE_MISSION_TOKENS = (
+    "移动防御", "无尽捕获", "虚空覆涌", "虚空风暴", "强袭", "刺杀", "挖掘",
+    "拦截", "救援", "间谍", "破坏", "生存", "防御", "歼灭", "捕获", "中断",
+    "转化", "腐化", "清巢", "空战", "平原", "突袭", "圣殿",
+    "Disruption", "Defense", "Survival", "Extermination", "Capture", "Sabotage",
+    "Spy", "Rescue", "Interception", "Assault", "Assassination", "Excavate",
+    "Mobile Defense", "Void Cascade", "Alchemy", "Landscape", "Corruption",
+    "Hive", "Archwing", "Railjack",
+)
+
+# 裂缝过滤里可单独出现的「地点」词（星球/中继/开放世界）；用于把「火星中断」切成
+# [火星, 中断]，同时把完全无法识别的残留词判为「不认识」而不是默默开一个空过滤。
+FISSURE_LOCATION_TOKENS = (
+    "比邻星域", "赤毒要塞", "库瓦要塞", "扎里曼", "奥布山谷", "魔胎之境",
+    "双衍王境", "夜灵平原", "希图斯", "九重天", "火卫一", "火卫二",
+    "地球", "金星", "火星", "水星", "木星", "土星", "天王星", "海王星",
+    "冥王星", "月球", "谷神星", "欧罗巴", "赛德娜", "虚空",
+)
+
+
+def _tokenize_fissure(text):
+    """切裂缝过滤词，返回 (conds, leftover)。
+
+    conds：已识别的必需条件（任务类型 / 归一后的中文纪名 / 地点名）；
+    leftover：无法识别的残留词（去空白后），非空表示用户写了不认识的词。
+    """
+    t = (text or "").lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return [], ""
+    conds = []
+    # 任务类型最先切：「中断」整体取走后，单字纪别名「中」才不会误命中
+    for m in sorted(FISSURE_MISSION_TOKENS, key=len, reverse=True):
+        ml = m.lower()
+        if ml and ml in t:
+            conds.append(ml)
+            t = t.replace(ml, "")
+    for era in sorted(set(TIER_ALIAS.keys()), key=len, reverse=True):   # 纪（长词优先）
+        if era and era in t:
+            conds.append(TIER_ALIAS[era].lower())
+            t = t.replace(era, "")
+    for loc in sorted(FISSURE_LOCATION_TOKENS, key=len, reverse=True):  # 地点（长词优先）
+        if loc in t:
+            conds.append(loc)
+            t = t.replace(loc, "")
+    return conds, re.sub(r"\s+", "", t)
+
+
+def parse_fissure_tokens(text):
+    """把裂缝过滤词串切成一组【必需条件】（AND）：每个条件都是裂缝条目的子串。
+
+    识别（长词优先）：先切任务类型词表，再切纪别名，最后切地点名；纪别名归一成
+    中文纪名。连写也能切：『后纪中断』→ [后纪, 中断]；『火星中断』→ [火星, 中断]。
+    无法识别的残留词按整体子串收进条件（调用方可用 parse_fissure_spec 的
+    residual 判断是否为「不认识」）。空列表表示不过滤（整栏）。
+    """
+    conds, leftover = _tokenize_fissure(text)
+    if leftover:
+        conds.append(leftover)
+    return conds
+
+
+def parse_fissure_spec(text):
+    """解析「裂缝/钢铁裂缝 + 过滤词」规格；与裂缝无关返回 None。
+
+    返回 {"column": "fissures"|"steel", "tokens": [...], "residual": bool}。
+    column：显式含「钢铁/steel」→ steel，否则含「裂缝/fissure」→ fissures；
+    都没有但过滤词命中裂缝概念（纪/任务类型/地点）→ 推断 fissures；否则 None。
+    residual：为 True 表示还有无法识别的词（监控路径据此回提示，避免误开空过滤）。
+    """
+    low = (text or "").strip().lower()
+    for w in ("监控", "monitor"):          # 监控路径可能还带着前缀
+        if low.startswith(w):
+            low = low[len(w):].strip()
+    if not low:
+        return None
+    has_steel = any(w in low for w in ("钢铁裂缝", "钢铁", "steelpath", "steel"))
+    has_fissure = any(w in low for w in ("裂缝", "裂隙", "fissure"))
+    col = "steel" if has_steel else ("fissures" if has_fissure else None)
+    ft = low
+    for w in ("钢铁裂缝", "钢铁", "裂缝", "裂隙", "fissure", "steel", "steelpath"):
+        ft = ft.replace(w, "")
+    # 其它栏目词（警报/活动/平原…）不是裂缝条件，先剔掉，避免「监控 裂缝 警报」变成「裂缝里含警报」；
+    # 但地名（扎里曼/奥布山谷…）本身又是栏目词，必须保留，否则「裂缝 扎里曼中断」会丢掉地点。
+    reserved_loc = {loc.lower() for loc in FISSURE_LOCATION_TOKENS}
+    for kw, k in KEYWORDS.items():
+        if k in ("fissures", "steel", "__all__"):
+            continue
+        if any(kw in loc for loc in reserved_loc):   # 地名本身或地名片段（奥布/山谷）
+            continue
+        if kw in ft:
+            ft = ft.replace(kw, "")
+    conds, leftover = _tokenize_fissure(ft)
+    if col is None:
+        col = "fissures" if (conds or leftover) else None
+    if not col:
+        return None
+    return {"column": col, "tokens": conds, "residual": bool(leftover)}
+
+
+def _fissure_matches(f, tokens):
+    """裂缝条目是否命中全部过滤条件（AND）：每个 token 命中任一字段即算满足。"""
+    if not tokens:
+        return True
+    node = str(f.get("node") or "").lower()
+    mt = str(f.get("missionType") or "").lower()
+    enemy = str(f.get("enemy") or "").lower()
+    tier_raw = str(f.get("tier") or "").lower()
+    # 数据源可能给英文纪名（Lith/Neo…），过滤词已归一成中文，这里一并归一后比对
+    tier = TIER_ALIAS.get(tier_raw, tier_raw)
+    for tok in tokens:
+        if tok in tier or tok in tier_raw or tok in node or tok in mt or tok in enemy:
+            continue
+        return False
+    return True
+
 
 def tier_name(tier):
     """中英文 / 简写遗物等级归一成中文名；认不出就原样返回。"""
@@ -1391,9 +1514,16 @@ def is_railjack(f):
     return any(m in blob for m in RAILJACK_MARKERS)
 
 
-def _fmt_fissure_list(items, title):
-    """常规星球在上、九重天在下；各组内按遗物等级再按剩余时间升序。"""
+def _fmt_fissure_list(items, title, tokens=None):
+    """常规星球在上、九重天在下；各组内按遗物等级再按剩余时间升序。
+
+    tokens：裂缝过滤条件（AND，每条都是条目字段的子串）；为空不过滤。
+    """
+    if tokens:
+        items = [f for f in items if _fissure_matches(f, tokens)]
     if not items:
+        if tokens:
+            return f"{title}：（按「{' '.join(tokens)}」过滤后当前无匹配）"
         return f"{title}：（当前无）"
     # 已过期的条目不再列出（缓存没赶上刷新时会堆一批「剩余：已结束」，看着像还有）
     now = time.time()
@@ -1443,13 +1573,13 @@ def _fmt_fissure_list(items, title):
     return "\n".join(out)
 
 
-def _fmt_fissures(s):
-    return _fmt_fissure_list(s.get("fissures") or [], "🔥 裂缝")
+def _fmt_fissures(s, tokens=None):
+    return _fmt_fissure_list(s.get("fissures") or [], "🔥 裂缝", tokens)
 
 
-def _fmt_steel(s):
+def _fmt_steel(s, tokens=None):
     sp = s.get("steelPath") or {}
-    return _fmt_fissure_list(sp.get("current") or [], "⚙️ 钢铁裂缝")
+    return _fmt_fissure_list(sp.get("current") or [], "⚙️ 钢铁裂缝", tokens)
 
 
 def _fmt_sortie(s):
@@ -1924,6 +2054,11 @@ def parse_ws_command(text):
         return {"action": "help"}
     if t in PLAN_WORDS:
         return {"action": "plan"}
+    # 显式带「裂缝 / 钢铁裂缝」的查询也按维度过滤（监控与查询通用）
+    if any(w in t for w in ("裂缝", "裂隙", "fissure", "钢铁裂缝", "钢铁", "steel")):
+        spec = parse_fissure_spec(t)
+        if spec is not None:
+            return {"action": "query", "types": [spec["column"]], "filter": spec["tokens"]}
     key = KEYWORDS.get(first)
     if not key and t in KEYWORDS:
         key = KEYWORDS[t]
@@ -1941,11 +2076,36 @@ def _parse_monitor(rest):
         return {"action": "monitor", "types": list(TYPES.keys())}
     if low == "":
         return {"action": "monitor_hint"}
+    # 其它（非裂缝）栏目关键词：与显式「裂缝」词可同时出现（如「监控 裂缝后纪 警报」）
+    other_cols = set()
+    for kw, k in KEYWORDS.items():
+        if k in ("fissures", "steel", "__all__"):
+            continue
+        if kw in low:
+            other_cols.add(k)
+    # 只有在「没有其它栏目」或「显式写了裂缝/钢铁裂缝」时才解析裂缝过滤，
+    # 否则「监控 平原」里的杂词会被误当成裂缝条件。
+    explicit_fis = any(w in low for w in ("裂缝", "裂隙", "fissure", "steel"))
+    spec = parse_fissure_spec(low) if (explicit_fis or not other_cols) else None
+    # 没写「裂缝/钢铁裂缝」又带无法识别的词 → 当不认识，绝不默默开一个永远空的过滤监控
+    if spec is not None and not explicit_fis and spec.get("residual"):
+        spec = None
+    if spec is not None and not other_cols:
+        out = {"action": "monitor", "types": [spec["column"]]}
+        if spec["tokens"]:
+            out["fissure_filter"] = {spec["column"]: spec["tokens"]}
+        return out
     types = set()
     used = []
+    # 显式写了裂缝时，地名已被当成裂缝过滤条件，不再额外开对应栏目
+    # （「监控 裂缝扎里曼中断」只要裂缝，不要外加扎里曼赏金）
+    loc_words = {loc.lower() for loc in FISSURE_LOCATION_TOKENS}
+    drop_loc = spec is not None and explicit_fis
     # 长的先匹配：「赏金轮换」不会再被「赏金」重复命中一次
     for kw, k in sorted(KEYWORDS.items(), key=lambda kv: -len(kv[0])):
-        if k == "__all__":
+        if k == "__all__" or k in ("fissures", "steel"):
+            continue
+        if drop_loc and any(kw in loc for loc in loc_words):
             continue
         if kw not in low:
             continue
@@ -1953,9 +2113,14 @@ def _parse_monitor(rest):
             continue
         used.append(kw)
         types.add(k)
+    if spec is not None:
+        types.add(spec["column"])
     if not types:
         return {"action": "monitor_hint"}
-    return {"action": "monitor", "types": sorted(types)}
+    out = {"action": "monitor", "types": sorted(types)}
+    if spec is not None and spec["tokens"]:
+        out["fissure_filter"] = {spec["column"]: spec["tokens"]}
+    return out
 
 
 HELP_TEXT = (
@@ -1970,6 +2135,10 @@ HELP_TEXT = (
     "  监控 <词>     在本会话开启推送（如 监控 警报 / 监控 裂缝 / 监控 平原）\n"
     "                  ⚠️ 裸「监控」或「监控 不认识的词」不会全开，会提示你怎样用；\n"
     "                     要监控全部栏目，必须发完整的「监控全部」。\n"
+    "  裂缝可按维度缩小：纪（古/前/中/后/安魂/全能）+ 星球（火星…）+ 任务类型（中断…）\n"
+    "                     例：监控 裂缝 后纪   监控 裂缝 火星 中断   监控 钢铁裂缝 古纪\n"
+    "                     多条件 AND；连写也行（后纪中断 = 后纪且中断）。钢铁裂缝数据源\n"
+    "                     不提供任务类型，按任务类型过滤对它不生效，只能按纪 / 星球过滤。\n"
     "  停止监控       停止本会话的推送（同时清掉本会话的开关设置）\n"
     "  ★ 发消息直接开关主推，不用改配置、不用重启（设置会存盘，重启后自动恢复）：\n"
     "      活动=开启    警报=开启    活动=关闭    警报=关闭\n"
@@ -2050,13 +2219,22 @@ def handle_plan():
             "到点只查一次全量）\n" + describe_plan())
 
 
-def _blocks_for(types, state):
+def _blocks_for(types, state, filters=None):
     """按类型列表拼回复块。「全部」这类一次性给十几个栏目时自动走精简模式，
-    避免一条消息长到超出 QQ 单条上限（要看全的还是发单条指令）。"""
+    避免一条消息长到超出 QQ 单条上限（要看全的还是发单条指令）。
+
+    filters：{栏目键: 过滤 token 列表}，仅对命中的栏目应用过滤（用于裂缝维度过滤）。
+    """
+    filters = filters or {}
     global _COMPACT
     _COMPACT = len(types) > 12
     try:
-        blocks = [TYPES[t][1](state) for t in types if t in TYPES]
+        blocks = []
+        for t in types:
+            if t not in TYPES:
+                continue
+            toks = filters.get(t)
+            blocks.append(TYPES[t][1](state, toks) if toks else TYPES[t][1](state))
         if _COMPACT:
             # 当前数据源确实没有的栏目（如 wf.wiki 没有信使/集团/建造）在「全部」里
             # 直接省掉，别用三行「不提供此项」占位；单条查询时仍然如实提示。
@@ -2084,7 +2262,9 @@ def handle_query(cmd):
                     "（程序会自动拼 /pc/zh），或改用能绕过拦截的网络后再试。")
         return "⚠️ 暂时拿不到世界状态数据（接口超时或被限流），请稍后重试。"
     types = _ordered_types(cmd.get("types") or list(TYPES.keys()))
-    return "\n\n".join(_blocks_for(types, state))
+    flt = cmd.get("filter")
+    filters = {types[0]: flt} if (flt and types) else {}
+    return "\n\n".join(_blocks_for(types, state, filters))
 
 
 def format_for(types):

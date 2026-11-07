@@ -60,7 +60,7 @@ def reset():
 
 def fake_parts_factory(types):
     """返回一个按 TYPES 展示序、仅含给定栏目的 _parts_of 替身。"""
-    def _fake(state, req_types):
+    def _fake(state, req_types, key=None):
         return [(t, _PART_TEXT[t]) for t in ws.TYPES
                 if t in req_types and t in _PART_TEXT]
     return _fake
