@@ -18,9 +18,14 @@ data/ 已由项目根目录的 .gitignore 排除，密钥与运行数据不会�
     apply() 用 setdefault，绝不覆盖已有 env（方便临时覆盖与离线测试）；
   - 路径：基于 __file__ 同目录解析，不依赖当前工作目录、无盘符、无上层路径；
   - 开关：flag() 把「0 / 空 / false / no / off」视为关，「1 / true / yes / on」视为开。
+  - 顺带统一 HTTPS 出口：手机（Termux / QPython）常缺 CA 根证书，导致所有
+    HTTPS 报 CERTIFICATE_VERIFY_FAILED。urlopen() / ssl_context() 会先自动找
+    CA bundle，实在找不到才降级并给出醒目警告；Windows / macOS 一律不动。
 """
 import os
+import ssl
 import sys
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -87,3 +92,158 @@ def flag(name, default=False):
     if v in _TRUE:
         return True
     return default
+
+
+# ---------------- 移动端 HTTPS / WSS 证书兼容 ----------------
+# 手机上的 Python 常缺 CA 根证书 bundle，报：
+#   <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+#    unable to get local issuer certificate (_ssl.c:1010)>
+# 这不是网络问题、也不是 QQ 接口问题：取 token / 发消息 / 查 WM / 抓世界状态 /
+# 连 wss 网关会【全部】失败，然后重连循环里刷屏。
+# 对策：先自动找到 CA 并照常校验；实在找不到才降级，且打印明确警告。
+_SSL_CHECKED = False
+_SSL_CA = None
+_SSL_UNVERIFIED = False
+
+
+def _usable_ca(path):
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 100
+    except OSError:
+        return False
+
+
+def _ca_candidates():
+    """Termux / Android / 常见 Linux 的 CA bundle 候选（按优先级）。"""
+    prefix = os.environ.get("PREFIX", "")
+    out = [os.environ.get("WM_SSL_CAFILE"), os.environ.get("SSL_CERT_FILE")]
+    if prefix:
+        out += [os.path.join(prefix, "etc", "tls", "cert.pem"),
+                os.path.join(prefix, "etc", "tls", "certs", "cacert.pem")]
+    out += [
+        "/data/data/com.termux/files/usr/etc/tls/cert.pem",
+        "/data/data/com.termux/files/usr/etc/tls/certs/cacert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/usr/local/etc/openssl/cert.pem",
+    ]
+    try:                     # 可选：手机上装过 certifi 就直接用它的 bundle
+        import certifi
+        out.append(certifi.where())
+    except Exception:
+        pass
+    return out
+
+
+def _android_ca_dir():
+    """Android 系统 CA 是散装 <hash>.0 文件，正好是 OpenSSL capath 格式。"""
+    for d in ("/system/etc/security/cacerts",
+              "/apex/com.android.conscrypt/cacerts"):
+        try:
+            if os.path.isdir(d) and any(f.endswith(".0") for f in os.listdir(d)):
+                return d
+        except OSError:
+            pass
+    return None
+
+
+def reset_ssl_state():
+    """仅供离线测试：清掉缓存的探测结果，不改磁盘配置。"""
+    global _SSL_CHECKED, _SSL_CA, _SSL_UNVERIFIED
+    _SSL_CHECKED = False
+    _SSL_CA = None
+    _SSL_UNVERIFIED = False
+
+
+def ensure_ssl_ca(force=False):
+    """探测并设置可用 CA；幂等，返回实际用到的路径（没改返回 None）。
+
+    - Windows / macOS 用系统证书库，一律不动；
+    - 系统默认 CA 已存在，一律不动（桌面零副作用）；
+    - 只在「类 Unix 且默认 CA 缺失」时，把 Termux / Android / Linux 的 CA
+      写进 SSL_CERT_FILE（或 SSL_CERT_DIR），**依然做证书校验**，这是最安全的一条路。
+    """
+    global _SSL_CHECKED, _SSL_CA
+    if _SSL_CHECKED and not force:
+        return _SSL_CA
+    _SSL_CHECKED = True
+    _SSL_CA = None
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    manual = os.environ.get("WM_SSL_CAFILE")
+    if manual and _usable_ca(manual):
+        os.environ["SSL_CERT_FILE"] = manual
+        _SSL_CA = manual
+        return manual
+    try:
+        d = ssl.get_default_verify_paths()
+        if _usable_ca(d.cafile):
+            return None
+        if d.capath and os.path.isdir(d.capath):
+            try:
+                if os.listdir(d.capath):
+                    return None
+            except OSError:
+                pass
+    except Exception:
+        pass
+    ca = next((p for p in _ca_candidates() if _usable_ca(p)), None)
+    if ca:
+        os.environ["SSL_CERT_FILE"] = ca
+        _SSL_CA = ca
+        return ca
+    dpath = _android_ca_dir()
+    if dpath:
+        os.environ.setdefault("SSL_CERT_DIR", dpath)
+        _SSL_CA = dpath
+        return dpath
+    return None
+
+
+def _noverify_requested():
+    return os.environ.get("WM_SSL_NOVERIFY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def ssl_context():
+    """给 wss 长连接用：和 urlopen 走同一套 CA / 降级策略。"""
+    ensure_ssl_ca()
+    if _SSL_UNVERIFIED or _noverify_requested():
+        return ssl._create_unverified_context()
+    return ssl.create_default_context()
+
+
+def is_ca_error(exc):
+    """只认「本机缺 CA / 证书链不完整」，不吞掉超时、DNS、HTTP 等其它错误。"""
+    s = str(exc).lower()
+    return ("certificate_verify_failed" in s
+            or "unable to get local issuer certificate" in s
+            or "certificate verify failed" in s)
+
+
+def urlopen(req, timeout=10):
+    """项目内所有 HTTPS 的统一出口；请求签名与标准库 urlopen 一致。
+
+    正常按系统证书校验；只有真撞到 CA 缺失错误时，才降级成不校验并重试一次，
+    之后本进程一直走降级 context，避免每个请求都先白失败一次。
+    降级会打印醒目警告 —— 它跳过证书校验，仅作为装不上 CA 的手机兜底。
+    """
+    global _SSL_UNVERIFIED
+    ensure_ssl_ca()
+    if _SSL_UNVERIFIED or _noverify_requested():
+        return urllib.request.urlopen(
+            req, timeout=timeout, context=ssl._create_unverified_context())
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        if not is_ca_error(e):
+            raise
+        _SSL_UNVERIFIED = True
+        print("[ssl] ⚠️ 本机找不到 CA 根证书，HTTPS 证书校验已临时关闭。\n"
+              "       建议修复（更安全）：Termux 执行 pkg install ca-certificates\n"
+              "       或在 data/config.txt 写 WM_SSL_CAFILE = /路径/cert.pem\n"
+              "       （关闭校验有中间人风险，仅作无法安装证书时的兜底）",
+              file=sys.stderr)
+        return urllib.request.urlopen(
+            req, timeout=timeout, context=ssl._create_unverified_context())

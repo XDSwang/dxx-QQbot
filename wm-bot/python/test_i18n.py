@@ -114,7 +114,9 @@ class TestI18n(unittest.TestCase):
             "/w Zephroste Hi! I want to buy: Boltor for 40 platinum.", txt)
         self.assertIn(
             "/w Zephroste 你好，我想购买 螺钉步枪 40 铂金.", txt)
-        self.assertNotIn("RabbitBot", txt)     # 后缀已取消，防止回归
+        # /w 指令结尾不带任何来源备注 / 机器人名后缀（用户明确不要，防止回归）
+        self.assertNotIn("(wf.m via RabbitBot)", txt)
+        self.assertNotIn("RabbitBot", txt)
         self.assertNotIn("wf.m via", txt)
         self.assertIn("来源：https://warframe.market/items/boltor_prime_set", txt)
 

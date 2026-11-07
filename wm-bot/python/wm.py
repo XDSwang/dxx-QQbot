@@ -34,6 +34,7 @@ import json
 import time
 import random
 import gzip
+import calendar
 import threading
 import urllib.parse
 import urllib.request
@@ -178,29 +179,78 @@ def _log(msg):
 
 
 # --------------------- 礼貌限流（文件持久） ---------------------
-def pace_gate(domain):
-    """每次访问 WM 前调用：保证与上次访问间隔 3~5 秒，写回本机真实当前时间。
+# 三个原子函数，所有域名（WM / 世界状态 / wiki / 词库 / 特殊任务）共用同一套：
+#   pace_last_access(domain)  查询某域名上次访问时间（没访问过返回 0.0）
+#   pace_record(domain, when) 记录某域名本次访问时间（文件不存在自动建）
+#   pace_gate_ex(domain, lo, hi) 阻塞节流：查上次 → 算间隔 → 必要时 sleep → 记录本次
+# pace.json 格式：扁平的 {域名: 上次访问时间(epoch 秒)}，按域名键查/改。
 
-    整个文件夹从桌面拷到手机时，pace.json 里带的是旧机器的时间戳；若手机
-    时钟比它早（时钟回拨 / 未自动校时），(now - last) 会是负数，直接算 wait
-    会睡上几小时。这里按「没有可信的上次访问时间」处理：仍完整等待 3~5 秒，
-    再写回本机时间——既不跳过节流，也不会异常久等卡住机器人。
+
+def pace_last_access(domain):
+    """查询某域名【上次访问时间】（epoch 秒）。
+
+    - 文件不存在 / 没有该域名记录：返回 0.0（表示没访问过）；
+    - 有记录：返回该域名上次访问的真实时刻（秒，epoch）；
+    - 记录损坏（非数字）/ 时钟回拨（记录的时间在未来）：也返回 0.0，
+      按「没访问过」处理，避免异常久等或跳过节流。
     """
-    now = time.time()
     data = load_json(PACE_FILE, {})
     try:
         last = float(data.get(domain, 0.0) or 0)
     except (TypeError, ValueError):
-        last = 0.0
-    gap = random.uniform(MIN_GAP, MAX_GAP)
-    elapsed = now - last
-    if elapsed < 0:                  # 时钟回拨 / 换了设备：按完整间隔等待
+        return 0.0
+    if last <= 0 or last > time.time():
+        return 0.0
+    return last
+
+
+def pace_record(domain, when=None):
+    """记录某域名【本次访问时间】（epoch 秒）写回 pace.json。
+
+    - when 留空：取【真实当前时间】（time.time()），绝不写未来时间；
+    - 文件 / 目录不存在：自动创建（save_json 内部已 mkdir）；
+    - 其它域名的记录原样保留，只改这一个域名的键。
+    用于「自己已经 sleep 过、只想登记一次访问」的场景；
+    pace_gate_ex 内部也用它写盘。
+    """
+    t = float(when) if when is not None else time.time()
+    data = load_json(PACE_FILE, {})
+    data[domain] = t
+    save_json(PACE_FILE, data)
+    return t
+
+
+def pace_gate_ex(domain, min_gap, max_gap):
+    """通用版：可指定「间隔范围（秒）」的同类节流，写回本机真实当前时间。
+
+    用于世界状态（api.warframestat.us）等其它域名：间隔由调用方传入，
+    世界状态同样用 3~5 秒，与 WM 共用同一套「写盘持久 + 时钟回拨保护」逻辑。
+    - min_gap/max_gap：相邻两次访问该域名的最小/最大间隔（随机取值，避免对齐突刺）；
+    - 没访问过（pace_last_access 返回 0）：按完整间隔等待；
+    - 时钟回拨（换新设备 / 未校时）时按完整间隔等待，不异常久等、也不跳过节流。
+    内部 = pace_last_access 查上次 → 算 wait → 必要时 sleep → pace_record 写本次。
+    """
+    try:
+        lo = float(min_gap)
+        hi = float(max_gap)
+    except (TypeError, ValueError):
+        lo, hi = 3.0, 5.0
+    if hi < lo:
+        hi = lo
+    last = pace_last_access(domain)              # 0.0 = 没访问过 / 回拨 → 按完整间隔等
+    gap = random.uniform(lo, hi)
+    elapsed = (time.time() - last) if last > 0 else 0.0
+    if elapsed < 0:                              # 理论上 pace_last_access 已挡回拨，双保险
         elapsed = 0.0
     wait = max(0.0, gap - elapsed)
     if wait > 0:
         time.sleep(wait)
-    data[domain] = time.time()        # 真实当前时间，绝不回拨/写未来时间
-    save_json(PACE_FILE, data)
+    pace_record(domain)                          # sleep 之后取真实当前时间写盘
+
+
+def pace_gate(domain):
+    """WM 专用：固定 3~5 秒同域名节流（保持原行为）。"""
+    pace_gate_ex(domain, MIN_GAP, MAX_GAP)
 
 
 # ----------------------------- HTTP -----------------------------
@@ -219,7 +269,7 @@ def http_get(path, params=None):
     pace_gate("api.warframe.market")
     req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with bot_config.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             raw = resp.read()
             if resp.headers.get("Content-Encoding") == "gzip":
                 raw = gzip.decompress(raw)
@@ -240,18 +290,29 @@ def mock_fetch(type_, name):
         MOCK_FAIL -= 1
         raise RuntimeError("mock 故意失败（剩余 %d 次）" % MOCK_FAIL)
     base = 8 if type_ == "item" else 500
-    orders = [
-        {"seller": f"MockSeller{i}", "price": base + i * 2, "quantity": (i % 3) + 1}
-        for i in range(1, 11)
-    ]
-    orders.sort(key=lambda o: o["price"])
-    prices = [o["price"] for o in orders]
+    # 故意混入三种在线状态（含 1 个 45 天没登录的），演示「在线优先」排序
+    orders = []
+    now = time.time()
+    for i in range(1, 11):
+        st = "ingame" if i <= 3 else ("online" if i <= 5 else "offline")
+        days = 0 if st != "offline" else (45 if i >= 9 else i)
+        row = {
+            "seller": f"MockSeller{i}", "price": base + i * 2,
+            "quantity": (i % 3) + 1,
+        }
+        row.update(_status_info(
+            st, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - days * 86400))))
+        orders.append(row)
+    orders, stats, samples, basis = _finish_rows(orders)
+    prices = [o["price"] for o in samples]
     return {
         "price": prices[0],
         "median": int(statistics.median(prices)),
         "unit": "铂金",
         "count": len(orders),
         "orders": orders,
+        "stats": stats,
+        "priceBasis": basis,
     }
 
 
@@ -522,7 +583,7 @@ def _wiki_api_langlinks(name):
     }
     url = "https://warframe.huijiwiki.com/api.php?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers=WIKI_HEADERS)
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+    with bot_config.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)
@@ -557,7 +618,7 @@ def _wiki_api_search(name):
         }
         url = "https://warframe.huijiwiki.com/api.php?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers=WIKI_HEADERS)
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with bot_config.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             raw = resp.read()
             if resp.headers.get("Content-Encoding") == "gzip":
                 raw = gzip.decompress(raw)
@@ -593,7 +654,7 @@ def _lexicon_fetch_json(fn):
     url = LEXICON_BASE + "/" + fn
     req = urllib.request.Request(url, headers={
         "User-Agent": _LEXICON_UA, "Accept": "application/json, */*"})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+    with bot_config.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)
@@ -759,6 +820,74 @@ def riven_slug(name):
     return slugify(stripped)
 
 
+# --------------------- 卖家在线状态：排序 / 可联系性 ---------------------
+# WM 返回的每条订单 / 拍卖都带卖家状态：ingame（游戏中）、online（在线）、offline（离线）。
+# 离线卖家的报价常常是几个月前挂的，号可能早已 2035（封禁）或弃坑——价格看着低却根本买不到。
+# 排序规则（用户要求）：游戏中 → 在线 → 离线；同组内仍按价格从低到高；
+# 离线且超过 WM_OFFLINE_STALE_DAYS 天没登录的再沉到最后（基本等于联系不上）。
+STATUS_RANK = {"ingame": 0, "online": 1, "offline": 2}
+RANK_UNKNOWN = 3                  # 老缓存 / 缺字段：不特殊对待，仍按价格排
+STATUS_MARK = {"ingame": "🟢", "online": "🔵", "offline": "⚪"}
+STATUS_TEXT = {"ingame": "游戏中", "online": "在线", "offline": "离线"}
+OFFLINE_STALE_DAYS = _env_int("WM_OFFLINE_STALE_DAYS", 30)
+
+_ISO_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})[T ](\d{1,2}):(\d{2}):(\d{2})")
+
+
+def _iso_ts(s):
+    """WM 的 ISO 时间（...Z / +00:00 / 带毫秒）→ epoch 秒；解析不了返回 None。"""
+    m = _ISO_RE.match(str(s or "").strip())
+    if not m:
+        return None
+    try:
+        y, mo, d, hh, mm, ss = (int(x) for x in m.groups())
+        return calendar.timegm((y, mo, d, hh, mm, ss, 0, 0, 0))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _status_info(status, last_seen):
+    """统一卖家状态：rank 越小越靠前；stale=True 表示离线且太久没登录（多半买不到）。"""
+    st = (status or "").strip().lower()
+    if st not in STATUS_RANK:
+        st = ""
+    ts = _iso_ts(last_seen)
+    days = None
+    if ts is not None:
+        days = max(0, int((time.time() - ts) // 86400))
+    stale = bool(st == "offline" and days is not None
+                 and OFFLINE_STALE_DAYS > 0 and days >= OFFLINE_STALE_DAYS)
+    return {"status": st, "rank": STATUS_RANK.get(st, RANK_UNKNOWN),
+            "lastSeenTs": ts, "days": days, "stale": stale}
+
+
+def _order_sort_key(r):
+    # 先按「现在能不能联系上」分组，组内价格从低到高；离线很久没登录的沉底。
+    # 紫卡里没有一口价、只有起拍价的（bidOnly）排在同组后面：起拍 1 铂金不是能直接买到的价。
+    return (r.get("rank", RANK_UNKNOWN), 1 if r.get("stale") else 0,
+            1 if r.get("bidOnly") else 0, r.get("price") or 0)
+
+
+def _finish_rows(rows):
+    """统一排序 + 汇总。
+
+    返回 (rows, stats, samples, basis)：
+      stats   各状态条数（给回复里的概览行用）；
+      samples 计算代表价 / 中位数用的样本：优先「现在就能交易」的报价，
+              一个都没有才退回全部报价（否则最低价永远来自几个月没上线的号）；
+      basis   "reachable" 表示代表价来自在线卖家，"all" 表示全离线仅供参照。
+    """
+    rows.sort(key=_order_sort_key)
+    stats = {"ingame": 0, "online": 0, "offline": 0, "unknown": 0, "stale": 0}
+    for r in rows:
+        st = r.get("status") or "unknown"
+        stats[st] = stats.get(st, 0) + 1
+        if r.get("stale"):
+            stats["stale"] += 1
+    reachable = [r for r in rows if r.get("rank", RANK_UNKNOWN) <= 1 and not r.get("stale")]
+    return rows, stats, (reachable or rows), ("reachable" if reachable else "all")
+
+
 # ----------------------------- 取数 -----------------------------
 def fetch_item(name):
     if SOURCE == "mock":
@@ -790,19 +919,23 @@ def fetch_item(name):
         _save_slug(key, slug)
         if not orders:
             raise RuntimeError(f"「{name}」(slug={slug}) 当前无在售订单")
-        rows = [
-            {
-                "seller": (o.get("user") or {}).get("ingameName", "?"),
-                "price": o.get("platinum"),
+        rows = []
+        for o in orders:
+            price = o.get("platinum")
+            if price is None:
+                continue
+            u = o.get("user") or {}
+            row = {
+                "seller": u.get("ingameName", "?"),
+                "price": price,
                 "quantity": o.get("quantity", 1),
             }
-            for o in orders
-        ]
-        rows = [r for r in rows if r["price"] is not None]
+            row.update(_status_info(u.get("status"), u.get("lastSeen")))
+            rows.append(row)
         if not rows:
             raise RuntimeError(f"「{name}」(slug={slug}) 订单无有效价格")
-        rows.sort(key=lambda r: r["price"])
-        prices = [r["price"] for r in rows]
+        rows, stats, samples, basis = _finish_rows(rows)
+        prices = [r["price"] for r in samples]
         _log(f"slug 命中 {slug}，已记入局部缓存（下次只发 1 个请求）")
         return {
             "price": prices[0],
@@ -810,6 +943,8 @@ def fetch_item(name):
             "unit": "铂金",
             "count": len(rows),
             "orders": rows,
+            "stats": stats,
+            "priceBasis": basis,
             "url": f"https://warframe.market/items/{slug}",   # WM 网页（具体物品页）
         }
     raise ItemNotFound(
@@ -830,26 +965,33 @@ def fetch_riven(name):
         raise RuntimeError(f"「{name}」当前无紫卡拍卖")
     rows = []
     for a in auctions:
-        price = a.get("buyout_price")
-        if price is None:
-            price = a.get("starting_price")
+        if a.get("closed"):          # 已流拍的拍卖挂着也没意义，直接跳过
+            continue
+        buyout = a.get("buyout_price")
+        price = buyout if buyout is not None else a.get("starting_price")
         if price is None:
             continue
-        rows.append({
-            "seller": (a.get("owner") or {}).get("ingame_name", "?"),
+        ow = a.get("owner") or {}
+        row = {
+            "seller": ow.get("ingame_name", "?"),
             "price": price,
             "quantity": a.get("quantity", 1),
-        })
+            "bidOnly": buyout is None,      # 只有起拍价、没有一口价：不是能直接买到的价
+        }
+        row.update(_status_info(ow.get("status"), ow.get("last_seen")))
+        rows.append(row)
     if not rows:
         raise RuntimeError(f"「{name}」拍卖无有效价格")
-    rows.sort(key=lambda r: r["price"])
-    prices = [r["price"] for r in rows]
+    rows, stats, samples, basis = _finish_rows(rows)
+    prices = [r["price"] for r in samples]
     return {
         "price": prices[0],
         "median": int(statistics.median(prices)),
         "unit": "铂金",
         "count": len(rows),
         "orders": rows,
+        "stats": stats,
+        "priceBasis": basis,
         "url": f"https://warframe.market/auctions/riven/{slug}",   # WM 网页（紫卡拍卖页）
     }
 
@@ -1018,7 +1160,7 @@ def query(text_or_cmd, force=False):
             return {"served": "help"}
         type_ = cmd["type"]
         name = cmd["name"]
-        force = cmd.get("force", force)
+        force = bool(force) or bool(cmd.get("force"))
         zh_disp = None
 
     # 中文输入 -> 翻成英文再去 WM 查（我们始终以英文查 WM）
@@ -1144,7 +1286,152 @@ def parse_command(text):
     return {"type": type_, "name": name, "force": force}
 
 
+# 卖家状态 → 卡片里「昵称」的颜色（用户要求：游戏中红、在线蓝、离线灰）。
+# 纯文字回复不受影响，只有白底卡片渲染时才用它给昵称上色。
+STATUS_RGB = {
+    "ingame": (198, 40, 40),      # 游戏中 → 红色昵称
+    "online": (32, 92, 180),      # 在线 → 蓝色昵称
+    "offline": (132, 136, 146),   # 离线 → 灰色昵称
+}
+
 # ----------------------------- 回复格式化 -----------------------------
+
+
+def _reply_en_zh(result, entry):
+    en = result.get("en") or entry.get("name") or ""
+    zh = result.get("zh") or entry.get("zh") or translate_en_to_zh(en)
+    return en, zh
+
+
+def _body_lines(result, entry):
+    """回复正文（不含「发起聊天」/w 指令），返回行列表。"""
+    label = "物品" if entry["type"] == "item" else "紫卡"
+    en, zh = _reply_en_zh(result, entry)
+    # 第一条：英文名称 + / 中文名称（有中文名才加 /，战甲等国服沿用英文名时只显示英文）
+    name_line = f"【{label}】{en}" + (f" / {zh}" if zh and zh != en else "")
+    d = entry["data"]
+    orders = d.get("orders", [])
+    st = d.get("stats") or {}
+    lines = [name_line]
+    head = f"WM 在售（共 {d.get('count', len(orders))} 条"
+    bits = [f"{STATUS_MARK[k]}{STATUS_TEXT[k]} {st[k]}"
+            for k in ("ingame", "online", "offline") if st.get(k)]
+    if bits:
+        head += "：" + " · ".join(bits)
+        if st.get("stale"):
+            head += f"，其中 {st['stale']} 个 {OFFLINE_STALE_DAYS} 天没登录"
+    lines.append(head + "）")
+    if bits:
+        lines.append("排序：🟢游戏中 → 🔵在线 → ⚪离线（同组内价格从低到高；离线太久没登录的沉底）")
+        lines.append("昵称颜色：游戏中=红 · 在线=蓝 · 离线=灰｜行首 [游戏中]/[在线]/[离线] 是状态标签")
+    if d.get("priceBasis") == "all" and st and not (st.get("ingame") or st.get("online")):
+        lines.append("⚠️ 现在没有游戏中/在线的卖家，以下全是离线报价，多半联系不上，仅供参考。")
+    for i, o in enumerate(orders[:15], 1):
+        mark = STATUS_MARK.get(o.get("status") or "", "")
+        pre = (mark + " ") if mark else ""
+        extra = []
+        if o.get("bidOnly"):
+            extra.append("仅竞价")
+        if o.get("status") == "offline" and o.get("days") is not None:
+            extra.append("今天在线过" if o["days"] < 1 else f"{o['days']}天前在线")
+        tail = (" · " + " · ".join(extra)) if extra else ""
+        lines.append(f"{i}. {pre}{o['seller']} — {o['price']} 铂金 ×{o.get('quantity', 1)}{tail}")
+    if len(orders) > 15:
+        rest = orders[15:]
+        off = sum(1 for r in rest if r.get("status") == "offline")
+        # 「最低价」只算能直接买到的（有一口价的）；全是竞价时才退回起拍价
+        cand = [r["price"] for r in rest if not r.get("bidOnly")] or [r["price"] for r in rest]
+        line = f"（其余 {len(rest)} 条未列出，最低 {min(cand)} 铂金"
+        line += "，多为离线卖家，价格低但多半联系不上）" if off * 2 >= len(rest) \
+            else "，其中也有在线卖家）"
+        lines.append(line)
+    ts = entry.get("ts", 0)
+    mins = max(0, int((time.time() * 1000 - ts) / 60000)) if ts else 0
+    hm = f"{mins // 60}小时{mins % 60}分" if mins >= 60 else f"{mins}分钟"
+    src = entry.get("source", "")
+    if not src:
+        src = "https://warframe.market"   # 旧缓存没有来源字段时才兜底
+    # 非 http 的 source（如 mock 本地测试数据）如实显示，绝不伪装成真实网址
+    lines.append(f"🕒 数据更新于 {entry.get('lastUpdated', '')}（距今约 {hm}）· 来源：{src}")
+    return lines
+
+
+def _whisper_lines(entry, en, zh):
+    """英中两条 /w 发起聊天指令（不带任何来源备注 / 后缀）。
+
+    用第 1 家卖家（排序后最优先、能直接交易的那个）；想买别家把 ID 换掉即可。
+    """
+    orders = ((entry or {}).get("data") or {}).get("orders") or []
+    if not orders:
+        return []
+    top = orders[0]
+    seller = top.get("seller", "")
+    price = top.get("price", "")
+    zh_name = zh if (zh and zh != en) else en
+    return [
+        f"英文：/w {seller} Hi! I want to buy: {en} for {price} platinum.",
+        f"中文：/w {seller} 你好，我想购买 {zh_name} {price} 铂金.",
+    ]
+
+
+def _whisper_block(entry, en, zh):
+    """纯文字回复里的完整「游戏内发起交易」区块（说明标题 + 英中指令）。"""
+    lines = _whisper_lines(entry, en, zh)
+    if not lines:
+        return []
+    d = (entry or {}).get("data") or {}
+    top = d["orders"][0]
+    who = STATUS_TEXT.get(top.get("status") or "", "")
+    head2 = "游戏内发起交易（用第 1 家"
+    if who:
+        head2 += f"：{STATUS_MARK.get(top.get('status'), '')}{who}"
+    head2 += "；想买别家把 ID 换掉即可）："
+    return [head2] + lines
+
+
+def build_whisper(result):
+    """随卡片图同发的可复制字符串：只有英中两条 /w 指令。
+
+    不压进卡片图（图里的字选不中、复制不了），由传输层与图片合成一条消息
+    （官方富媒体图文混排 / OneBot 段数组），也不带 (wf.m ...) 之类的来源备注。
+    """
+    entry = result.get("entry")
+    if not entry:
+        return ""
+    en, zh = _reply_en_zh(result, entry)
+    return "\n".join(_whisper_lines(entry, en, zh))
+
+
+def seller_colors(result):
+    """返回 {卖家昵称: RGB}，供白底卡片给昵称按在线状态上色。
+
+    游戏中 → 红，在线 → 蓝，离线 → 灰。纯文字回复不受影响。
+    只覆盖实际列进回复的前 15 条，避免长列表里误伤同名文本。
+    """
+    entry = result.get("entry")
+    if not entry or result.get("served") in ("translate", "help", "error"):
+        return {}
+    out = {}
+    for o in ((entry.get("data") or {}).get("orders") or [])[:15]:
+        col = STATUS_RGB.get((o.get("status") or "").strip().lower())
+        seller = o.get("seller")
+        if col and seller:
+            out[seller] = col
+    return out
+
+
+def reply_body(result):
+    """返回卡片正文（不含「游戏内发起交易」区块），供白底图片渲染。
+
+    /w 指令改由 build_whisper 作为随图同发的可复制文字（不进图片），能长按复制。
+    翻译 / 帮助 / 报错 / 无数据等非行情分支没有 /w 指令，直接复用 format_reply 全文。
+    """
+    entry = result.get("entry")
+    if not entry or result.get("served") in ("translate", "help", "error"):
+        return format_reply(result)
+    return "\n".join(_body_lines(result, entry))
+
+
 def format_reply(result):
     if result.get("served") == "translate":
         return result.get("text", "")
@@ -1168,36 +1455,9 @@ def format_reply(result):
     entry = result.get("entry")
     if not entry:
         return "（无数据）"
-    label = "物品" if entry["type"] == "item" else "紫卡"
-    en = result.get("en") or entry.get("name") or ""
-    zh = result.get("zh") or entry.get("zh") or translate_en_to_zh(en)
-    # 第一条：英文名称 + / 中文名称（有中文名才加 /，战甲等国服沿用英文名时只显示英文）
-    name_line = f"【{label}】{en}" + (f" / {zh}" if zh and zh != en else "")
-    d = entry["data"]
-    orders = d.get("orders", [])
-    lines = [
-        name_line,
-        f"WM 在售（价格从低到高，共 {d.get('count', len(orders))} 条）：",
-    ]
-    for i, o in enumerate(orders[:15], 1):
-        lines.append(f"{i}. {o['seller']} — {o['price']} 铂金 ×{o.get('quantity', 1)}")
-    ts = entry.get("ts", 0)
-    mins = max(0, int((time.time() * 1000 - ts) / 60000)) if ts else 0
-    hm = f"{mins // 60}小时{mins % 60}分" if mins >= 60 else f"{mins}分钟"
-    src = entry.get("source", "")
-    if not src:
-        src = "https://warframe.market"   # 旧缓存没有来源字段时才兜底
-    # 非 http 的 source（如 mock 本地测试数据）如实显示，绝不伪装成真实网址
-    lines.append(f"🕒 数据更新于 {entry.get('lastUpdated', '')}（距今约 {hm}）· 来源：{src}")
-    # 游戏内发起交易：英文 + 中文 两条完整指令（用最低价那家的卖家名；想买别家改 ID 即可）
-    if orders:
-        top = orders[0]
-        seller = top.get("seller", "")
-        price = top.get("price", "")
-        zh_name = zh if (zh and zh != en) else en
-        lines.append("游戏内发起交易（复制到聊天框，把 ID 换成你想买的那家即可）：")
-        lines.append(f"英文：/w {seller} Hi! I want to buy: {en} for {price} platinum.")
-        lines.append(f"中文：/w {seller} 你好，我想购买 {zh_name} {price} 铂金.")
+    en, zh = _reply_en_zh(result, entry)
+    lines = _body_lines(result, entry)
+    lines += _whisper_block(entry, en, zh)
     return "\n".join(lines)
 
 

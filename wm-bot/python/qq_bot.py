@@ -50,10 +50,21 @@ def _run_onebot():
                                  str(qq_common.DEFAULT_GROUPS_FILE))
     allowed = qq_common.load_allowed_groups(groups_file)
     allow_all = bot_config.flag("WM_QQ_ALLOW_ALL_GROUPS")
+    base_handler = qq_common.make_handler(allowed, allow_all=allow_all)
     client = OneBotClient(
         url=url, token=token, mode=mode,
-        handler=qq_common.make_handler(allowed, allow_all=allow_all),
+        handler=qq_common.make_monitor_aware_handler(base_handler),
     )
+    import ws_monitor
+    ws_monitor.set_sender(client.send_active)
+    saved_n = ws_monitor.load_switches()
+    if saved_n:
+        print(f"[qq_bot] 已恢复 {saved_n} 个会话保存的主推开关"
+              "（发「主推状态」可查看）", file=sys.stderr)
+    auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
+    if auto_n:
+        print(f"[qq_bot] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "
+              f"{ws_monitor.priority_types()}（新条目即时推送）", file=sys.stderr)
     print(f"[qq_bot] WM→QQ（OneBot {mode}）启动，URL={url}",
           file=sys.stderr)
     if allow_all:
@@ -71,8 +82,39 @@ def _run_onebot():
     client.run_forever()
 
 
+def _startup_selfcheck():
+    """开机把「图片 / Markdown 能不能发」一次说清，手机端排障不用翻日志。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.exists(os.path.join(here, "render_card.py")):
+        print("[card] ⚠️ 缺少 render_card.py！请把电脑 python/ 目录下这个文件一起拷过来，"
+              "否则所有回复只能发纯文字、红/蓝/灰昵称也不会有。", file=sys.stderr)
+    if not os.path.exists(os.path.join(here, "qq_markdown.py")):
+        print("[md] ⚠️ 缺少 qq_markdown.py，Markdown 通道不可用（自动回退富媒体图片）",
+              file=sys.stderr)
+    try:
+        import render_card
+        card = render_card.diagnose()
+    except Exception as e:
+        card = f"自检失败：{e}（render_card.py 是否拷到手机了？）"
+    print(f"[card] 图片能力自检：{card}", file=sys.stderr)
+    try:
+        import qq_markdown
+        if qq_markdown.enabled():
+            print(f"[md] Markdown 消息已启用：{qq_markdown.resolved_mode()}"
+                  "（一条消息：上卡片图 + 下可复制字符串）", file=sys.stderr)
+        else:
+            print("[md] Markdown 消息已关闭：走富媒体图片 msg_type=7 图文混排",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[md] Markdown 自检失败：{e}", file=sys.stderr)
+
+
 def main():
     bot_config.apply()   # 幂等：读同目录 data/config.txt（wm 模块导入时已读过，这里再保底）
+    ca = bot_config.ensure_ssl_ca()   # 手机端缺 CA 根证书时自动找 bundle / 兜底
+    if ca:
+        print(f"[ssl] 已启用 CA 根证书：{ca}", file=sys.stderr)
+    _startup_selfcheck()
     # 纯 Python 的调试开关：临时抓群 openid 用，不改 data/config.txt
     if "--allow-all-groups" in sys.argv[1:]:
         os.environ["WM_QQ_ALLOW_ALL_GROUPS"] = "1"

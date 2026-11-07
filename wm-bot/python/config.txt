@@ -44,8 +44,24 @@ WM_QQ_SECRET =
 # 官方接口根地址，一般不用改
 WM_QQ_API_BASE = https://api.bot.qq.com
 
-# 事件订阅位掩码，一般不用改（33554432 = 群@消息 + 单聊消息）
+# 事件订阅位掩码，一般不用改（33554432 = GROUP_AND_C2C_EVENT，1<<25）。
+# 这一位已经包含：群@消息 GROUP_AT_MESSAGE_CREATE、群全量消息 GROUP_MESSAGE_CREATE、
+#   单聊 C2C_MESSAGE_CREATE、通知开关 GROUP/C2C_MSG_RECEIVE|REJECT、进退群与好友事件。
+# 免 @ 和主动发言【都不是改这里】，而是在【群资料页 → 机器人设置】按群单独开：
+#   ① 机器人可获取的群聊消息范围 = 获取群内全部消息
+#      → 群里每条消息都推 GROUP_MESSAGE_CREATE，不用 @（文档 group_message_create.html）
+#   ② 机器人主动在群聊内发言（蓝色开关）
+#      → 定时监控能主动推送（开启时触发 GROUP_MSG_RECEIVE）
+# 两个开关互不替代；每个群、每个人都得单独开一次。intent 保持 1<<25 即可。
 WM_QQ_INTENTS = 33554432
+
+# 全量群消息（免 @，即 GROUP_MESSAGE_CREATE）的回复方式：
+#   1（默认）= 单纯发一条普通群消息，不带 msg_id、不 @ 任何人、不显示「引用某条消息」；
+#              这正是「别人 wm 物品名 不用 @ 就能查」的效果。失败自动回退被动引用。
+#   0        = 仍走被动引用回复（带 msg_id，QQ 里会显示引用了哪条消息）。
+# 设 1 需要该群已打开「机器人主动在群聊内发言」，会消耗主动消息配额
+# （每群每天 1000 条，正常查询量远用不到）。
+WM_FULLMSG_ACTIVE = 1
 
 # ---------- 二、群白名单（只监控写进文件的群） ----------
 
@@ -75,6 +91,15 @@ WM_API_BASE = https://api.warframe.market
 # 单次联网请求的超时秒数，默认 15。连不上就立刻明确报错，不会让机器人卡住不回复。
 WM_HTTP_TIMEOUT = 15
 
+# 订单排序：优先「现在能马上交易」的卖家，默认 30 天。
+# WM 每条订单都带卖家状态（游戏中 / 在线 / 离线），排序固定为
+#   游戏中 → 在线 → 离线，同组内仍按价格从低到高。
+# 离线且【超过下面这个天数】没登录的（多半已 2035 封号或弃坑），再沉到列表最后；
+# 回复里会标出「N 天前在线」。代表价（最低价）只取在线/游戏中的报价，
+# 全都没在线时才退回全部报价并给出警告。
+# 想更严格可改成 7 / 14；改成 0 表示不区分「离线很久没登录」，只按三档排序。
+WM_OFFLINE_STALE_DAYS = 30
+
 # ---------- 四、OneBot 后端专用（用官方后端时下面几行用不上） ----------
 
 # 连接模式：client = 主动连过去；server = 等对方连进来（手机挂机常用）
@@ -92,5 +117,199 @@ WM_QQ_TOKEN =
 #           1 / 3 / 7 分钟重试（累计最多 4 次）在后台继续，成功后自动更新缓存；
 #           这样真实源挂掉时机器人不会假死、不会错过 QQ 被动回复的 5 分钟窗口。
 # 缓存只按「用户实际查过的物品」建立，绝不预拉全站物品清单。
-# 数据文件 cache.json / pace.json / bot_flow.log / groups.txt 都在
+# 数据文件 cache.json / pace.json / worldstate.json / bot_flow.log / groups.txt 都在
 # python 脚本同目录的 data/ 下，路径由脚本自己解析，整个文件夹拷到手机任意位置都能跑。
+
+# ---------- 六、世界状态（星际战甲国际服：警报 / 平原 / 突击 / 裂缝 …） ----------
+# 数据源：社区维护的 Warframe Status API（warframestat.us，开源、无需 key、已中文化）。
+#   它的底层就是解析 DE 官方 worldState.php，数据同源；比直接抓官方原始 JSON 省事太多。
+#   我们不抓官方 worldState.php：那是给游戏客户端用的原始 MongoDB 风格 JSON（几 MB、
+#   内部码如 MT_MOBILE_DEFENSE），要移植解析器 + 自建本地化表，成本太高。
+#
+# 刷新节奏（核心：**不轮询、不反复查询，按数据自身到期时间更新一次**）：
+#   每次抓取只发 1 个请求就把整个世界状态拿回来，同时记下「抓取时刻」，
+#   并把各条数据的 expiry / activation / timeLeft（相对时长换算成 抓取时刻 + 剩余时长）
+#   变成【绝对结束时刻】，去重升序排成队列写进 worldstate.json。
+#   后台线程长睡到队首那一条的结束时刻，到点再发 1 次全量请求、重排队列，继续睡。
+#   例：虚空商人没来时，队首就是他下次抵达时间（可能十几天），期间 0 次请求；
+#       到他抵达/离场那一刻才更新一次。发「计划」可查看全部到期时刻。
+#   - 节拍（任意两次全量请求之间的最小间隔）：10 -> 20 -> 50 -> 10 秒循环，
+#     写死在代码里（WS_STEP_GAPS），【不提供配置】—— 防止被误调小后打爆接口。
+#     真正决定「何时请求」的仍是队首那一条的结束时刻：队首在十几分钟后，节拍早过了，
+#     也只等到期点，不会按节拍空转；队列为空 / 到期点异常时才靠节拍兜底。
+#   - 失败退避：10 -> 30 -> 60 秒，之后保持 60 秒继续重试（成功后归零）；绝不无限快刷。
+#   - 同域名 3~5 秒访问间隔是【硬规则，写死不提供配置】，与 WM 共用 pace.json 记录，
+#     每次 HTTP 前都过一遍，保证任何两次访问【同一数据源域名】不短于 3~5 秒。
+#   - WS_PUSH_SECONDS：监控【检查】节奏（秒），默认 10；只读缓存，不额外打接口。
+#     注意它不是发送周期：主动消息权限开通后，只有「内容变了 + 过了 WS_ACTIVE_MIN_GAP」
+#     才真的发一条，否则 10 秒一条会刷屏并撞官方频控。
+#   - WS_WAKE_MAX：单次最长睡眠（秒），默认 3600，醒来重算计划防系统休眠漏点。
+#   - WS_EXPIRY_GRACE：到期宽限（秒），默认 2，避开边界抖动。
+#   - WS_HTTP_TIMEOUT：单次 HTTP 超时（秒），默认 15；连不上交给上面的退避，不会卡住机器人。
+#
+# 查询用「警报 / 平原 / 突击 / 仲裁 / 裂缝 / 钢铁裂缝 / 活动 / 赏金 …」任意词，
+# 「计划」看到期时间表；「监控 <词>」「监控 全部」开自动推送，发「停止监控」停止。
+# 全部指令发「帮助」（或「?」「菜单」）查看。
+
+# ---- 回复形式：白底卡片图（默认）or 纯文字 ----
+# 为什么要图：栏目多时纯文字一条消息上千字，容易触发风控、也不好看；
+#             卡片图一屏给全、还能分组/对齐剩余时间。
+# always（默认）：所有回复都优先发图（世界状态 / WM 查价 / 紫卡 / 帮助）
+# auto          ：查询结果超过 WM_WS_CARD_MIN 字节才画图，短结果仍发文字
+# off           ：只发文字（想复制文字的场景，图里的字选不中）
+# 临时强压：发「图 裂缝」强制出图，发「文字 裂缝」强制只发文字，前缀优先于这里。
+#           「文字」对 WM 也生效：文字 WM Boltor Prime 会回纯文本，方便复制 /w 指令。
+# WM_WS_CARD = always
+# WM_WS_CARD_MIN = 800
+#   字体：默认自动找 微软雅黑 / 思源黑体 / Noto / 文泉驿；都找不到就自动退回纯文字。
+#   要指定字体（例如 Linux 服务器）：
+# WM_CARD_FONT = /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+# 注意：渲染依赖 Pillow（pip install pillow）；没装 Pillow 时自动退回纯文字，不报错。
+#       发图失败（无权限 / 图片过大）同样退回纯文字。
+#
+# 官方通道：WM 交易回复的「卡片图 + 中英文 /w 指令」默认合成【一条消息】
+#   （富媒体 msg_type=7 同时带 content，仅图片支持图文混排；/w 仍是可复制纯文本）
+# 1（默认）：一条消息，图上是价格列表、图下就是 /w 指令
+# 0        ：退回两条（图一条 + 文本一条）；若发现客户端不显示混排文字，改成 0
+# 混排被服务端拒绝时会自动回退成两条，无需手动干预。
+# WM_QQ_MIX_MESSAGE = 1
+
+# ---- 监控推送：主动 + 随消息附带（两手准备） ----
+# 主动消息要在【群资料页 → 机器人设置】打开「机器人主动在群聊内发言」，
+# 没开时固定 40034105 无权限；发不出去的内容会攒着，等本会话有人发消息时
+# 拼在回复末尾一起带出（被动窗口必达）。开了「获取群内全部消息」后，
+# 任意一条群消息都能当这个窗口，不必非等查询指令。
+# 官方主动消息频控：单关系 20 qpm、每群每天最多 1000 条，所以主动推送有
+# 「内容不变不重发 + 最小间隔」两道闸，别把 WS_PUSH_SECONDS 当成发送周期。
+# WS_ACTIVE_MIN_GAP = 300     主动推送最小间隔（秒）；内容不变一律不重发
+# WS_ATTACH_ON_QUERY = 1      是否允许随消息附带（1 开 / 0 关，默认开）
+# WS_ATTACH_TTL = 1800        暂存保鲜期（秒），过期不再附带
+# WS_ATTACH_GAP = 20          同一会话两次附带的最小间隔（秒），防连发重复
+# WS_ATTACH_MAX_BYTES = 2000  附带内容最大字节，超出按整行截断并注明
+
+# ---- 数据源选择【重要：换源只改这里】----
+# wfwiki（默认，推荐）：抓 worldstate.wf.wiki 页面内嵌的实时数据（Next.js 服务端渲染）。
+#   无 Cloudflare、程序化可直连；主页一屏能看到的栏目全部可取、且都能单独查：
+#   平原（希图斯 / 奥布山谷 / 魔胎之境 / 双衍王境 / 扎里曼）、裂缝、钢铁裂缝、警报、活动、
+#   入侵、午夜电波、虚空商人、瓦奇娅、Darvo 特惠、开放世界赏金、赏金轮换、
+#   信条武器、终幕武器、全局加成、新闻。
+#   突击：wf.wiki 没有，另从 DE 官方端点 api.warframe.com/cdn/worldState.php 补抓（可直连）。
+#   仲裁：wf.wiki 没有，来自 arbi.wf.wiki 的「仲裁轮换表」（见下面的 ARBI 两行）。
+#   【仍不提供】：信使前哨 / 集团任务 / 建造进度（这三项 DE 数据也没有，查询会如实提示）。
+# warframe：走下面的 WM_WS_API_BASE（api.warframestat.us 系，常被 Cloudflare 拦成 403）。
+# mock：离线测试用（返回内置样例，不联网）。
+# WM_WS_SOURCE = wfwiki
+#
+# wf.wiki 页面地址 / DE 官方突击端点（一般不用改）：
+# WM_WS_WFWIKI_URL = https://worldstate.wf.wiki
+# WM_WS_OFFICIAL_URL = https://api.warframe.com/cdn/worldState.php
+#
+# ---- 仲裁（arbi.wf.wiki 轮换表）----
+# 仲裁每小时整点换图。arbi.wf.wiki 把轮换固化成了两张静态 JSON：
+#   /data/arbys.schedule.v2.json  {startTs, stepSec(3600), nodes[节点码], seq[序号->下标]}
+#   /data/arbys.nodes.zh.json     {节点码: 中文节点名 / 任务 / 阵营 / 等级区间}
+# 当前这张图 = nodes[seq[(now-startTs)/3600]]，所以本地就能算，不需要每次去问站点：
+#   表 7 天同步一次（两张表合计约 440KB），平时查询 0 请求；表跑出覆盖区间会自动重抓。
+# 同样守同域名 3~5 秒（两次请求之间会等），想换镜像就改 WM_WS_ARBI_URL。
+# WM_WS_ARBI_URL = https://arbi.wf.wiki
+# WM_WS_ARBI_TTL = 604800
+#
+# ---- 世界状态数据源根地址（仅 WM_WS_SOURCE = warframe 时生效）----
+# 【多源用逗号分隔】，主用在前，某个源整体失败（/pc/zh 与 /pc 都拿不到）自动回退下一个；
+# 全部失败才报错。默认只含官方 api.warframestat.us（该域名常被 Cloudflare 拦程序化请求 → HTTP 403）。
+# 建议把你自建/能用的镜像放最前面，例如：
+#   WM_WS_API_BASE = http://127.0.0.1:3001,https://api.warframestat.us
+# 程序会自动给每个根地址拼 /pc/zh（中文失败退回 /pc），每个源按【自己的域名】独立守 3~5 秒。
+#
+# 自建方法（返回格式与官方【完全一致】，解析器零改动）：官方开源服务 WFCD/warframe-status
+#   本机 Docker 一键起：  docker run -d --name wfstatus -p 3001:3001 ghcr.io/wfcd/warframe-status:latest
+#   然后本机填：          WM_WS_API_BASE = http://127.0.0.1:3001
+#   部署到 VPS：          同上命令跑在 VPS 上，这里填 http://<VPS的IP>:3001
+#   验证：               curl http://127.0.0.1:3001/pc/zh   应能返回 JSON
+#   注意：若部署机也连不上 DE 服务器（地域限制），官方文档让套 Cloudflare WARP 出口。
+WM_WS_API_BASE = https://api.warframestat.us
+
+# 语言：zh = 中文（默认，推荐）；改成 en 就是英文原版。
+WM_WS_LANG = zh
+
+WS_PUSH_SECONDS = 10
+WS_WAKE_MAX = 3600
+WS_EXPIRY_GRACE = 2
+WS_HTTP_TIMEOUT = 15
+
+# ---- 监控推送 / 警报「主推」（模板示例；真正生效的是 data/config.txt）----
+# 完整说明见 data/config.txt「四点六」与「四点六(2)」两段。
+# 警报 / 活动出现新条目时立刻单独推一条，不受下面的 300 秒周期限制；
+# 周期推送签名会剔除倒计时，倒计时跳动不再刷屏。
+WS_ACTIVE_MIN_GAP = 300
+WS_ATTACH_ON_QUERY = 1
+WS_ATTACH_TTL = 1800
+WS_ATTACH_GAP = 20
+WS_ATTACH_MAX_BYTES = 2000
+# 主推栏目（英文键或中文名，逗号分隔；写 off = 关掉主推）
+WS_PRIORITY_TYPES = alerts,events
+# 主推防抖最小间隔（秒）
+WS_PRIORITY_MIN_GAP = 60
+# 周期全量推送里剔除已主推栏目：1 开 / 0 关
+WS_PRIORITY_SKIP_IN_FULL = 1
+# 群里 / 私聊直接发「活动=开启」「警报=关闭」「主推状态」即可按会话开关主推，
+# 不用改配置、不用重启；设置存 data/ws_switches.json，重启自动恢复。
+# 开关存盘位置（可选，默认 data/ws_switches.json）
+# WS_SWITCH_FILE = data/ws_switches.json
+# 设 0 = 只本轮运行有效、不写盘；1 = 存盘（默认）
+WS_SWITCH_PERSIST = 1
+# 启动即对白名单群自动注册主推：0 关（默认，不擅自发消息）/ 1 开
+WS_AUTO_PRIORITY = 0
+
+# ---- 手机端 HTTPS 证书（Termux / QPython）----
+# 若启动时一直刷 CERTIFICATE_VERIFY_FAILED / unable to get local issuer certificate：
+# 这是手机上的 Python 缺 CA 根证书，不是网络或 QQ 接口问题。
+# 推荐在 Termux 执行：pkg install ca-certificates   然后重新运行即可。
+# 程序会自动探测 $PREFIX/etc/tls/cert.pem、/etc/ssl/certs/ca-certificates.crt、
+# /system/etc/security/cacerts 等路径并照常校验；全找不到时才临时关闭校验并
+# 打印醒目警告（有中间人风险，仅作兜底）。也可手动指定 CA 文件：
+# WM_SSL_CAFILE = /data/data/com.termux/files/usr/etc/tls/cert.pem
+# 实在装不上证书才设 1 强制不校验（不推荐）：
+# WM_SSL_NOVERIFY = 0
+
+# ---- Markdown 消息（上图片 + 下字符串，一条消息；完整说明见 data/config.txt「四点九」）----
+# 官方 2026/04/23 起自定义 Markdown 对单聊/群聊全量开放，无需模板审核。
+# 一条消息 = 完整卡片图 + 图片下方英中两条可复制 /w 指令。
+# ★ 卡片图里已有标题 / 行情 / 排序 / 订单 / 来源，文字区【不重复正文】；
+#   只有「文字 xxx」纯文字回退才输出完整正文。
+# 图片【首选】固定公网 URL + 覆盖式上传：网盘 / Git 仓库里永远只有一张 card.png，
+# 每次覆盖写，URL 永不变、不占免费额度；客户端按图片标签自动解析。
+#   方式 A 通用 PUT：WM_QQ_MD_IMAGE_PUT_URL（上传端点）+ WM_QQ_MD_IMAGE_URL（公开地址）
+#                    + WM_QQ_MD_IMAGE_PUT_TOKEN / WM_QQ_MD_IMAGE_PUT_METHOD（默认 PUT）
+#   方式 B GitHub/Gitee：WM_QQ_MD_GITHUB_REPO / TOKEN / PATH / BRANCH / API / RAW
+# 覆盖后地址不变可能显示旧图：WM_QQ_MD_IMAGE_BUST=1 加 ?v=<图片哈希> 破缓存，
+# 存储仍只有一张，不产生新图。没配覆盖式 → 官方素材 qqbot-media:// → 自备图床兜底；
+# 素材拿不到引用就回退富媒体发图，绝不发「无图纯文字」。
+# 真机实测：python md_probe.py（dry-run）/ --send --group <openid> --image overwrite
+# native（默认）/ template（需审核模板 ID）/ auto / 0（关，回退 msg_type=7 图文混排）
+WM_QQ_MARKDOWN = native
+WM_QQ_MD_FALLBACK = 1
+WM_QQ_MD_MAX_CHARS = 3000
+WM_QQ_MD_IMAGE_WIDTH = 618
+WM_QQ_MD_IMAGE_BUST = 1
+# 官方素材清理阈值：默认只留 3 张，上传新图后删最旧的；可填 1 / 3 / 5（范围 1~95）
+WM_QQ_MD_MEDIA_MAX = 3
+# 覆盖式配置示例（换成自己的地址；token 不要写进这个会上传 GitHub 的模板文件）
+# WM_QQ_MD_IMAGE_URL = https://raw.githubusercontent.com/你的名/仓库/main/wm/card.png
+# WM_QQ_MD_IMAGE_PUT_URL = https://你的网盘/wm/card.png
+# WM_QQ_MD_IMAGE_PUT_TOKEN = Bearer xxxxx
+# WM_QQ_MD_GITHUB_REPO = 你的名/仓库
+# WM_QQ_MD_GITHUB_TOKEN = ghp_xxxx
+# WM_QQ_MD_GITHUB_PATH = wm/card.png
+# WM_QQ_MD_GITHUB_BRANCH = main
+# WM_QQ_MD_IMAGE_STATE = data/md_image_state.json
+# WM_QQ_MD_TEMPLATE_ID = 101993071_1658748972
+# WM_QQ_MD_IMAGE_UPLOAD = https://example.com/upload
+
+# ---- 卡片图片（Pillow + 中文字体）----
+# 手机上图片/红蓝灰昵称全没了，通常是没装 Pillow 或没有中文字体：
+#   pip install pillow  /  pkg install noto-cjk-fonts
+# 也可手动指定字体路径（QPython 等环境）：
+# WM_CARD_FONT = /path/to/NotoSansCJK-Regular.ttc
+# WM_CARD_FONT_BOLD = /path/to/NotoSansCJK-Bold.ttc
+

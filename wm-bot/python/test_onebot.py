@@ -169,7 +169,37 @@ class TestIntegrationServer(unittest.TestCase):
 
         self.assertIsNotNone(got, "未收到 send_group_msg 回复")
         self.assertEqual(got["params"]["group_id"], 123456)
-        self.assertIn("boltor prime", got["params"]["message"].lower())
+        # 现在默认「一律出图」，message 会是段数组（含 base64 图片段）；
+        # 无字体/Pillow 时退回纯文本。两种形态都要能发出去。
+        sent = got["params"]["message"]
+        if isinstance(sent, list):
+            kinds = {s.get("type") for s in sent if isinstance(s, dict)}
+            self.assertTrue(kinds & {"image", "text"}, "段数组里既没有图片也没有文本")
+            texts = "".join(
+                (s.get("data") or {}).get("text", "") for s in sent
+                if isinstance(s, dict) and s.get("type") == "text")
+        else:
+            texts = str(sent)
+        if texts:
+            self.assertIn("boltor prime", texts.lower())
+
+    def test_send_reply_text_fallback(self):
+        """强制纯文本（如「文字 WM …」）时仍发单个字符串，老客户端兼容。"""
+        class _Sink:
+            sent = None
+
+            def send_text(self, s):
+                self.sent = s
+
+        class _Reply(str):
+            pngs = []
+
+        conn = _Sink()
+        client = onebot.OneBotClient()
+        client._send_reply(conn, {"message_type": "group", "group_id": 42},
+                           _Reply("hello 文本"))
+        payload = json.loads(conn.sent)
+        self.assertEqual(payload["params"]["message"], "hello 文本")
 
 
 if __name__ == "__main__":

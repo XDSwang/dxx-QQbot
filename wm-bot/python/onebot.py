@@ -30,6 +30,8 @@ import hashlib
 import threading
 import urllib.parse
 
+import config as bot_config   # 统一 wss 证书处理（手机端缺 CA 时自动兼容）
+
 WSS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -203,6 +205,7 @@ class OneBotClient:
         self._echo = 0
         self._echo_lock = threading.Lock()
         self._srv = None
+        self._conn = None   # 当前活跃连接（供主动发送使用）
 
     def stop(self):
         self._stop.set()
@@ -244,7 +247,7 @@ class OneBotClient:
         sock = socket.create_connection((host, port), timeout=10)
         if u.scheme == "wss":
             import ssl
-            ctx = ssl.create_default_context()
+            ctx = bot_config.ssl_context()
             if os.environ.get("WM_QQ_NO_VERIFY"):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
@@ -289,21 +292,42 @@ class OneBotClient:
 
     # ---- 收发主循环 ----
     def _loop(self, conn):
-        while not self._stop.is_set():
-            typ, payload = conn.recv_message()
-            if typ == "close":
+        self._conn = conn
+        try:
+            while not self._stop.is_set():
+                typ, payload = conn.recv_message()
+                if typ == "close":
+                    try:
+                        conn.send_close()
+                    except Exception:
+                        pass
+                    break
+                if typ != "text":
+                    continue
                 try:
-                    conn.send_close()
+                    msg = json.loads(payload.decode("utf-8"))
                 except Exception:
-                    pass
-                break
-            if typ != "text":
-                continue
-            try:
-                msg = json.loads(payload.decode("utf-8"))
-            except Exception:
-                continue
-            self._on_message(conn, msg)
+                    continue
+                self._on_message(conn, msg)
+        finally:
+            self._conn = None
+
+    def send_active(self, channel, target_id, text):
+        """主动发送（供世界状态监控推送）：直接走 OneBot API（send_group_msg / send_private_msg）。"""
+        if self._conn is None or not target_id:
+            return False
+        if channel == "group":
+            action, params = "send_group_msg", {"group_id": target_id, "message": text}
+        elif channel == "private":
+            action, params = "send_private_msg", {"user_id": target_id, "message": text}
+        else:
+            return False
+        with self._echo_lock:
+            self._echo += 1
+            e = self._echo
+        self._conn.send_text(json.dumps(
+            {"action": action, "params": params, "echo": e}, ensure_ascii=False))
+        return True
 
     def _on_message(self, conn, msg):
         post_type = msg.get("post_type")
@@ -328,7 +352,25 @@ class OneBotClient:
 
     def _send_reply(self, conn, msg, reply):
         message_type = msg.get("message_type")
-        params = {"message": reply}
+        pngs = list(getattr(reply, "pngs", None) or [])
+        tail = str(getattr(reply, "tail", "") or "").strip()
+        if pngs:
+            # OneBot 11：message 传数组，图片用 base64://（免图床、免公网地址）
+            segs = []
+            for png in pngs[:4]:
+                try:
+                    segs.append({"type": "image", "data": {
+                        "file": "base64://" + base64.b64encode(png).decode("ascii")}})
+                except Exception:
+                    segs = []
+                    break
+            if segs and tail:
+                # 同一条消息里，图片段后跟可复制的 /w 指令文本段
+                segs.append({"type": "text", "data": {"text": tail}})
+            params = ({"message": segs} if segs
+                      else {"message": str(reply) + (("\n" + tail) if tail else "")})
+        else:
+            params = {"message": reply}
         if message_type == "group":
             params["group_id"] = msg.get("group_id")
             action = "send_group_msg"

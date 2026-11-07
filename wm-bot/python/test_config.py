@@ -106,9 +106,22 @@ class TestWiring(unittest.TestCase):
         self.assertNotIn("WM_QQ_SECRET", config.read(tpl))
 
     def test_data_dir_is_gitignored(self):
-        """data/ 必须被排除，否则 data/config.txt 里的密钥会随仓库上传。"""
-        gi = HERE.parent / ".gitignore"
-        self.assertTrue(gi.exists())
+        """data/ 必须被排除，否则 data/config.txt 里的密钥会随仓库上传。
+
+        仓库层级曾从 python/ 搬到 wm-bot/python/，.gitignore 可能在脚本同目录，
+        也可能在更上层的仓库根；从脚本目录逐级向上找第一个存在的即可。
+        """
+        gi = None
+        p = HERE
+        while True:
+            cand = p / ".gitignore"
+            if cand.exists():
+                gi = cand
+                break
+            if p == p.parent:
+                break
+            p = p.parent
+        self.assertTrue(gi is not None, "找不到 .gitignore")
         lines = [l.strip() for l in gi.read_text(encoding="utf-8").splitlines()
                  if l.strip() and not l.strip().startswith("#")]
         self.assertIn("data/", lines)

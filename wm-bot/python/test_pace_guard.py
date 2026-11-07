@@ -7,7 +7,12 @@
 同域名 3~5s 节流、1/3/7 分钟重试、4 次全失败后 1 小时。
 
 用法：python test_pace_guard.py
+被 `python -m unittest discover` 误导入时自动跳过（本文件是脚本式，不是 TestCase）。
 """
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("脚本式测试，请直接 python test_pace_guard.py 运行")
+
 import json
 import os
 import subprocess
@@ -60,7 +65,13 @@ def probe_cache(overrides):
     env["WM_SOURCE"] = "mock"          # 离线，不发 HTTP
     env.pop("WM_CACHE_MINUTES", None)
     env.update(overrides)
-    code = "import wm;print(wm.CACHE_MINUTES, wm.STALE_MS)"
+    # 隔离本机 data/config.txt：其中若设了 WM_CACHE_MINUTES=3，会在 wm 导入时被
+    # config.apply() 注入 env，把「内置默认值 60」覆盖掉。这里先让 config 指向一个
+    # 不存在的临时路径，测的才是代码内置默认值；覆盖场景由下面的 overrides 验证。
+    code = ("import pathlib, tempfile, config\n"
+            "config.CONFIG_FILE = pathlib.Path(tempfile.gettempdir()) / '__wm_bot_no_config__.txt'\n"
+            "config.TEMPLATE_FILE = config.CONFIG_FILE\n"
+            "import wm;print(wm.CACHE_MINUTES, wm.STALE_MS)")
     p = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env,
                         capture_output=True, text=True)
     if p.returncode != 0:
