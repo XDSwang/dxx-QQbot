@@ -29,6 +29,10 @@ os.environ["WS_PUSH_SPLIT_MAX"] = "10"
 
 import worldstate as ws
 import ws_monitor as M
+import tempfile as _tf
+from pathlib import Path as _P
+# 去重记录落盘重定向到临时目录，绝不污染真实 data/ws_last_sent.json
+M.LAST_SENT_FILE = _P(_tf.gettempdir()) / "wm_ws_last_sent_testsplit.json"
 
 KA = ("group", "G1")
 
@@ -180,6 +184,34 @@ def main():
     calls.clear()
     sent4 = once({"alerts": [_alert()], "events": [_event()]}, ["alerts", "events"])
     t("纯主推栏目 → 周期 0 条（交给主推分支）", sent4 == 0 and len(calls) == 0)
+
+    # ---------- 8) 去重记录持久化：重启后内容没变不重发 ----------
+    print("[去重记录持久化·防重启重发]")
+    import tempfile
+    from pathlib import Path
+    tmpf = Path(tempfile.gettempdir()) / "wm_ws_last_sent_test.json"
+    for p in (tmpf, tmpf.with_name(tmpf.name + ".tmp")):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    with patch.object(M, "LAST_SENT_FILE", tmpf):
+        bind(monitored)
+        calls.clear()
+        once({}, monitored)                    # 首轮全发，并自动落盘
+        t("首轮发出 4 条", len(calls) == 4)
+        t("去重记录已落盘", tmpf.exists())
+        # 模拟重启：内存清空（set_sender 会清）+ 从磁盘恢复
+        M._last_sent.clear()
+        M.restore_last_sent()
+        calls.clear()
+        again = once({}, monitored)            # 内容没变 → 应 0 条
+        t("重启后内容不变 → 不重发（0 条）", again == 0 and len(calls) == 0)
+    for p in (tmpf, tmpf.with_name(tmpf.name + ".tmp")):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
     print("\n拆分测试：%d/%d 通过" % (ok, total))
     return 0 if ok == total else 1

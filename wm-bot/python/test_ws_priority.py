@@ -30,6 +30,9 @@ os.environ["WS_ACTIVE_MIN_GAP"] = "300"
 
 import worldstate as ws
 import ws_monitor as M
+import tempfile as _tf
+from pathlib import Path as _P
+M.LAST_SENT_FILE = _P(_tf.gettempdir()) / "wm_ws_last_sent_testprio.json"
 
 
 def check(name, cond):
@@ -350,8 +353,8 @@ def main():
     print("[监控文字标签 monitor_label]")
     t("赏金 → 赏金监控信息如下",
       M.monitor_label("开放世界赏金(3个集团)\n赏金 · 索拉里斯") == "【赏金监控信息如下】")
-    t("希图斯/夜灵平原 → 平原监控信息如下",
-      M.monitor_label("希图斯（昼）\n夜灵平原 剩余") == "【平原监控信息如下】")
+    t("希图斯 → 希图斯监控信息如下（只看首行）",
+      M.monitor_label("希图斯（昼）\n夜灵平原 剩余") == "【希图斯监控信息如下】")
     t("虚空裂隙 → 裂缝监控信息如下",
       M.monitor_label("虚空裂隙\n中断事件") == "【裂缝监控信息如下】")
     t("后纪中断/强袭 → 中断监控信息如下",
@@ -368,6 +371,26 @@ def main():
       M.monitor_label("赏金 · 希图斯集团") == "【赏金监控信息如下】")
     t("裂缝优先于平原（避免误标）",
       M.monitor_label("裂缝\n奥布山谷附近") == "【裂缝监控信息如下】")
+    # —— 关键回归：平原正文内嵌「赏金 ·」行，不能把整个栏目误标成「赏金」——
+    t("平原内嵌赏金行 → 仍按首行标希图斯（不误标赏金）",
+      M.monitor_label("希图斯（地球平原）：☀️ 白天 剩余 5分\n   赏金 · 希图斯（5 个）")
+      == "【希图斯监控信息如下】")
+    t("平原昼夜组合视图（≥2 区域）→ 平原昼夜",
+      M.monitor_label("希图斯（地球平原）：☀️ 白天\n   赏金 · 希图斯\n\n"
+                      "奥布山谷（金星平原）：🔥 温暖\n   赏金 · 索拉里斯")
+      == "【平原昼夜监控信息如下】")
+    t("赏金轮换 与 赏金 不再撞名",
+      M.monitor_label("🔄 赏金轮换（本轮 A）\n  本轮奖励：x") == "【赏金轮换监控信息如下】"
+      and M.monitor_label("🧾 开放世界赏金（3 个集团）") == "【赏金监控信息如下】")
+    t("瓦奇娅 与 虚空商人 不再撞名",
+      M.monitor_label("💎 瓦奇娅（原初重生）· Maroo 的市集") == "【瓦奇娅监控信息如下】"
+      and M.monitor_label("🛸 虚空商人（白老头）：已在 飞船") == "【商人监控信息如下】")
+    t("信条武器 / 终幕武器 不再都叫「武器」",
+      M.monitor_label("🗡️ 信条武器：（当前无）") == "【信条武器监控信息如下】"
+      and M.monitor_label("🔫 终幕武器：（当前无）") == "【终幕武器监控信息如下】")
+    t("钢铁裂缝 与 裂缝 不再撞名",
+      M.monitor_label("⚙️ 钢铁裂缝（共 2）") == "【钢铁裂缝监控信息如下】"
+      and M.monitor_label("🔥 裂缝\n  - 地球") == "【裂缝监控信息如下】")
     t("无关键字 → 通用监控信息如下",
       M.monitor_label("") == "【监控信息如下】")
     t("None 也不报错", M.monitor_label(None) == "【监控信息如下】")

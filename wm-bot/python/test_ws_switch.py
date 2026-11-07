@@ -35,6 +35,8 @@ import ws_monitor as M
 import qq_common
 
 wm.CACHE_FILE = os.path.join(TMP, "cache.json")   # 离线测试绝不污染真实缓存
+from pathlib import Path as _P
+M.LAST_SENT_FILE = _P(TMP) / "ws_last_sent.json"   # 去重记录也写临时目录
 
 SW = os.environ["WS_SWITCH_FILE"]
 KA = ("group", "G1")

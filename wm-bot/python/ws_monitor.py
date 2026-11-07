@@ -48,11 +48,13 @@ import threading
 import time
 from pathlib import Path
 
+import wm
 import worldstate as ws
 
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SWITCH_FILE = HERE / "data" / "ws_switches.json"
+LAST_SENT_FILE = HERE / "data" / "ws_last_sent.json"   # 按栏目去重记录（落盘，防重启重发）
 
 _sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text) -> bool
 _monitors = {}                       # (channel, target_id) -> set(types)
@@ -379,6 +381,70 @@ def set_sender(fn):
         _priority_sent_at.clear()
 
 
+def _flog(msg):
+    """写流程日志（复用 qq_official 注入到 wm.LOG_HOOK 的 flog）；未注入时静默。"""
+    hook = getattr(wm, "LOG_HOOK", None)
+    if hook:
+        try:
+            hook("WS " + str(msg))
+        except Exception:
+            pass
+
+
+def _save_last_sent():
+    """把按栏目去重记录落盘（原子写），重启后能续上，避免把稳定内容再刷一遍。"""
+    try:
+        with _lock:
+            data = {}
+            for (ch, tid), m in _last_sent.items():
+                data["%s|%s" % (ch, tid)] = {
+                    t: [sig, round(float(ts), 3)]
+                    for t, (sig, ts) in m.items()
+                }
+        LAST_SENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_SENT_FILE.with_name(LAST_SENT_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LAST_SENT_FILE)
+    except Exception as e:
+        _flog("去重记录落盘失败（忽略）: %s" % e)
+
+
+def restore_last_sent():
+    """启动时从磁盘恢复去重记录（须在 set_sender 清空之后调用）。
+
+    这样即使机器人重启，只要世界状态内容没变，就不会把首轮监控内容再全发一遍；
+    内容确实变了（签名不同）仍会正常推送，不影响「有变化才发」。
+    """
+    try:
+        if not LAST_SENT_FILE.exists():
+            return
+        with open(LAST_SENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        _flog("读取去重记录失败（当作全新启动）: %s" % e)
+        return
+    restored = {}
+    try:
+        for key, m in (data or {}).items():
+            if "|" not in key or not isinstance(m, dict):
+                continue
+            ch, tid = key.split("|", 1)
+            restored[(ch, tid)] = {
+                t: (v[0], float(v[1]))
+                for t, v in m.items()
+                if isinstance(v, (list, tuple)) and len(v) == 2
+            }
+    except Exception as e:
+        _flog("解析去重记录失败（当作全新启动）: %s" % e)
+        return
+    with _lock:
+        _last_sent.clear()
+        _last_sent.update(restored)
+    _flog("恢复去重记录：%d 个会话 / %d 条栏目" % (
+        len(restored), sum(len(m) for m in restored.values())))
+
+
 def start_monitor(channel, target_id, types):
     """开启某会话的监控；types 为 worldstate.TYPES 的键集合。"""
     key = (channel, str(target_id))
@@ -405,7 +471,10 @@ def stop_monitor(channel, target_id):
         if had_switch:
             _save_switches()
         removed = _monitors.pop(key, None) is not None
-        return removed or had_switch
+        changed = removed or had_switch
+    if changed:
+        _save_last_sent()            # 把「已移除该会话」的去重记录落盘
+    return changed
 
 
 def list_monitors():
@@ -601,41 +670,77 @@ def _priority_text(state, changed, added):
 
 # ---------------- 监控推送的文字标签（图文混排时放在图片前面） ----------------
 # 只做关键字匹配，不碰任何渲染逻辑，原图完全不变。
+# 顺序即优先级：更具体、或被更宽泛词包含的来源必须排前面
+# （如"赏金轮换"含"赏金"、"钢铁裂缝"含"裂缝"）。
 _MONITOR_LABEL_RULES = [
-    (("赏金", "赏金轮换", "bounty"), "赏金"),
-    (("虚空裂隙", "裂缝", "裂隙", "fissure", "Fissure"), "裂缝"),
+    # —— 具体来源优先 ——
+    (("赏金轮换", "bountyrot"), "赏金轮换"),
+    (("赏金", "悬赏", "bounty"), "赏金"),
+    (("瓦奇娅", "varzia", "原初"), "瓦奇娅"),
+    (("虚空商人", "baro", "白老头"), "商人"),
+    (("信条武器", "信条", "tenet"), "信条武器"),
+    (("终幕武器", "终幕", "coda"), "终幕武器"),
+    (("钢铁裂缝", "steel"), "钢铁裂缝"),
+    (("裂缝", "裂隙", "fissure"), "裂缝"),
     (("后纪中断", "中断", "强袭", "assault"), "中断"),
-    (("希图斯", "奥布山谷", "魔胎之境", "双衍王境", "扎里曼", "夜灵平原",
-      "金星平原", "火卫二", "平原",
-      "cetus", "vallis", "cambion", "duviri", "zariman"), "平原"),
+    # —— 平原各区域：每个区域独立标签（否则正文里内嵌的「赏金 ·」行会让
+    #    平原栏目全被误标成「赏金」，监控全部时看起来一堆重复）——
+    (("希图斯", "cetus"), "希图斯"),
+    (("奥布山谷", "vallis", "山谷"), "奥布山谷"),
+    (("魔胎之境", "cambion"), "魔胎之境"),
+    (("双衍王境", "duviri", "王境"), "双衍王境"),
+    (("扎里曼", "zariman"), "扎里曼"),
+    (("平原", "昼夜", "cycle"), "平原昼夜"),
+    # —— 其余 ——
     (("地图", "星图"), "地图"),
     (("警报", "alert"), "警报"),
     (("活动", "event"), "活动"),
     (("入侵", "invasion"), "入侵"),
     (("虚空风暴", "虚空军团", "void"), "虚空风暴"),
-    (("钢铁裂缝", "steel"), "钢铁裂缝"),
-    (("午夜电波", "电波", "nightwave"), "电波"),
-    (("虚空商人", "瓦奇娅", "baro"), "商人"),
+    (("午夜电波", "电波", "nightwave", "夜波"), "电波"),
     (("Darvo", "特惠", "deal"), "特惠"),
-    (("信条", "终幕"), "武器"),
-    (("全局加成", "加成"), "加成"),
+    (("全局加成", "加成", "双倍"), "加成"),
+    (("信使前哨", "outpost", "信使"), "信使前哨"),
+    (("集团任务", "syndicate", "集团"), "集团任务"),
+    (("建造进度", "construction", "建造"), "建造进度"),
+    (("新闻", "news"), "新闻"),
 ]
+
+# 平原各区域标签：多区域拼接（平原昼夜组合视图）时另判为「平原昼夜」。
+_REGION_LABELS = ("希图斯", "奥布山谷", "魔胎之境", "双衍王境", "扎里曼")
 
 
 def monitor_label(text):
-    """监控推送图文混排时用的文字标签：从内容里匹配关键字，返回「【来源监控信息如下】」。
+    """监控推送图文混排时用的文字标签：返回「【来源监控信息如下】」。
 
-    规则按 _MONITOR_LABEL_RULES 顺序（更具体的来源排在前面），命中第一个即返回；
-    一个关键字都不命中返回通用的「【监控信息如下】」。纯关键字匹配，不动任何卡片
-    渲染，原图完全不变——和 WM 交易卡片的「图片 + content 文字」是同一套机制，
-    只是这里把文字标签放在图片前面。
+    **只匹配首行**：每个栏目的标题都在首行（「希图斯（地球平原）」「🔄 赏金轮换」
+    「💎 瓦奇娅」…），而正文里会内嵌「赏金 · …」这类跨栏目行——若按全文匹配，
+    平原栏目会被正文里的「赏金」误标成「赏金」，监控全部时好几条全叫赏金、
+    看着像重复。只认首行，每个栏目就能拿到自己的标签。
+
+    规则按 _MONITOR_LABEL_RULES 顺序（更具体的来源在前），命中第一个即返回；
+    一个都不命中返回通用「【监控信息如下】」。纯关键字匹配，不动任何渲染，原图不变。
     """
-    t = (text or "").lower()
+    text = text or ""
+    head = text.split("\n", 1)[0]
+    low = head.lower()
+    matched = None
     for keys, source in _MONITOR_LABEL_RULES:
         for k in keys:
-            if k and k.lower() in t:
-                return "【%s监控信息如下】" % source
-    return "【监控信息如下】"
+            if k and k.lower() in low:
+                matched = source
+                break
+        if matched:
+            break
+    if not matched:
+        return "【监控信息如下】"
+    # 平原昼夜 = 多个区域拼接而成的组合视图：首行只会落成第一个区域，
+    # 整段出现 ≥2 个区域标题时归为「平原昼夜」，避免和各区域单栏目撞名。
+    if matched in _REGION_LABELS:
+        hits = sum(1 for r in _REGION_LABELS if r in text)
+        if hits >= 2:
+            return "【平原昼夜监控信息如下】"
+    return "【%s监控信息如下】" % matched
 
 
 def _push_priority(ch, tid, key, state, prio, now):
@@ -831,6 +936,8 @@ def push_once():
                 time.sleep(interval)        # 相邻两条之间稍歇，防官方频控
         if sent_any:
             sent += 1
+    if sent:
+        _save_last_sent()               # 本轮有改动 → 去重记录落盘，重启后不再重发
     return sent
 
 

@@ -377,9 +377,10 @@ class OfficialBot:
                 # 单条 Markdown：文字标签在上、卡片图在下（与交易卡反过来，占一条消息）
                 if self._send_active_markdown(token, kind, target_id, pngs, label):
                     _active_fail_at[0] = 0.0
-                    flog(f"主动推送(单条Markdown·字在上)成功: {kind} {target_id} 张数={len(pngs)}")
-                    print(f"[official] 主动推送 单条Markdown(字在上) {kind} {target_id}"
-                          f"（{len(pngs)} 张）", file=sys.stderr)
+                    flog(f"主动推送(单条Markdown·字在上)成功: {kind} {target_id} "
+                         f"{label or '【监控信息如下】'} 张数={len(pngs)}")
+                    print(f"[official] 主动推送 单条Markdown(字在上) {kind} {target_id} "
+                          f"{label or '【监控信息如下】'}（{len(pngs)} 张）", file=sys.stderr)
                     return True
                 # Markdown 没成（没图引用 / 被拒 / 关了）：回退两条消息（字在上+图在下），
                 # 保证「字在上」的意图在兜底时也不丢；多页卡片图也能全部发出
@@ -392,9 +393,10 @@ class OfficialBot:
                                          content=None)
                 if res and res.ok:
                     _active_fail_at[0] = 0.0
-                    flog(f"主动推送(两条·字在上)成功: {kind} {target_id} 张数={len(pngs)}")
-                    print(f"[official] 主动推送 两条(字在上) {kind} {target_id}"
-                          f"（{len(pngs)} 张）", file=sys.stderr)
+                    flog(f"主动推送(两条·字在上)成功: {kind} {target_id} "
+                         f"{label or '【监控信息如下】'} 张数={len(pngs)}")
+                    print(f"[official] 主动推送 两条(字在上) {kind} {target_id} "
+                          f"{label or '【监控信息如下】'}（{len(pngs)} 张）", file=sys.stderr)
                     return True
                 # 图片也没发成：补发纯文本；标签若已发出则省略，避免重复
                 fb = text if label_sent else ((label + "\n\n" + text) if label else text)
@@ -841,6 +843,8 @@ def main():
 
     import ws_monitor
     ws_monitor.set_sender(lambda kind, tid, text: bot.send_active(kind, tid, text))
+    # 恢复上次的去重记录：重启后只要内容没变，就不再重发首轮监控（防刷屏 / 重复）
+    ws_monitor.restore_last_sent()
     # 先恢复聊天指令保存的开关（「活动=开启」等），再按配置补自动注册；
     # 两者都只合并栏目，不覆盖对方 / 用户手动开的监控范围。
     saved_n = ws_monitor.load_switches()

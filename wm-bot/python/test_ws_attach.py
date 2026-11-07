@@ -20,6 +20,9 @@ sys.path.insert(0, HERE)
 import qq_common as q
 import worldstate as ws
 import ws_monitor as M
+import tempfile as _tf
+from pathlib import Path as _P
+M.LAST_SENT_FILE = _P(_tf.gettempdir()) / "wm_ws_last_sent_testattach.json"
 
 
 def check(name, cond):
