@@ -292,7 +292,7 @@ class TestOnEvent(unittest.TestCase):
                 "d": {"author": {"user_openid": openid}, "content": content, "id": mid}}
 
     def test_group_whitelisted_trigger(self):
-        self.bot._on_event(None, self._pkt_group("<@!bot> wm boltor prime"), "TOK")
+        self.bot._on_event(None, self._pkt_group("<@!bot> D/XX/wm boltor prime"), "TOK")
         self.assertEqual(len(self.calls), 1)
         kind, gid, content = self.calls[0]
         self.assertEqual(kind, "group")
@@ -301,7 +301,7 @@ class TestOnEvent(unittest.TestCase):
         self.assertIn("铂金", content)
 
     def test_group_not_whitelisted_silent(self):
-        self.bot._on_event(None, self._pkt_group("<@!bot> wm boltor", gid="GX"), "TOK")
+        self.bot._on_event(None, self._pkt_group("<@!bot> D/XX/wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
 
     def test_group_non_trigger_silent(self):
@@ -309,14 +309,14 @@ class TestOnEvent(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_c2c_not_limited(self):
-        # 单聊不受白名单限制
-        self.bot._on_event(None, self._pkt_c2c("zk tigris"), "TOK")
+        # 单聊不受白名单限制（WM 查询需带 D/XX/ 前缀）
+        self.bot._on_event(None, self._pkt_c2c("D/XX/zk tigris"), "TOK")
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][0], "user")
         self.assertIn("tigris", self.calls[0][2].lower())
 
     def test_passive_msg_id(self):
-        pkt = self._pkt_group("<@!bot> wm boltor", mid="EVENT999")
+        pkt = self._pkt_group("<@!bot> D/XX/wm boltor", mid="EVENT999")
         self.bot._on_event(None, pkt, "TOK")
         # 被动回复须把事件 d.id 作为 msg_id 传入（不是 event_id）
         self.assertEqual(len(self.calls), 1)
@@ -324,8 +324,8 @@ class TestOnEvent(unittest.TestCase):
         self.assertEqual(self.msg_ids[0], "EVENT999")
 
     def test_group_full_message_no_mention(self):
-        # 群消息全量模式：不用 @，直接 "wm boltor" 也要能触发（白名单内）
-        self.bot._on_event(None, self._pkt_group_full("wm boltor"), "TOK")
+        # 群消息全量模式：不用 @，直接 "D/XX/wm boltor" 也要能触发（白名单内）
+        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor"), "TOK")
         self.assertEqual(len(self.calls), 1)
         kind, gid, content = self.calls[0]
         self.assertEqual(kind, "group")
@@ -333,14 +333,14 @@ class TestOnEvent(unittest.TestCase):
         self.assertIn("boltor", content.lower())
 
     def test_group_full_message_mention_placeholder(self):
-        # 全量模式里 @某人会变成 <@openid> 占位，剥掉后仍能命中触发词
-        self.bot._on_event(None, self._pkt_group_full("wm boltor <@7A3B9C1D>"), "TOK")
+        # 全量模式里 @某人会变成 <@openid> 占位，剥掉后仍能命中 D/XX/ 前缀 + 触发词
+        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor <@7A3B9C1D>"), "TOK")
         self.assertEqual(len(self.calls), 1)
         self.assertIn("boltor", self.calls[0][2].lower())
         self.assertNotIn("<@", self.calls[0][2])
 
     def test_group_full_message_not_whitelisted_silent(self):
-        self.bot._on_event(None, self._pkt_group_full("wm boltor", gid="GX"), "TOK")
+        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
 
     def test_image_reply_sends_tail_in_same_message(self):
@@ -424,10 +424,13 @@ class TestNotifySwitchAndActivePush(unittest.TestCase):
 
     def test_send_active_prefers_image(self):
         calls = []
+
+        def fake_reply(self, tok, kind, tid, pngs, mid, content=None):
+            calls.append((kind, tid, len(pngs), mid))
+            return qq_official._ImageSendResult(True, mixed=True)
+
         with patch("render_card.render", lambda *a, **k: [b"\x89PNG"]), \
-             patch.object(qq_official.OfficialBot, "_reply_images",
-                          lambda self, tok, kind, tid, pngs, mid:
-                          calls.append((kind, tid, len(pngs), mid)) or True), \
+             patch.object(qq_official.OfficialBot, "_reply_images", fake_reply), \
              patch.object(qq_official, "send_message",
                           lambda *a, **k: (False, "不该走到文本")):
             ok = self.bot.send_active("group", "G1", "监控内容")

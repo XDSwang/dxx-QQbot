@@ -88,34 +88,54 @@ class TestHandler(unittest.TestCase):
     def test_handler_mock(self):
         os.environ["WM_SOURCE"] = "mock"
         h = qq_bot.make_handler()   # 无参=宽松（所有群都回），便于本地直跑
-        reply = h("WM Boltor Prime", {})
+        # WM 查询现在必须带 D/XX/ 前缀，否则静默（防群聊误触发）
+        self.assertIsNone(h("WM Boltor Prime", {}), "裸 WM 查询应静默")
+        reply = h("D/XX/WM Boltor Prime", {})
         self.assertIn("boltor prime", reply.lower())
         self.assertIn("铂金", reply)
         # 非指令不回复
         self.assertIsNone(h("你好啊群友", {}))
-        # /报错 强制刷新也能走通
-        reply2 = h("/报错 WM Boltor Prime", {})
+        # 报错 强制刷新也能走通（带 D/XX/ 前缀；报错是斜杠触发词，前缀前加 /）
+        reply2 = h("/D/XX/报错 WM Boltor Prime", {})
         self.assertIn("boltor prime", reply2.lower())
 
     def test_group_whitelist(self):
         os.environ["WM_SOURCE"] = "mock"
         # 严格模式：仅白名单群 123456 才回复
         h = qq_bot.make_handler({"123456"}, allow_all=False)
-        # 白名单群内 WM 触发 -> 回复
-        self.assertIsNotNone(h("WM Boltor Prime",
+        # 白名单群内 WM 触发（带 D/XX/ 前缀） -> 回复
+        self.assertIsNotNone(h("D/XX/WM Boltor Prime",
                                {"message_type": "group", "group_id": 123456}))
-        # 非白名单群 -> 静默
-        self.assertIsNone(h("WM Boltor Prime",
+        # 非白名单群（即使带前缀）-> 静默
+        self.assertIsNone(h("D/XX/WM Boltor Prime",
                             {"message_type": "group", "group_id": 999999}))
         # 非白名单群内非指令 -> 静默
         self.assertIsNone(h("闲聊一下",
                             {"message_type": "group", "group_id": 123456}))
         # 私聊不受白名单限制
-        self.assertIsNotNone(h("ZK Tigris",
+        self.assertIsNotNone(h("D/XX/ZK Tigris",
                                {"message_type": "private", "user_id": 1}))
         # 空白名单 -> 所有群都静默（符合"没写就不监控"）
         h2 = qq_bot.make_handler(set(), allow_all=False)
-        self.assertIsNone(h2("WM x", {"message_type": "group", "group_id": 123456}))
+        self.assertIsNone(h2("D/XX/WM x", {"message_type": "group", "group_id": 123456}))
+
+    def test_query_prefix_gating(self):
+        """D/XX/ 前缀门槛：WM 查询必须带前缀；世界状态查询与控制命令不受限。"""
+        os.environ["WM_SOURCE"] = "mock"
+        h = qq_bot.make_handler()   # 宽松
+        # WM 查询：裸 -> 静默；带 D/XX/ -> 回复
+        self.assertIsNone(h("wm Boltor", {"channel": "group", "group_id": "g"}))
+        self.assertIsNone(h("zk Tigris", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("D/XX/wm Boltor",
+                               {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("D/XX/zk Tigris",
+                               {"channel": "group", "group_id": "g"}))
+        # 世界状态查询：仍可直接打（属监控领域，不受 D/XX/ 限制）
+        self.assertIsNotNone(h("平原", {"channel": "group", "group_id": "g"}))
+        # 监控控制：裸「监控」给安全提示（不全会）；「监控全部」全量
+        self.assertIsNotNone(h("监控", {"channel": "group", "group_id": "g"}))
+        self.assertIn("监控全部", h("监控", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("监控全部", {"channel": "group", "group_id": "g"}))
 
 
 class TestIntegrationServer(unittest.TestCase):
@@ -141,8 +161,8 @@ class TestIntegrationServer(unittest.TestCase):
             "message_type": "group",
             "group_id": 123456,
             "user_id": 999,
-            "message": "WM Boltor Prime",
-            "raw_message": "WM Boltor Prime",
+            "message": "D/XX/WM Boltor Prime",
+            "raw_message": "D/XX/WM Boltor Prime",
         }
         ws.send_text(json.dumps(event, ensure_ascii=False))
 

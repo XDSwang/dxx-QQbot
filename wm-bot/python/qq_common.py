@@ -31,6 +31,12 @@ WORD_TRIGGERS = {"wm", "zk", "紫卡", "翻译", "translate", "trans"}
 # 斜杠指令触发（/wm /zk /报错 /查询 /翻译）
 SLASH_TRIGGERS = {"wm", "zk", "报错", "查询", "翻译", "translate", "trans"}
 
+# 交互查询前缀：只有以它开头（大小写不敏感，可带前导斜杠）的消息，才被当作
+# 一次「要回复别人的查询」来处理；不带此前缀的普通闲聊一律静默，避免群友聊天
+# 意外触发机器人。监控控制（监控/停止监控/主推开关）与主动推送不受此限制。
+# 想换前缀：直接改下面这个常量即可（例如改成 "BOT/"）。
+QUERY_PREFIX = "D/XX/"
+
 
 # 全局「全部指令」查看词：发这些词返回合并总览（WM + 世界状态），不再是静默
 GLOBAL_HELP_WORDS = {"帮助", "help", "?", "菜单", "指令", "命令", "功能", "总览", "全部指令", "全部命令"}
@@ -322,6 +328,29 @@ def is_wm_command(text):
     return first in WORD_TRIGGERS
 
 
+def strip_query_prefix(text):
+    """若以 QUERY_PREFIX（默认 D/XX/，大小写不敏感，可选前导斜杠）开头，剥掉前缀
+    返回剩余文本；否则返回 None（表示这不是带前缀的显式查询）。
+
+    前导斜杠会原样保留，这样「/报错」「/查询」这类纯斜杠触发词在剥掉前缀后仍然有效：
+      例：D/XX/wm Boltor   → "wm Boltor"
+          /D/XX/报错 WM x  → "/报错 WM x"（保留斜杠语义）
+          /D/XX/平原        → "/平原"
+          普通「你好」        → None
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    pref = QUERY_PREFIX.lower()
+    if low.startswith("/" + pref):
+        # 保留用户的前导斜杠，交给后面的斜杠触发逻辑
+        return ("/" + t[len(pref) + 1:].strip()).strip()
+    if low.startswith(pref):
+        return t[len(pref):].strip()
+    return None
+
+
 def resolve_path(p):
     """相对路径一律按「脚本同目录」解析；绝对路径原样返回。
 
@@ -381,13 +410,18 @@ def make_handler(allowed_groups=None, allow_all=False):
         if _is_global_help(body):
             return finalize(build_full_help(), ctx, force_image=force_img,
                             force_text=force_txt, title="星际战甲 · 全部指令")
-        # 世界状态指令（查询 / 监控 / 停止）优先；与 WM 关键词无冲突
+        # 世界状态指令（查询 / 监控 / 停止 / 开关）属监控领域，不要求 D/XX/ 前缀（主推信息不管）
         if is_ws_command(body):
             return handle_ws(body, ctx, force_image=force_img,
                              force_text=force_txt)
-        if not is_wm_command(body):
+        # WM 查询（wm / zk / 紫卡 / 翻译）：必须带 D/XX/ 前缀，防群聊误触发
+        q = strip_query_prefix(body)
+        if q is None:
+            # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送不受影响，仍照常工作）
             return None
-        cmd = wm.parse_command(body)
+        if not is_wm_command(q):
+            return None
+        cmd = wm.parse_command(q)
         if not cmd:
             return finalize(wm.format_reply({"served": "help"}), ctx,
                             force_image=force_img, force_text=force_txt,
@@ -513,6 +547,16 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
                 "\n发送「停止监控」即可停止。")
         return finalize(msg, ctx, force_image=force_image, force_text=force_text,
                         title="星际战甲 · 世界状态监控")
+    if action == "monitor_hint":
+        # 裸「监控」或「监控 不认识的词」：不静默全开，提示正确用法（防误开全量监控）
+        return finalize(
+            "⚠️ 「监控」需要明确指定内容，已停止，未开启任何监控。\n"
+            "· 监控全部栏目：发完整的「监控全部」\n"
+            "· 监控指定栏目：发「监控 警报」「监控 平原」「监控 裂缝」等\n"
+            "· 查看可监控栏目：发「世界」或「帮助」\n"
+            "· 停止监控：发「停止监控」",
+            ctx, force_image=force_image, force_text=force_text, attach=False,
+            title="星际战甲 · 世界状态监控")
     if action in ("query", "plan"):
         txt = worldstate.handle_query(cmd)
         title = ("星际战甲 · 更新计划" if action == "plan"

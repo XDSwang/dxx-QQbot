@@ -109,6 +109,16 @@ def test_parse():
           and set(c["types"]) == {"alerts", "fissures"})
     check("解析 停止监控", ws.parse_ws_command("停止监控")["action"] == "stop")
     check("解析 计划", ws.parse_ws_command("计划")["action"] == "plan")
+    # 监控安全化：裸「监控」/「监控 不认识的词」不再静默全开，给提示；只有「监控全部」全量
+    check("裸 监控 -> 安全提示(monitor_hint)",
+          ws.parse_ws_command("监控")["action"] == "monitor_hint")
+    check("监控 乱码 -> 安全提示(monitor_hint)",
+          ws.parse_ws_command("监控 不认识的东西")["action"] == "monitor_hint")
+    c_all = ws.parse_ws_command("监控全部")
+    check("监控全部 -> 全量监控", c_all["action"] == "monitor"
+          and len(c_all["types"]) == len(ws.TYPES))
+    check("monitor(英文)裸 -> 安全提示",
+          ws.parse_ws_command("monitor")["action"] == "monitor_hint")
     check("闲聊不触发", not qq_common.is_ws_command("今天天气不错")
           and not qq_common.is_ws_command("wm boltor"))
     check("12 个查询指令全部能被触发词识别",

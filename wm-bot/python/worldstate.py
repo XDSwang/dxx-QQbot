@@ -1908,8 +1908,10 @@ def parse_ws_command(text):
     if sw:
         return sw
     first = t.split()[0] if t.split() else t
-    if first.startswith("监控") or first.startswith("monitor"):
+    if first.startswith("监控"):
         return _parse_monitor(t[2:].strip())
+    if first.startswith("monitor"):
+        return _parse_monitor(t[7:].strip())
     if first.startswith("停止监控") or first.startswith("取消监控") or first.startswith("停止"):
         return {"action": "stop"}
     if t in HELP_WORDS:
@@ -1928,8 +1930,11 @@ def parse_ws_command(text):
 
 def _parse_monitor(rest):
     low = rest.lower()
-    if low in ("", "全部", "all", "全"):
+    # 显式「全部 / all / 全」才全量监控；裸「监控」或不认识的内容都给提示，绝不静默全开
+    if low in ("全部", "all", "全"):
         return {"action": "monitor", "types": list(TYPES.keys())}
+    if low == "":
+        return {"action": "monitor_hint"}
     types = set()
     used = []
     # 长的先匹配：「赏金轮换」不会再被「赏金」重复命中一次
@@ -1943,7 +1948,7 @@ def _parse_monitor(rest):
         used.append(kw)
         types.add(k)
     if not types:
-        return {"action": "monitor", "types": list(TYPES.keys())}
+        return {"action": "monitor_hint"}
     return {"action": "monitor", "types": sorted(types)}
 
 
@@ -1956,7 +1961,9 @@ HELP_TEXT = (
     "  赏金：赏金（开放世界任务板）/ 赏金轮换\n"
     "  装备：信条 / 终幕\n"
     "  其它：新闻 / 全部\n"
-    "  监控 <词>     在本会话开启推送（如 监控 警报 / 监控 裂缝 / 监控 全部）\n"
+    "  监控 <词>     在本会话开启推送（如 监控 警报 / 监控 裂缝 / 监控 平原）\n"
+    "                  ⚠️ 裸「监控」或「监控 不认识的词」不会全开，会提示你怎样用；\n"
+    "                     要监控全部栏目，必须发完整的「监控全部」。\n"
     "  停止监控       停止本会话的推送（同时清掉本会话的开关设置）\n"
     "  ★ 发消息直接开关主推，不用改配置、不用重启（设置会存盘，重启后自动恢复）：\n"
     "      活动=开启    警报=开启    活动=关闭    警报=关闭\n"
@@ -1967,7 +1974,9 @@ HELP_TEXT = (
     "    刚开监控只记现状、不补发历史；其余栏目内容变了才推（倒计时不算变化）。\n"
     "  计划           查看按最快结束排好的队列与下次更新时间\n"
     "  回复形式：默认一律发白底卡片图；要复制文字就在指令前加「文字」两个字，\n"
-    "        例如「文字 裂缝」「文字 WM Boltor Prime」。\n"
+    "        例如「文字 裂缝」「文字 D/XX/WM Boltor Prime」。\n"
+    "  ⚠️ WM 查询（WM/ZK/翻译）在群聊需带 D/XX/ 前缀，避免群友闲聊误触发；\n"
+    "        世界状态查询（平原/警报/裂缝等）与「监控 / 停止监控 / 主推开关」不受此限制。\n"
     "  说明：一次全量请求取回全部数据，把【每一条】的结束时刻排序交给唯一主任务；\n"
     "        睡到最快结束那条才查【一次】，查完重排，没到点零请求；\n"
     "        两次请求间隔按 10/20/50 秒节拍兜底，且每次都守同域名 3~5 秒底线；\n"

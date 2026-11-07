@@ -1437,13 +1437,14 @@ def format_reply(result):
         return result.get("text", "")
     if result.get("served") == "help":
         return (
-            "指令格式：\n"
-            "  WM <物品名>          查物品（WM 英文名如 Boltor Prime；也支持中文名如 螺钉步枪）\n"
-            "  ZK <武器名>          查紫卡 Riven（WM 英文名如 Tigris）\n"
-            "  翻译 <名称>          只做中↔英名称翻译（如 翻译 Boltor / 翻译 螺钉步枪）\n"
-            "  翻译 同步            联网拉全量中英对照词库（一次即可，之后查询不再联网）\n"
-            "  /报错 WM|ZK <名称>   数据有误，强制再查一次\n"
-            "  注：wiki 页面的获取方式/锻造材料等正文机器人抓不到，回复里会给两个 wiki 链接，请自己点开看。"
+            "指令格式（群内交互查询需带前缀 D/XX/，防群聊误触发）：\n"
+            "  D/XX/WM <物品名>      查物品（WM 英文名如 D/XX/WM Boltor Prime；也支持中文名）\n"
+            "  D/XX/ZK <武器名>      查紫卡 Riven（WM 英文名如 D/XX/ZK Tigris）\n"
+            "  D/XX/翻译 <名称>      中↔英名称翻译（如 D/XX/翻译 螺钉步枪）\n"
+            "  D/XX/翻译 同步        联网拉全量中英对照词库（一次即可，之后查询不再联网）\n"
+            "  /D/XX/报错 WM|ZK <名称>  数据有误，强制再查一次\n"
+            "  注：世界状态查询（平原/警报/裂缝等）与「监控」不受 D/XX/ 限制；\n"
+            "      wiki 页面的获取方式/锻造材料等正文机器人抓不到，回复里会给两个 wiki 链接，请自己点开看。"
         )
     if result.get("served") == "error":
         if result.get("permanent"):
