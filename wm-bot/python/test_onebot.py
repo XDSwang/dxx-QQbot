@@ -120,9 +120,9 @@ class TestHandler(unittest.TestCase):
         self.assertIsNone(h2("D/XX/WM x", {"message_type": "group", "group_id": 123456}))
 
     def test_query_prefix_gating(self):
-        """D/XX/ 前缀门槛：所有交互指令（WM / 世界状态查询 / 监控开关 / 帮助 / 自检）
-        都必须带 D/XX/ 前缀；只有机器人主动推送（send_active）不在用户指令范畴，
-        不受影响。"""
+        """D/XX/ 前缀门槛：WM / 世界状态查询 / 监控开关 / 自检 都必须带 D/XX/ 前缀；
+        唯一例外是「帮助」类词（发两个字的「帮助」就出菜单，用户明确要求）；
+        只有机器人主动推送（send_active）不在用户指令范畴，不受影响。"""
         os.environ["WM_SOURCE"] = "mock"
         h = qq_bot.make_handler()   # 宽松
         # WM 查询：裸 -> 静默；带 D/XX/ -> 回复
@@ -142,9 +142,13 @@ class TestHandler(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertIn("监控全部", r)   # 安全提示，不全开
         self.assertIsNotNone(h("D/XX/监控全部", {"channel": "group", "group_id": "g"}))
-        # 帮助 / 自检 也要前缀
-        self.assertIsNone(h("帮助", {"channel": "group", "group_id": "g"}))
+        # 帮助【例外】：发「帮助」两个字就出菜单，不要求前缀（用户明确要求）；
+        # 自检仍需前缀
+        r_bare_help = h("帮助", {"channel": "group", "group_id": "g"})
+        self.assertIsNotNone(r_bare_help)
+        self.assertIn("全部指令一览", r_bare_help)
         self.assertIsNotNone(h("D/XX/帮助", {"channel": "group", "group_id": "g"}))
+        self.assertIsNone(h("?", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("自检", {"channel": "group", "group_id": "g"}))
         self.assertIsNotNone(h("D/XX/自检", {"channel": "group", "group_id": "g"}))
 

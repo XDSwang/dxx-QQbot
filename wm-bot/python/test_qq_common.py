@@ -58,8 +58,46 @@ def main():
     ok += check("handler 'D/XX/平原' 走查询（非帮助）",
                 isinstance(r_query, str) and "全部指令一览" not in r_query)
 
-    # 3b) 不带 D/XX/ 前缀：所有交互指令必须静默（防群聊误触发），主推不受影响
-    for w in ("帮助", "世界", "平原", "自检", "wm Boltor", "监控 裂缝", "你好啊"):
+    # 3.5) 裸「帮助」两个字就出菜单（不要求 D/XX/ 前缀）
+    GRP = {"channel": "group", "group_id": "G1"}
+    for w in ("帮助", "help", "菜单", "指令", "命令", "功能", "总览"):
+        r = H(w, GRP)
+        total += 1
+        ok += check("裸 %r（群内无前缀）也返回总览" % w,
+                    isinstance(r, str) and "全部指令一览" in r)
+    total += 1
+    ok += check("裸「?」仍不触发（单字符易误触，需带前缀）", H("?", GRP) is None)
+    total += 1
+    ok += check("带前缀 D/XX/? 仍可出总览",
+                isinstance(H("D/XX/?", GRP), str))
+    total += 1
+    ok += check("裸「帮助」不影响其它闲聊静默", H("今天打什么", GRP) is None)
+
+    # 3.6) 帮助卡片配色：查询指令红、其它指令蓝
+    cols = q.help_colors()
+    total += 1
+    ok += check("查询词是红色（平原/裂缝/WM/计划）",
+                all(cols.get(w) == q.HELP_RED
+                    for w in ("平原", "裂缝", "WM", "计划", "赏金")))
+    total += 1
+    ok += check("其它指令是蓝色（监控/停止监控/文字/自检）",
+                all(cols.get(w) == q.HELP_BLUE
+                    for w in ("监控", "停止监控", "文字", "自检")))
+    total += 1
+    ok += check("红蓝不重叠（同一片段的颜色唯一）",
+                not (set(q._HELP_QUERY_WORDS) & set(q._HELP_OTHER_WORDS)))
+    import render_card as R
+    segs = dict(R._split_segments("活动=开启 关闭 帮助", cols))
+    total += 1
+    ok += check("「活动=开启」整段取蓝色（长片段优先于「活动」）",
+                segs.get("活动=开启") == q.HELP_BLUE)
+    total += 1
+    ok += check("帮助卡片能渲染出图", bool(R.render(q.build_full_help(),
+                                                    title="帮助", colors=cols)))
+
+    # 3b) 不带 D/XX/ 前缀：除「帮助」类词外，其它交互指令必须静默（防群聊误触发）
+    #     （「帮助」两个字就要出菜单，是用户明确要求的例外，见 3.5）
+    for w in ("世界", "平原", "自检", "wm Boltor", "监控 裂缝", "你好啊"):
         r = H(w, PRIV)
         total += 1
         ok += check("handler %r 无前缀静默（None）" % w, r is None)

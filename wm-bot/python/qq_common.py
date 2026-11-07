@@ -40,6 +40,9 @@ QUERY_PREFIX = "D/XX/"
 
 # 全局「全部指令」查看词：发这些词返回合并总览（WM + 世界状态），不再是静默
 GLOBAL_HELP_WORDS = {"帮助", "help", "?", "菜单", "指令", "命令", "功能", "总览", "全部指令", "全部命令"}
+# 这些词【不】要求 D/XX/ 前缀：用户要求「发『帮助』两个字就出菜单」。
+# 「?」故意不放进来（单字符太容易误触），要它仍可发 D/XX/? 。
+BARELESS_HELP_WORDS = GLOBAL_HELP_WORDS - {"?"}
 
 
 def _is_global_help(text):
@@ -107,6 +110,38 @@ def build_full_help():
     wm_part = wm.format_reply({"served": "help"})
     return ("📖 全部指令一览（随时发「帮助」或「?」可再看）\n\n"
             + wm_part + "\n\n" + worldstate.HELP_TEXT)
+
+
+# ---------------- 帮助菜单配色：查询指令红、其它指令蓝 ----------------
+# 卡片里只给「命中的片段」上色，其余保持墨色；卡片标题行不着色。
+# 两个颜色和 WM 行情的「游戏中红 / 在线蓝」同一套，视觉统一。
+HELP_RED = (198, 40, 40)      # 指令查询（WM 查价 / 紫卡 / 翻译 / 世界状态各栏目）
+HELP_BLUE = (32, 92, 180)     # 其它指令（监控开关 / 停止监控 / 回复形式 / 帮助自检）
+
+_HELP_QUERY_WORDS = (
+    # WM 侧查询
+    "WM", "ZK", "紫卡", "翻译", "报错",
+    # 世界状态查询：栏目名 + 总览 / 计划
+    "世界状态", "平原", "希图斯", "奥布山谷", "魔胎之境", "双衍", "扎里曼",
+    "裂缝", "钢铁裂缝", "突击", "仲裁", "入侵", "警报", "活动",
+    "商人", "瓦奇娅", "特惠", "电波", "加成",
+    "赏金轮换", "赏金", "信条", "终幕", "新闻", "全部", "计划",
+)
+
+_HELP_OTHER_WORDS = (
+    # 监控 / 开关 / 辅助指令（长的写全，避免被上面的栏目名抢走）
+    "停止监控", "取消监控", "监控全部", "监控", "主推状态",
+    "活动=开启", "警报=开启", "活动=关闭", "警报=关闭",
+    "全部=开启", "主推=开启",
+    "开启", "关闭", "自检", "帮助", "文字", "图片",
+)
+
+
+def help_colors():
+    """帮助卡片用的 {片段: 颜色}：查询指令红、其它指令蓝。"""
+    out = {w: HELP_RED for w in _HELP_QUERY_WORDS if w}
+    out.update({w: HELP_BLUE for w in _HELP_OTHER_WORDS if w})
+    return out
 
 
 # 回复形式前缀：默认按长度自动决定是否出图，也可用前缀强制
@@ -409,15 +444,21 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 只有「主推信息」（机器人主动推出来的监控）不受限。
         q = strip_query_prefix(body)
         if q is None:
-            # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
-            return None
+            # 例外：裸「帮助 / help / 菜单 / 指令…」不要求前缀，发这两个字就直接出菜单
+            bare = (body or "").strip().lstrip("/").strip().lower()
+            if bare in BARELESS_HELP_WORDS:
+                q = bare
+            else:
+                # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
+                return None
         # 排障：发「自检」直接回一段文字，列出手机端图片/Markdown 各部件状态
         if is_diagnostic(q):
             return build_diagnostic()
         # 全局「全部指令」查看：返回合并总览（WM + 世界状态）
         if _is_global_help(q):
             return finalize(build_full_help(), ctx, force_image=force_img,
-                            force_text=force_txt, title="星际战甲 · 全部指令")
+                            force_text=force_txt, title="星际战甲 · 全部指令",
+                            colors=help_colors())
         # 世界状态指令（查询 / 监控 / 停止 / 主推开关）：带前缀才触发
         if is_ws_command(q):
             return handle_ws(q, ctx, force_image=force_img,
@@ -429,7 +470,7 @@ def make_handler(allowed_groups=None, allow_all=False):
         if not cmd:
             return finalize(wm.format_reply({"served": "help"}), ctx,
                             force_image=force_img, force_text=force_txt,
-                            title="星际战甲 · 市场行情")
+                            title="星际战甲 · 市场行情", colors=help_colors())
         if cmd.get("type") == "translate":
             # 翻译 <名称>：只做中↔英名称翻译，不直接查价、也不提供 wiki 正文
             return finalize(
@@ -514,7 +555,7 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
     if action == "help":
         return finalize(worldstate.HELP_TEXT + "\n\n" + wm.format_reply({"served": "help"}),
                         ctx, force_image=force_image, force_text=force_text,
-                        title="星际战甲 · 世界状态指令")
+                        title="星际战甲 · 世界状态指令", colors=help_colors())
     if action == "stop":
         ch, tid = _ctx_ids(ctx)
         if ch is None:
