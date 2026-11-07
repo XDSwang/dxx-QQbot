@@ -93,6 +93,14 @@ def _candidate_files():
                 p = Path(d) / name
                 if p.exists():
                     yield str(p), str(Path(d) / bold)
+    # 便携：python/fonts/ 下任意字体文件（用户自己下载丢进去的最小中文字体即可，
+    # 不要求特定文件名；后面 _load_fonts 会用「星」字渲染校验是否真含中文）
+    _portable_fonts = Path(__file__).resolve().parent / "fonts"
+    if _portable_fonts.is_dir():
+        for ext in ("*.ttf", "*.ttc", "*.otf"):
+            for p in sorted(_portable_fonts.glob(ext)):
+                s = str(p)
+                yield s, s
 
 
 def _load_fonts():
