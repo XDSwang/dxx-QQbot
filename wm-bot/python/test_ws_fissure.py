@@ -171,6 +171,13 @@ def main():
           q["action"] == "query" and q["types"] == ["fissures"]
           and sorted(q["filter"]) == ["中断", "后纪"])
 
+        # 指令识别：整句能完整切开才算查询指令，多一个词就当闲聊（完美匹配）
+        print("[指令识别]")
+        for s in ("裂缝后纪中断", "钢铁裂缝古纪中断", "裂缝 中纪", "fissure axi"):
+            t("识别 %-14s 为指令" % s, qq_common.is_ws_command(s))
+        for s in ("裂缝后纪中断是什么", "裂缝好玩吗", "钢铁裂缝在哪打"):
+            t("识别 %-16s 为闲聊（静默）" % s, not qq_common.is_ws_command(s))
+
         # ---------- 4) 匹配 ----------
         print("[匹配]")
         t("空条件全命中", all(ws._fissure_matches(f, []) for f in FIS))

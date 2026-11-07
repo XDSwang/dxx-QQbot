@@ -350,6 +350,13 @@ def is_ws_command(text):
         return True
     if t in worldstate.KEYWORDS:
         return True
+    # 带维度过滤的裂缝查询：「裂缝后纪中断」「钢铁裂缝古纪中断」。
+    # 整句必须能完整切开（多一个无法识别的词就算闲聊），延续「完美匹配」原则。
+    if first.startswith(("裂缝", "裂隙", "钢铁裂缝", "fissure")):
+        spec = worldstate.parse_fissure_spec(t)
+        # 必须真的带条件（「裂缝裂缝」这种空条件仍算闲聊，不当指令）
+        if spec is not None and spec["tokens"] and not spec.get("residual"):
+            return True
     return False
 
 
