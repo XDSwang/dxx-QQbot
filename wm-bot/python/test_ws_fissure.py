@@ -77,8 +77,8 @@ FIS = [
     _fis("土星/Kronus", "中断", "Axi"),
 ]
 STEEL = [
-    _fis("冥王星/Cerberus", "?", "Axi"),
-    _fis("地球/Everest", "?", "Meso"),
+    _fis("冥王星/Cerberus", "中断", "Axi"),
+    _fis("地球/Everest", "防御", "Meso"),
 ]
 
 
@@ -203,6 +203,32 @@ def main():
         t("无命中时明确说无且带上条件", "无匹配" in txt and "安魂" in txt)
         t("不传条件照旧全量", "地球/Everest" in ws._fmt_fissures(mk_state()))
 
+        # ---------- 5b) 数据源两种形态（钢铁裂缝曾整栏漏成「当前无」） ----------
+        print("[数据源形态]")
+        raw_old = {"fissures": [{"node": "地球/Everest", "missionType": "防御",
+                                 "enemy": "Grineer", "tier": "古纪",
+                                 "expiry": EXP, "steelPath": True}]}
+        st_old = ws._wfwiki_to_state(raw_old)
+        t("旧形态：fissures 带 steelPath 标志归钢铁",
+          len((st_old.get("steelPath") or {}).get("current") or []) == 1
+          and not st_old.get("fissures"))
+        raw_new = {"fissures": [{"node": "火星/Tharsis", "missionType": "生存",
+                                 "enemy": "Corpus", "tier": "中纪", "expiry": EXP}],
+                   "steelPath": {"current": [
+                       {"node": "赤毒要塞/Dakata", "missionType": "歼灭",
+                        "enemy": "Grineer", "tier": "安魂", "expiry": EXP}]}}
+        st_new = ws._wfwiki_to_state(raw_new)
+        steel_new = (st_new.get("steelPath") or {}).get("current") or []
+        t("新形态：单独 steelPath.current 归钢铁", len(steel_new) == 1
+          and steel_new[0]["node"].endswith("Dakata"))
+        t("新形态钢铁保留任务类型/敌人/纪",
+          bool(steel_new) and steel_new[0]["missionType"] == "歼灭"
+          and steel_new[0]["enemy"] == "Grineer" and steel_new[0]["tier"] == "安魂")
+        t("钢铁条目可按任务类型过滤",
+          bool(steel_new) and ws._fissure_matches(steel_new[0], ["歼灭"]))
+        t("普通裂缝敌人不再显示问号",
+          st_new["fissures"][0]["enemy"] == "Corpus")
+
         # ---------- 6) 会话存储 ----------
         print("[会话存储]")
         reset()
@@ -256,7 +282,9 @@ def main():
           M._fissure_filters.get(KA) == {"fissures": ["中断", "后纪"]})
         t("监控带条件只开裂缝", M._monitors.get(KA) == {"fissures"})
         r = str(qq_common.handle_ws("监控 钢铁裂缝中断", ctx))
-        t("钢铁裂缝带任务过滤给出数据源提示", "不提供任务类型" in r)
+        t("钢铁裂缝也能按任务类型过滤（有数据）",
+          "钢铁之路" in r and "中断" in r
+          and (M._fissure_filters.get(KA) or {}).get("steel") == ["中断"])
         reset()
         r = str(qq_common.handle_ws("监控 不认识的词", ctx))
         t("不认识的词仍回提示、不开监控",

@@ -485,18 +485,38 @@ def _wfwiki_to_state(raw):
         s["zarimanCycle"] = {"state": _clean(z.get("state")) or _clean(z.get("stateKey")),
                              "stateKey": z.get("stateKey"), "expiry": _ms(z.get("expiry"))}
 
-    # 裂缝 / 钢铁裂缝（按 steelPath 标志拆分）
-    fiss, steel = [], []
-    for f in (raw.get("fissures") or []):
-        item = {
+    # 裂缝 / 钢铁裂缝：数据源有两种形态——
+    #   ① fissures 每条带 steelPath 标志（旧形态）；
+    #   ② 单独的 steelPath.current 列表（现形态，2026-11 起）。
+    # 两种都要吃，并按 node+expiry 去重，避免钢铁整栏漏成「当前无」或重复。
+    def _fis_item(f):
+        return {
             "node": loc(f.get("system"), f.get("node")),
             # 任务类型在 wf.wiki 里是 missionType 字段（mission 常为 null），优先取它
             "missionType": _clean(f.get("missionType") or f.get("mission")) or "?",
-            "enemy": _clean(f.get("faction")) or "?",
+            # wf.wiki 给的字段是 enemy（旧代码读 faction，导致敌人一律显示 ?）
+            "enemy": _clean(f.get("enemy") or f.get("faction")) or "?",
             "tier": _clean(f.get("tier")) or "",
             "expiry": _ms(f.get("expiry")),
         }
+
+    fiss, steel, seen = [], [], set()
+    for f in (raw.get("fissures") or []):
+        item = _fis_item(f)
+        key = (item["node"], item["expiry"], item["tier"])
+        if key in seen:
+            continue
+        seen.add(key)
         (steel if f.get("steelPath") else fiss).append(item)
+    sp_raw = raw.get("steelPath")
+    if isinstance(sp_raw, dict):
+        for f in (sp_raw.get("current") or []):
+            item = _fis_item(f)
+            key = (item["node"], item["expiry"], item["tier"])
+            if key in seen:
+                continue
+            seen.add(key)
+            steel.append(item)
     s["fissures"] = fiss
     if steel:
         s["steelPath"] = {"current": steel}
@@ -1379,8 +1399,9 @@ RAILJACK_MARKERS = ("比邻星域", "proxima", "empyrean", "railjack", "九重�
 # 被「防御」抢先截断）。用来把「火星中断」「后纪中断」这类连写过滤词切成独立条件。
 # 星球/地点名单独放在下面的 FISSURE_LOCATION_TOKENS，切完后再整体当子串匹配节点。
 FISSURE_MISSION_TOKENS = (
-    "移动防御", "无尽捕获", "虚空覆涌", "虚空风暴", "强袭", "刺杀", "挖掘",
-    "拦截", "救援", "间谍", "破坏", "生存", "防御", "歼灭", "捕获", "中断",
+    "移动防御", "无尽捕获", "虚空覆涌", "虚空风暴", "元素转换", "前哨战", "强袭",
+    "刺杀", "挖掘", "爆发", "拦截", "救援", "间谍", "破坏", "生存", "防御",
+    "歼灭", "捕获", "中断",
     "转化", "腐化", "清巢", "空战", "平原", "突袭", "圣殿",
     "Disruption", "Defense", "Survival", "Extermination", "Capture", "Sabotage",
     "Spy", "Rescue", "Interception", "Assault", "Assassination", "Excavate",
@@ -2137,8 +2158,9 @@ HELP_TEXT = (
     "                     要监控全部栏目，必须发完整的「监控全部」。\n"
     "  裂缝可按维度缩小：纪（古/前/中/后/安魂/全能）+ 星球（火星…）+ 任务类型（中断…）\n"
     "                     例：监控 裂缝 后纪   监控 裂缝 火星 中断   监控 钢铁裂缝 古纪\n"
-    "                     多条件 AND；连写也行（后纪中断 = 后纪且中断）。钢铁裂缝数据源\n"
-    "                     不提供任务类型，按任务类型过滤对它不生效，只能按纪 / 星球过滤。\n"
+    "                     多条件 AND；连写也行（后纪中断 = 后纪且中断）。\n"
+    "                     ⚠️ 裂缝=普通裂缝，钢铁裂缝=钢铁之路，两栏分开算：\n"
+    "                        「监控 裂缝 后纪」只看普通；「监控 钢铁裂缝 后纪」只看钢铁。\n"
     "  停止监控       停止本会话的推送（同时清掉本会话的开关设置）\n"
     "  ★ 发消息直接开关主推，不用改配置、不用重启（设置会存盘，重启后自动恢复）：\n"
     "      活动=开启    警报=开启    活动=关闭    警报=关闭\n"
