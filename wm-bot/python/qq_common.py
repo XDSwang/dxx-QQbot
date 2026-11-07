@@ -403,22 +403,26 @@ def make_handler(allowed_groups=None, allow_all=False):
                 return None
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
         body, force_img, force_txt = split_style_prefix(text)
-        # 排障：发「自检」直接回一段文字，列出手机端图片/Markdown 各部件状态
-        if is_diagnostic(body):
-            return build_diagnostic()
-        # 全局「全部指令」查看优先：返回合并总览（WM + 世界状态），不让它掉进静默
-        if _is_global_help(body):
-            return finalize(build_full_help(), ctx, force_image=force_img,
-                            force_text=force_txt, title="星际战甲 · 全部指令")
-        # 世界状态指令（查询 / 监控 / 停止 / 开关）属监控领域，不要求 D/XX/ 前缀（主推信息不管）
-        if is_ws_command(body):
-            return handle_ws(body, ctx, force_image=force_img,
-                             force_text=force_txt)
-        # WM 查询（wm / zk / 紫卡 / 翻译）：必须带 D/XX/ 前缀，防群聊误触发
+        # —— 所有「交互指令」必须带 D/XX/ 前缀，防群聊闲聊误触发 ——
+        # 例外：机器人主动推送（send_active）是机器人外发，不是用户指令，不受影响。
+        # 因此 WM 查价 / 世界状态查询 / 监控开关 / 帮助 / 自检 全部收进前缀；
+        # 只有「主推信息」（机器人主动推出来的监控）不受限。
         q = strip_query_prefix(body)
         if q is None:
-            # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送不受影响，仍照常工作）
+            # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
             return None
+        # 排障：发「自检」直接回一段文字，列出手机端图片/Markdown 各部件状态
+        if is_diagnostic(q):
+            return build_diagnostic()
+        # 全局「全部指令」查看：返回合并总览（WM + 世界状态）
+        if _is_global_help(q):
+            return finalize(build_full_help(), ctx, force_image=force_img,
+                            force_text=force_txt, title="星际战甲 · 全部指令")
+        # 世界状态指令（查询 / 监控 / 停止 / 主推开关）：带前缀才触发
+        if is_ws_command(q):
+            return handle_ws(q, ctx, force_image=force_img,
+                             force_text=force_txt)
+        # WM 查询（wm / zk / 紫卡 / 翻译）：带前缀才触发
         if not is_wm_command(q):
             return None
         cmd = wm.parse_command(q)

@@ -423,19 +423,27 @@ class TestNotifySwitchAndActivePush(unittest.TestCase):
         self.bot._on_event(None, {"op": 0, "t": "RESUMED", "d": ""}, "TOK")
 
     def test_send_active_prefers_image(self):
-        calls = []
+        seq = []   # 记录发送顺序：文字标签(在上) 先于 图片(在下)
+
+        def fake_text(*a, **k):
+            # send_message(token, appid, api_base, kind, target_id, content, msg_id)
+            seq.append(("text", a[3], a[4], a[5]))
+            return (True, {})
 
         def fake_reply(self, tok, kind, tid, pngs, mid, content=None):
-            calls.append((kind, tid, len(pngs), mid))
-            return qq_official._ImageSendResult(True, mixed=True)
+            seq.append(("image", kind, tid, len(pngs), mid))
+            return qq_official._ImageSendResult(True, mixed=False)
 
         with patch("render_card.render", lambda *a, **k: [b"\x89PNG"]), \
              patch.object(qq_official.OfficialBot, "_reply_images", fake_reply), \
-             patch.object(qq_official, "send_message",
-                          lambda *a, **k: (False, "不该走到文本")):
-            ok = self.bot.send_active("group", "G1", "监控内容")
+             patch.object(qq_official, "send_message", fake_text):
+            ok = self.bot.send_active("group", "G1", "警报\n任务A")
         self.assertTrue(ok)
-        self.assertEqual(calls, [("group", "G1", 1, None)],
+        # 顺序：先发文字标签（监控来源提示，在上），再发图片（在下）—— 与交易卡片反过来
+        self.assertEqual(seq[0][0], "text", "必须先发文字标签")
+        self.assertIn("监控信息如下", seq[0][3], "文字标签应为监控来源提示")
+        self.assertEqual(seq[1][0], "image", "后发图片")
+        self.assertEqual(seq[1][1:], ("group", "G1", 1, None),
                          "主动发图不能带 msg_id，否则就不是主动消息了")
 
     def test_send_active_falls_back_to_text(self):

@@ -41,26 +41,28 @@ def main():
     total += 1
     ok += check("总览有可随时复看提示", "随时发" in full)
 
-    # 3) handler 路由：帮助词 -> 总览；世界状态词 -> 世界专项；闲聊 -> 静默
-    for w in ("帮助", "?", "菜单", "指令"):
+    # 3) handler 路由（交互指令必须带 D/XX/ 前缀）：帮助词 -> 总览；世界状态词 -> 世界专项
+    for w in ("D/XX/帮助", "D/XX/?", "D/XX/菜单", "D/XX/指令"):
         r = H(w, PRIV)
         total += 1
         ok += check("handler %r 返回总览" % w, isinstance(r, str) and "全部指令一览" in r)
 
-    r_world = H("世界", PRIV)
+    r_world = H("D/XX/世界", PRIV)
     total += 1
-    ok += check("handler '世界' 返回世界专项（非总览）",
+    ok += check("handler 'D/XX/世界' 返回世界专项（非总览）",
                 isinstance(r_world, str) and "世界状态查询" in r_world
                 and "全部指令一览" not in r_world)
 
-    r_query = H("平原", PRIV)
+    r_query = H("D/XX/平原", PRIV)
     total += 1
-    ok += check("handler '平原' 走查询（非帮助）",
+    ok += check("handler 'D/XX/平原' 走查询（非帮助）",
                 isinstance(r_query, str) and "全部指令一览" not in r_query)
 
-    r_idle = H("你好啊", PRIV)
-    total += 1
-    ok += check("handler '你好啊' 静默（None，不刷屏）", r_idle is None)
+    # 3b) 不带 D/XX/ 前缀：所有交互指令必须静默（防群聊误触发），主推不受影响
+    for w in ("帮助", "世界", "平原", "自检", "wm Boltor", "监控 裂缝", "你好啊"):
+        r = H(w, PRIV)
+        total += 1
+        ok += check("handler %r 无前缀静默（None）" % w, r is None)
 
     # 4) 世界状态 HELP_WORDS 不再含 帮助/help/?（避免与全局总览冲突）
     total += 1
@@ -74,9 +76,9 @@ def main():
     for w in ("平原", "WM boltor", "你好", "自检一下"):
         total += 1
         ok += check("非排障词不命中: %r" % w, not q.is_diagnostic(w))
-    r_diag = H("自检", PRIV)
+    r_diag = H("D/XX/自检", PRIV)
     total += 1
-    ok += check("handler '自检' 返回诊断文字",
+    ok += check("handler 'D/XX/自检' 返回诊断文字",
                 isinstance(r_diag, str) and "机器人自检" in r_diag)
     total += 1
     ok += check("诊断文字含 render_card / Markdown / 出图模式",

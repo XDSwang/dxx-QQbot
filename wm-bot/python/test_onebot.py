@@ -120,7 +120,9 @@ class TestHandler(unittest.TestCase):
         self.assertIsNone(h2("D/XX/WM x", {"message_type": "group", "group_id": 123456}))
 
     def test_query_prefix_gating(self):
-        """D/XX/ 前缀门槛：WM 查询必须带前缀；世界状态查询与控制命令不受限。"""
+        """D/XX/ 前缀门槛：所有交互指令（WM / 世界状态查询 / 监控开关 / 帮助 / 自检）
+        都必须带 D/XX/ 前缀；只有机器人主动推送（send_active）不在用户指令范畴，
+        不受影响。"""
         os.environ["WM_SOURCE"] = "mock"
         h = qq_bot.make_handler()   # 宽松
         # WM 查询：裸 -> 静默；带 D/XX/ -> 回复
@@ -130,12 +132,21 @@ class TestHandler(unittest.TestCase):
                                {"channel": "group", "group_id": "g"}))
         self.assertIsNotNone(h("D/XX/zk Tigris",
                                {"channel": "group", "group_id": "g"}))
-        # 世界状态查询：仍可直接打（属监控领域，不受 D/XX/ 限制）
-        self.assertIsNotNone(h("平原", {"channel": "group", "group_id": "g"}))
-        # 监控控制：裸「监控」给安全提示（不全会）；「监控全部」全量
-        self.assertIsNotNone(h("监控", {"channel": "group", "group_id": "g"}))
-        self.assertIn("监控全部", h("监控", {"channel": "group", "group_id": "g"}))
-        self.assertIsNotNone(h("监控全部", {"channel": "group", "group_id": "g"}))
+        # 世界状态查询：也必须带 D/XX/ 前缀（防群聊误触发），裸 -> 静默
+        self.assertIsNone(h("平原", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("D/XX/平原", {"channel": "group", "group_id": "g"}))
+        # 监控控制：裸「监控」「监控全部」都静默；带 D/XX/ 才生效
+        self.assertIsNone(h("监控", {"channel": "group", "group_id": "g"}))
+        self.assertIsNone(h("监控全部", {"channel": "group", "group_id": "g"}))
+        r = h("D/XX/监控", {"channel": "group", "group_id": "g"})
+        self.assertIsNotNone(r)
+        self.assertIn("监控全部", r)   # 安全提示，不全开
+        self.assertIsNotNone(h("D/XX/监控全部", {"channel": "group", "group_id": "g"}))
+        # 帮助 / 自检 也要前缀
+        self.assertIsNone(h("帮助", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("D/XX/帮助", {"channel": "group", "group_id": "g"}))
+        self.assertIsNone(h("自检", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("D/XX/自检", {"channel": "group", "group_id": "g"}))
 
 
 class TestIntegrationServer(unittest.TestCase):

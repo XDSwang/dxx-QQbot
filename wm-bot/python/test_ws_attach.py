@@ -181,7 +181,7 @@ def main():
     M.clear_pending()
     _seed("🛡️ 仲裁：赛德娜/Sangeru · 防御")
     with patch.dict(os.environ, {"WS_ATTACH_GAP": "0"}, clear=False):
-        r = H("帮助", ctx)
+        r = H("D/XX/帮助", ctx)
     total += 1
     ok += check("帮助回复里带出监控内容",
                 isinstance(r, str) and "📬 监控推送" in r and "Sangeru" in r)
@@ -194,7 +194,7 @@ def main():
         _seed("🛡️ 仲裁：赛德娜/Sangeru · 防御")
         total += 1
         ok += check("「停止监控」的确认不夹带",
-                    "📬" not in H("停止监控", ctx))
+                    "📬" not in H("D/XX/停止监控", ctx))
 
     # ---------- 8.5) 查询已覆盖监控栏目时不再重复附带 ----------
     print("[栏目重复时不重复附带]")
@@ -238,7 +238,7 @@ def main():
     M.clear_pending()
     _seed("🔥 裂缝（共 3）", types={"fissures"})
     with patch.dict(os.environ, {"WS_ATTACH_GAP": "0"}, clear=False):
-        r_same = H("裂缝", ctx)
+        r_same = H("D/XX/裂缝", ctx)
     total += 1
     ok += check("handler 查询同栏目时不夹带", "📬 监控推送" not in r_same)
 
