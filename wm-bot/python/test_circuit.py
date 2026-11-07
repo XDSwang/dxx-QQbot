@@ -126,6 +126,23 @@ def main():
       "刚刚结束" in ws._fmt_circuit({"circuit": {
           "expiry": int(time.time() - 60), "normal": ["X"], "hard": []}}))
 
+    print("\n== 2.5) 回廊并入双衍王境（王境里的玩法，归它这一块） ==")
+    d = dict(ws._MOCK_WS)
+    dt = ws._fmt_duviri(d)
+    t("双衍王境块里带出回廊", "无尽回廊" in dt)
+    t("王境块里列出三选一战甲", "Ivara、Inaros、Titania" in dt)
+    t("王境块里列出灵化武器", "Braton、Lato、Skana、Paris、Kunai" in dt)
+    t("回廊排在王境周期之后", dt.index("双衍王境") < dt.index("无尽回廊"))
+    no_c = dict(d)
+    no_c.pop("circuit")
+    t("取不到回廊时不写空行", "无尽回廊" not in ws._fmt_duviri(no_c))
+    t("回廊缺失不影响王境周期", "双衍王境：" in ws._fmt_duviri(no_c))
+    ws._COMPACT = True
+    try:
+        t("「全部」精简模式不重复贴回廊", "无尽回廊" not in ws._fmt_duviri(d))
+    finally:
+        ws._COMPACT = False
+
     print("\n== 3) 栏目与指令 ==")
     t("TYPES 里有回廊", "circuit" in ws.TYPES and ws.TYPES["circuit"][0] == "回廊")
     for word in ("回廊", "无尽回廊", "灵化", "灵化武器", "钢铁回廊", "circuit"):
@@ -171,6 +188,13 @@ def main():
               any("无尽回廊" in txt for k, txt in parts if k == "circuit"))
             t("新栏目可被 monitor_label 识别",
               "circuit" in ws.TYPES and ws.TYPES["circuit"][0] == "回廊")
+            t("回廊推送标签就是「回廊」",
+              M.monitor_label(ws._fmt_circuit(dict(ws._MOCK_WS))) == "【回廊监控信息如下】")
+            t("双衍王境块不会被标成回廊",
+              M.monitor_label(ws._fmt_duviri(dict(ws._MOCK_WS))) == "【双衍王境监控信息如下】")
+            r = str(qq_common.handle_ws("双衍王境", CONTEXT))
+            t("查双衍王境直接看到回廊",
+              "双衍王境" in r and "无尽回廊" in r and "Ivara" in r)
     finally:
         reset()
 

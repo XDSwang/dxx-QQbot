@@ -701,14 +701,47 @@ _MODIFIER_CN = {
     "SORTIE_MODIFIER_SHIELDS": "强化护盾",
     "SORTIE_MODIFIER_ENEMY_PHYSICAL": "敌人物理强化",
     "SORTIE_MODIFIER_ENEMY_ELEMENTAL": "敌人元素强化",
+    # 以下按 WFCD/warframe-worldstate-data 的 data/zh/sortieData.json（modifierTypes）
+    # 补齐：官方端点只给 SORTIE_MODIFIER_* 编码，缺表就会把 Electricity/Puncture
+    # 这类键直接 title 成英文塞给用户。已有译名保持不动，只补本表没有的键。
+    "SORTIE_MODIFIER_IMPACT": "敌人物理强化(冲击)",
+    "SORTIE_MODIFIER_PUNCTURE": "敌人物理强化(穿刺)",
+    "SORTIE_MODIFIER_SLASH": "敌人物理强化(切割)",
+    "SORTIE_MODIFIER_MAGNETIC": "敌人元素强化(磁力)",
+    "SORTIE_MODIFIER_CORROSIVE": "敌人元素强化(腐蚀)",
+    "SORTIE_MODIFIER_VIRAL": "敌人元素强化(病毒)",
+    "SORTIE_MODIFIER_ELECTRICITY": "敌人元素强化(电击)",
+    "SORTIE_MODIFIER_RADIATION": "敌人元素强化(辐射)",
+    "SORTIE_MODIFIER_GAS": "敌人元素强化(毒气)",
+    "SORTIE_MODIFIER_FIRE": "敌人元素强化(火焰)",
+    "SORTIE_MODIFIER_EXPLOSION": "敌人元素强化(爆炸)",
+    "SORTIE_MODIFIER_FREEZE": "敌人元素强化(冰冻)",
+    "SORTIE_MODIFIER_TOXIN": "敌人元素强化(毒素)",
+    "SORTIE_MODIFIER_POISON": "敌人元素强化(毒素)",
+    "SORTIE_MODIFIER_HAZARD_FOG": "浓雾",
+    "SORTIE_MODIFIER_SECONDARY_ONLY": "副武器限定",
+    "SORTIE_MODIFIER_SHOTGUN_ONLY": "霰弹枪限定",
+    "SORTIE_MODIFIER_SNIPER_ONLY": "狙击枪限定",
+    "SORTIE_MODIFIER_RIFLE_ONLY": "步枪限定",
+    "SORTIE_MODIFIER_MELEE_ONLY": "近战限定",
+    "SORTIE_MODIFIER_BOW_ONLY": "弓限定",
 }
 _BOSS_CN = {
     "SORTIE_BOSS_HEK": "Vay Hek", "SORTIE_BOSS_SARGAS_RUK": "Sargas Ruk",
     "SORTIE_BOSS_KRILA": "Kela De Thaym", "SORTIE_BOSS_TYL_REGOR": "Tyl Regor",
     "SORTIE_BOSS_LECH_KRIL": "Lech Kril", "SORTIE_BOSS_AMBULAS": "Ambulas",
-    "SORTIE_BOSS_JACKAL": "Jackal", "SORTIE_BOSS_PHORID": "Phorid",
-    "SORTIE_BOSS_BOREAL": "Boreal", "SORTIE_BOSS_NEF_ANYO": "Nef Anyo",
-    "SORTIE_BOSS_ALAD_V": "Alad V", "SORTIE_BOSS_HYENA": "Hyena Pack",
+    "SORTIE_BOSS_JACKAL": "豺狼", "SORTIE_BOSS_PHORID": "Phorid",
+    "SORTIE_BOSS_BOREAL": "诡文枭主", "SORTIE_BOSS_NEF_ANYO": "Nef Anyo",
+    "SORTIE_BOSS_ALAD_V": "Alad V", "SORTIE_BOSS_HYENA": "鬣狗群",
+    # 官方不同版本用过两套 Boss 编码（旧 KRILA/TYL_REGOR/NEF_ANYO，
+    # 新 KELA/TYL/NEF），两套都留着，遇到哪套都能翻。
+    "SORTIE_BOSS_KELA": "Kela De Thaym", "SORTIE_BOSS_TYL": "Tyl Regor",
+    "SORTIE_BOSS_KRIL": "Lech Kril", "SORTIE_BOSS_RUK": "Sargas Ruk",
+    "SORTIE_BOSS_VOR": "Vor 上尉", "SORTIE_BOSS_NEF": "Nef Anyo",
+    "SORTIE_BOSS_ALAD": "Alad V", "SORTIE_BOSS_RAPTOR": "猛禽",
+    "SORTIE_BOSS_LEPHANTIS": "Lephantis", "SORTIE_BOSS_INFALAD": "异融者Alad V",
+    "SORTIE_BOSS_CORRUPTED_VOR": "堕落 Vor", "SORTIE_BOSS_AMAR": "欺谋狼主",
+    "SORTIE_BOSS_NIRA": "混沌蛇主", "SORTIE_BOSS_PAAZUL": "帕祖",
 }
 
 
@@ -1394,12 +1427,35 @@ def _fmt_cambion(s):
                               + _cycle_left(c.get("expiry"), c.get("timeLeft")))
 
 
+def _circuit_lines(s, indent="  "):
+    """回廊轮换的正文行（不含标题）：普通回廊三选一战甲 + 钢铁回廊五把灵化武器。
+
+    「回廊」独立栏目与「双衍王境」平原块共用这一份渲染，避免两处各写一套走样。
+    """
+    c = s.get("circuit") or {}
+    nrm = c.get("normal") or []
+    hard = c.get("hard") or []
+    out = []
+    if nrm:
+        out.append(f"{indent}· 普通回廊 · 战甲三选一：" + "、".join(nrm))
+    if hard:
+        out.append(f"{indent}· 钢铁回廊 · 灵化武器：" + "、".join(hard))
+    return out
+
+
 def _fmt_duviri(s):
+    """双衍王境：区域周期 + 无尽回廊（回廊是王境内的常驻玩法，归这一块一起给）。"""
     d = s.get("duviriCycle") or {}
-    if not d:
-        return _plain_with_bounty(s, "duviri", "🌀 双衍王境：（当前无）")
-    return _plain_with_bounty(s, "duviri", "🌀 双衍王境："
-                              + (d.get("state") or "?") + _cycle_left(d.get("expiry")))
+    head = ("🌀 双衍王境：" + (d.get("state") or "?") + _cycle_left(d.get("expiry"))
+            if d else "🌀 双衍王境：（当前无）")
+    out = [_plain_with_bounty(s, "duviri", head)]
+    # 「全部」这种一次十几栏的精简模式里回廊另有独立块，这里不重复贴一遍
+    lines = _circuit_lines(s, "     ")
+    if lines and not _COMPACT:
+        out.append("    无尽回廊（本周"
+                   + _cycle_left((s.get("circuit") or {}).get("expiry")) + "）")
+        out += lines
+    return "\n".join(out)
 
 
 def _fmt_zariman(s):
@@ -1689,13 +1745,8 @@ def _fmt_circuit(s):
     if not c:
         return "🌀 无尽回廊：（暂时取不到，稍后自动重试）"
     out = [f"🌀 无尽回廊（本周{_cycle_left(c.get('expiry'))}）"]
-    nrm = c.get("normal") or []
-    hard = c.get("hard") or []
-    if nrm:
-        out.append("  · 普通回廊 · 战甲三选一：" + "、".join(nrm))
-    if hard:
-        out.append("  · 钢铁回廊 · 灵化武器：" + "、".join(hard))
-    if not nrm and not hard:
+    out += _circuit_lines(s)
+    if not (c.get("normal") or c.get("hard")):
         out.append("  （本轮轮换数据为空，等刷新）")
     out.append("（每周一 00:00 UTC 轮换；名称沿用官方原名）")
     return "\n".join(out)
@@ -2386,7 +2437,8 @@ HELP_TEXT = (
     "  平原：平原（五处时间一起给，各处附自己的赏金）/ 希图斯 / 奥布山谷 / 魔胎之境 / 双衍 / 扎里曼\n"
     "  战斗：裂缝（常规星球在上、九重天在下，各按 古→前→中→后→安魂→全能 排序）\n"
     "        钢铁裂缝 / 突击 / 仲裁 / 入侵 / 警报 / 活动\n"
-    "        回廊（本周普通回廊三选一战甲 + 钢铁回廊五把灵化武器，每周一 00:00 UTC 换）\n"
+    "        回廊（本周普通回廊三选一战甲 + 钢铁回廊五把灵化武器，每周一 00:00 UTC 换；\n"
+    "             它就在双衍王境里，查「双衍王境」也会一起给）\n"
     "  轮换：商人 / 瓦奇娅 / 特惠 / 电波 / 加成\n"
     "  赏金：赏金（六个集团一次给全，每档带奖励）/ 赏金轮换（本轮 + 宝库奖励）\n"
     "        单个集团：赏金 Ostron / 赏金 坚守者 / 赏金 扎里曼（也可 监控 赏金 Ostron）\n"

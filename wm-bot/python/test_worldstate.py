@@ -742,6 +742,26 @@ def test_sortie_supplement():
                                             "SORTIE_MODIFIER_") == "能量缩减")
     check("未知码回退去前缀", ws._code_cn(ws._MISSION_CN, "MT_WEIRD_THING", "MT_") == "Weird Thing")
     check("BOSS 映射 HEK", ws._code_cn(ws._BOSS_CN, "SORTIE_BOSS_HEK", "SORTIE_BOSS_") == "Vay Hek")
+    # 官方端点只给编码：缺表就会把 Electricity / Puncture 这类键 title 成英文丢给用户
+    check("减益映射 ELECTRICITY 不再是英文",
+          ws._code_cn(ws._MODIFIER_CN, "SORTIE_MODIFIER_ELECTRICITY",
+                      "SORTIE_MODIFIER_") == "敌人元素强化(电击)")
+    check("减益映射 PUNCTURE 不再是英文",
+          ws._code_cn(ws._MODIFIER_CN, "SORTIE_MODIFIER_PUNCTURE",
+                      "SORTIE_MODIFIER_") == "敌人物理强化(穿刺)")
+    check("限定类减益有中文",
+          ws._code_cn(ws._MODIFIER_CN, "SORTIE_MODIFIER_SHOTGUN_ONLY",
+                      "SORTIE_MODIFIER_") == "霰弹枪限定")
+    check("新版 Boss 编码 HYENA 走中文名",
+          ws._code_cn(ws._BOSS_CN, "SORTIE_BOSS_HYENA", "SORTIE_BOSS_") == "鬣狗群")
+    check("新旧两套 Boss 编码都能翻",
+          ws._code_cn(ws._BOSS_CN, "SORTIE_BOSS_KELA", "SORTIE_BOSS_") == "Kela De Thaym"
+          and ws._code_cn(ws._BOSS_CN, "SORTIE_BOSS_KRILA", "SORTIE_BOSS_") == "Kela De Thaym")
+    check("修饰词表覆盖 WFCD 补的编码",
+          all(k in ws._MODIFIER_CN for k in (
+              "SORTIE_MODIFIER_IMPACT", "SORTIE_MODIFIER_SLASH",
+              "SORTIE_MODIFIER_ELECTRICITY", "SORTIE_MODIFIER_VIRAL",
+              "SORTIE_MODIFIER_SECONDARY_ONLY")))
 
     fake = {"Sorties": [{
         "Expiry": {"$date": {"$numberLong": "1794070800000"}},
