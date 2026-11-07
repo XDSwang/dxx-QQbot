@@ -102,15 +102,14 @@ def main():
         total += 1
         ok += check("handler %r 无前缀静默（None）" % w, r is None)
 
-    # 3c) 带前缀但指令写错：不能再静默（以前会一条回复都没有，用户以为机器人挂了）
-    for w in ("D/XX/随便乱打", "D/XX/希图思", "D/XX/裂缝裂缝", "D/XX/今天打什么"):
+    # 3c) 完整指令才算数：带前缀但没精确命中 → 一律静默（不猜、不提示）
+    #     理由：模糊/子串/后缀匹配会撞上正常聊天（例如「希图思」这种错别字、
+    #     或聊天里出现栏目字眼），机器人跑去接话比"没回复"更糟。
+    for w in ("D/XX/随便乱打", "D/XX/希图思", "D/XX/裂缝裂缝",
+              "D/XX/今天打什么", "D/XX/平原好玩吗我想去"):
         r = H(w, PRIV)
         total += 1
-        ok += check("handler %r 未识别 → 给提示（不静默）" % w,
-                    isinstance(r, str) and "没识别到这条指令" in r)
-    total += 1
-    ok += check("提示里引导发「帮助」",
-                "帮助" in H("D/XX/随便乱打", PRIV))
+        ok += check("handler %r 未精确命中 → 静默（None）" % w, r is None)
 
     # 4) 世界状态 HELP_WORDS 不再含 帮助/help/?（避免与全局总览冲突）
     total += 1
