@@ -52,6 +52,35 @@ class TestFrames(unittest.TestCase):
         typ, payload = cb.recv_message()
         self.assertEqual(payload.decode("utf-8"), "server data 123")
 
+    def test_handshake_keeps_trailing_frame(self):
+        """101 响应和第一帧落在同一个 TCP 段时，第一帧不能被握手丢掉。
+
+        这是真实踩过的坑：QQ 网关常在回完 101 后立刻发 op10 Hello，两段被同一次
+        recv 读走；旧实现把 \r\n\r\n 之后的字节直接丢弃，客户端就会一直等第一帧
+        （90 秒读超时）才重连 —— 现象是「日志显示已连网关，但完全没有事件」。
+        """
+        c, s = socket.socketpair()
+
+        def server():
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += s.recv(4096)
+            s.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                      b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                      b"\x81\x03abc")          # 文本帧 "abc"，故意和响应同一次发送
+
+        th = threading.Thread(target=server, daemon=True)
+        th.start()
+        try:
+            leftover = onebot.client_handshake(c, "127.0.0.1", 1, "/", None)
+            self.assertEqual(leftover, b"\x81\x03abc", "101 之后的剩余字节不能丢")
+            conn = onebot.WSConn(c, client_mask=True, initial=leftover)
+            typ, payload = conn.recv_message()
+            self.assertEqual((typ, payload), ("text", b"abc"))
+        finally:
+            c.close()
+            s.close()
+
     def test_ping_auto_pong(self):
         a, b = socket.socketpair()
         ca = onebot.WSConn(a, client_mask=False)   # a 端会消费 ping 并自动回 pong
@@ -168,8 +197,8 @@ class TestIntegrationServer(unittest.TestCase):
 
         # mock OneBot 客户端：连 server、做握手、发 message 事件、收 send_group_msg
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)
-        onebot.client_handshake(sock, "127.0.0.1", port, "/", None)
-        ws = onebot.WSConn(sock, client_mask=True)
+        leftover = onebot.client_handshake(sock, "127.0.0.1", port, "/", None)
+        ws = onebot.WSConn(sock, client_mask=True, initial=leftover)
 
         event = {
             "post_type": "message",

@@ -61,10 +61,12 @@ def _make_frame(opcode, payload, mask):
 class WSConn:
     """一个已握手的 WebSocket 连接。client_mask=True 表示本端是客户端（发帧需掩码）。"""
 
-    def __init__(self, sock, client_mask):
+    def __init__(self, sock, client_mask, initial=b""):
         self.sock = sock
         self.client_mask = client_mask
-        self._rbuf = b""
+        # initial：握手时可能已把「101 响应 + 第一帧」一起读进缓冲区，
+        # 那部分剩余字节从这里接上，否则第一帧（如 op10 Hello）会被吞掉。
+        self._rbuf = bytes(initial or b"")
         self._lock = threading.Lock()
 
     def _read_exact(self, n):
@@ -141,7 +143,15 @@ class WSConn:
 
 
 def client_handshake(sock, host, port, path, token=None):
-    """作为 WebSocket 客户端，向 OneBot WS 服务端发起 HTTP Upgrade 握手。"""
+    """作为 WebSocket 客户端，向 OneBot WS 服务端发起 HTTP Upgrade 握手。
+
+    返回「紧跟在 101 响应之后、已经被 recv 进来的剩余字节」——服务端常常在
+    回完 101 后立刻发第一帧（QQ 网关的 op10 Hello / 有些 OneBot 实现的推送），
+    这两段可能落在同一个 TCP 段、被同一次 recv 读走。以前这里把剩余字节直接
+    丢掉，若 Hello 正好被吞掉，客户端就会一直等第一帧（90 秒读超时）才能重连，
+    表现为「刚连上却迟迟没反应」。调用方必须把返回值交给 WSConn(initial=...)，
+    否则会丢帧。
+    """
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     lines = [
         f"GET {path} HTTP/1.1",
@@ -161,9 +171,11 @@ def client_handshake(sock, host, port, path, token=None):
         if not chunk:
             raise ConnectionError("握手时连接关闭")
         resp += chunk
-    status_line = resp.split(b"\r\n", 1)[0].decode("utf-8", "ignore")
+    head, _, leftover = resp.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("utf-8", "ignore")
     if "101" not in status_line:
         raise RuntimeError("WebSocket 握手失败: " + status_line)
+    return leftover
 
 
 def server_handshake(conn):
@@ -252,8 +264,8 @@ class OneBotClient:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
             sock = ctx.wrap_socket(sock, server_hostname=host)
-        client_handshake(sock, host, port, path, self.token)
-        conn = WSConn(sock, client_mask=True)
+        leftover = client_handshake(sock, host, port, path, self.token)
+        conn = WSConn(sock, client_mask=True, initial=leftover)
         self._loop(conn)
 
     # ---- server 模式：脚本起 WS 服务端，OneBot 反向连 ----

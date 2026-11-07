@@ -20,6 +20,7 @@ import json
 import time
 import socket
 import threading
+import queue
 import unittest
 from unittest.mock import patch
 
@@ -267,6 +268,29 @@ class TestMixedImageMessage(unittest.TestCase):
                 return True
             time.sleep(0.02)
         return False
+
+    def test_async_dead_worker_revived(self):
+        """工作线程异常退出后，新任务不能烂在队列里：应自动补一个新消费者。"""
+        self.bot._async_replies = True
+        seen = []
+
+        def h(t, c):
+            seen.append(t)
+            return qq_common.ImageReply(t, [b"\x89PNG"])
+
+        self.bot.handler = h
+        key = "group:G9"
+        q = queue.Queue()
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        self.bot._reply_queues[key] = q
+        self.bot._reply_threads[key] = dead   # 现场：队列还在，消费者已死
+
+        self.bot._dispatch_reply("TOK", "group", "G9", "hello", {}, "M9")
+        self.assertTrue(self._wait_for(lambda: seen == ["hello"]),
+                        "线程已死时新任务必须被新消费者接手")
+        self.assertTrue(self._wait_for(lambda: len(self.image_calls) == 1))
 
     def test_async_dispatch_returns_at_once(self):
         """_dispatch_reply 在异步模式下必须立刻返回，别把网关读取循环堵住。"""

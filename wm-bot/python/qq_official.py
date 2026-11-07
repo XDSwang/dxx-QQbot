@@ -336,6 +336,7 @@ class OfficialBot:
         # 仍是同步执行，断言不受影响。
         self._async_replies = False
         self._reply_queues = {}
+        self._reply_threads = {}
         self._reply_qlock = threading.Lock()
 
     def stop(self):
@@ -490,8 +491,11 @@ class OfficialBot:
         if u.scheme == "wss":
             ctx = bot_config.ssl_context()   # 与 REST 共用同一套 CA / 降级策略
             sock = ctx.wrap_socket(sock, server_hostname=host)
-        client_handshake(sock, host, port, path, token=None)
-        conn = WSConn(sock, client_mask=True)   # 客户端→服务端 发帧需掩码
+        # 握手返回值是「101 响应之后已被读进来的剩余字节」：QQ 网关常在握手后
+        # 立刻发 op10 Hello，两者可能落在同一个 TCP 段里。丢掉它会让客户端干等
+        # 90 秒读超时才重连（现象：日志显示已连网关，但一直没有任何事件）。
+        leftover = client_handshake(sock, host, port, path, token=None)
+        conn = WSConn(sock, client_mask=True, initial=leftover)   # 客户端→服务端 发帧需掩码
         print(f"[official] 已连网关 {host}{path}", file=sys.stderr)
         flog(f"已连网关 {host}{path}")
         self._loop(conn, token)
@@ -705,11 +709,19 @@ class OfficialBot:
     def _submit_reply(self, key, job):
         with self._reply_qlock:
             q = self._reply_queues.get(key)
-            if q is None:
-                q = queue.Queue()
-                self._reply_queues[key] = q
+            th = self._reply_threads.get(key)
+            # 兜底：工作线程如果异常退出（不是正常空闲注销），队列还在但没有消费者，
+            # 之后的任务会永远躺在队列里、用户一条回复都收不到。这里发现线程已死
+            # 就补一个新消费者接着消费同一个队列（队列里排着的任务不会丢）。
+            if q is None or (th is not None and not th.is_alive()):
+                if q is None:
+                    q = queue.Queue()
+                    self._reply_queues[key] = q
+                else:
+                    flog(f"⚠️ 会话 {key} 的回复线程已退出，重建消费者（队列中 {q.qsize()} 条待处理）")
                 th = threading.Thread(target=self._reply_worker, args=(key, q),
                                       daemon=True, name="reply-%s" % key)
+                self._reply_threads[key] = th
                 th.start()
         q.put(job)
 
@@ -728,6 +740,7 @@ class OfficialBot:
                     with self._reply_qlock:
                         if q.empty() and self._reply_queues.get(key) is q:
                             self._reply_queues.pop(key, None)
+                            self._reply_threads.pop(key, None)
                             return
                     idle = 0.0
                 continue
@@ -739,6 +752,8 @@ class OfficialBot:
         with self._reply_qlock:
             if self._reply_queues.get(key) is q:
                 self._reply_queues.pop(key, None)
+            if self._reply_threads.get(key) is threading.current_thread():
+                self._reply_threads.pop(key, None)
 
     def _do_reply(self, token, kind, target_id, text, ctx, msg_id):
         if not target_id:
