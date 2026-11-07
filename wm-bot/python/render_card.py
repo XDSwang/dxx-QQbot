@@ -546,7 +546,8 @@ def render(text, title="星际战甲 · 世界状态", subtitle=None, footer=Tru
     if cur:
         pages.append(cur)
     out = []
-    for i, pg in enumerate(pages[:4]):     # 最多 4 页，防炸
+    max_pages = int(os.environ.get("WS_CARD_MAX_PAGES") or 10)  # 页数上限，防炸（默认 10）
+    for i, pg in enumerate(pages[:max_pages]):
         t = title if len(pages) == 1 else f"{title}（{i + 1}/{len(pages)}）"
         out.append(_emit(pg, W_SINGLE, PAD, PAD * 2, t, subtitle, foot_txt,
                          fonts, 0, colors))

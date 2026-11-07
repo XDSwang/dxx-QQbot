@@ -344,12 +344,13 @@ class OfficialBot:
 
         前提：群管理员 / 用户在机器人资料页打开「机器人主动在群聊内发言」开关
         （对应 GROUP_MSG_RECEIVE / C2C_MSG_RECEIVE 事件），否则固定 40034105。
-        与 WM 交易卡片「图片 + content 文字（图在上、字在下）」正好相反：监控推送
-        先发一行文字标签（如「【平原监控信息如下】」，在上），再发卡片图（在下），
-        原图完全不变。这样群友先看到「这是什么监控」，再看到详情卡片。
-        QQ 的图文混排 caption 永远显示在图片下方，要做到「字在上、图在下」只能把
-        标签作为一条独立文字消息先发、卡片图消息后发，本函数即如此。
-        发图失败 / WM_WS_CARD=off 时回退纯文本（标签在正文前）。
+        结构：与 WM 交易卡片同一套单条 Markdown 通道，但把【文字标签放在图片上方】
+        —— 交易卡是「图在上、字在下」，监控反过来「字在上、图在下」，一条消息搞定。
+        做法：原生 Markdown（msg_type=2）内容里先写标签文字、再写图片标签即可，
+        QQ 自定义 Markdown 允许文字排在图片前面（不像富媒体 caption 永远在图下），
+        因此「单条消息 + 字在上」两者可同时成立，原图完全不变。
+        优先单条 Markdown；Markdown 不可用 / 没拿到图片引用 / 发送失败时回退：
+          两条消息（文字标签在上 + 卡片图在下，保持「字在上」意图）→ 纯文本。
         两者都失败才返回 False，由 ws_monitor 暂存、等本会话有人发消息时随回复带出。
         失败日志按 5 分钟节流。
         """
@@ -373,7 +374,15 @@ class OfficialBot:
             except Exception:
                 pngs = None
             if pngs:
-                # 先发文字标签（在上），再发图片（在下）—— 与交易卡片反过来
+                # 单条 Markdown：文字标签在上、卡片图在下（与交易卡反过来，占一条消息）
+                if self._send_active_markdown(token, kind, target_id, pngs, label):
+                    _active_fail_at[0] = 0.0
+                    flog(f"主动推送(单条Markdown·字在上)成功: {kind} {target_id} 张数={len(pngs)}")
+                    print(f"[official] 主动推送 单条Markdown(字在上) {kind} {target_id}"
+                          f"（{len(pngs)} 张）", file=sys.stderr)
+                    return True
+                # Markdown 没成（没图引用 / 被拒 / 关了）：回退两条消息（字在上+图在下），
+                # 保证「字在上」的意图在兜底时也不丢；多页卡片图也能全部发出
                 label_sent = False
                 if label:
                     ok_l, _ = send_message(token, self.appid, self.api_base,
@@ -383,11 +392,11 @@ class OfficialBot:
                                          content=None)
                 if res and res.ok:
                     _active_fail_at[0] = 0.0
-                    flog(f"主动推送(文字+图片)成功: {kind} {target_id} 张数={len(pngs)}")
-                    print(f"[official] 主动推送 文字+图片 {kind} {target_id}（{len(pngs)} 张）",
-                          file=sys.stderr)
+                    flog(f"主动推送(两条·字在上)成功: {kind} {target_id} 张数={len(pngs)}")
+                    print(f"[official] 主动推送 两条(字在上) {kind} {target_id}"
+                          f"（{len(pngs)} 张）", file=sys.stderr)
                     return True
-                # 图片没发成：补发纯文本；标签若已发出则省略，避免重复
+                # 图片也没发成：补发纯文本；标签若已发出则省略，避免重复
                 fb = text if label_sent else ((label + "\n\n" + text) if label else text)
                 ok2, info2 = send_message(token, self.appid, self.api_base,
                                           kind, target_id, fb, msg_id=None)
@@ -408,6 +417,41 @@ class OfficialBot:
             _active_fail_at[0] = 0.0
             flog(f"主动推送文本成功: {kind} {target_id}")
         return ok
+
+    def _send_active_markdown(self, token, kind, target_id, pngs, label):
+        """单条 Markdown 主动推送：文字标签在上、卡片图在下（与交易卡反过来）。
+
+        复用 qq_markdown 的原生 Markdown 通道（msg_type=2）：内容里先写标签文字、
+        再逐个写图片标签，即可实现「字在上、图在下」且只占一条消息，原图不变。
+        多页卡片逐张上传并依次排在标签下方。无图引用 / Markdown 关闭 / 发送失败
+        时返回 False，由 send_active 回退两条消息或纯文本。
+        """
+        if qq_markdown is None or not qq_markdown.enabled():
+            return False
+        try:
+            tags = []
+            for png in pngs[:4]:
+                url = qq_markdown.resolve_image_url(
+                    [png], token, self.appid, self.api_base)
+                if not url:
+                    flog("主动推送 Markdown 未取得图片引用，回退两条消息")
+                    return False
+                tags.append(f"![img {qq_markdown.image_markup_size([png])}]({url})")
+        except Exception as e:
+            flog(f"主动推送 Markdown 取图失败: {e}")
+            return False
+        # 文字在上、图在下：原生 Markdown 先写标签，再写图片标签
+        md = ((label.strip() + "\n\n") if label and label.strip() else "") \
+            + "\n".join(tags)
+        try:
+            ok, info = qq_markdown.send(token, self.appid, self.api_base, kind,
+                                        target_id, {"content": md}, msg_id=None)
+        except Exception as e:
+            flog(f"主动推送 Markdown 发送异常: {e}")
+            return False
+        if not ok:
+            flog(f"主动推送 Markdown 发送失败({info})，回退两条消息")
+        return bool(ok)
 
     def run_forever(self):
         try:

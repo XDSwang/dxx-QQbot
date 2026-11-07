@@ -112,7 +112,9 @@ def main():
     # ---------- 1) 配置与主推栏目解析 ----------
     print("[主推栏目配置]")
     reset()
-    t("默认主推 = 警报 + 活动（按 TYPES 序）", M.priority_types() == ["alerts", "events"])
+    # 本模块顶部把 WS_PRIORITY_TYPES 设成了 alerts,events；这里临时清空才能真正测默认
+    with patch.dict(os.environ, {"WS_PRIORITY_TYPES": ""}):
+        t("默认不主推（等周期拆分推，不即时推）", M.priority_types() == [])
     with patch.dict(os.environ, {"WS_PRIORITY_TYPES": "警报,活动"}):
         t("中文别名也能配", M.priority_types() == ["alerts", "events"])
     with patch.dict(os.environ, {"WS_PRIORITY_TYPES": "alerts,invasions"}):
@@ -289,11 +291,15 @@ def main():
         with patch.object(ws, "ensure_fresh", lambda: next(states)), \
              patch.object(ws, "activity_touch", lambda: None), \
              patch.object(ws, "ensure_active", lambda: None):
-            M.push_once()                     # 首次：周期推一条
+            M.push_once()                     # 首次：周期按栏目拆分推（警报 + 活动各一条）
             first = len(calls)
-            sent = M.push_once()              # 新增警报：不再即时推
-        t("关掉主推后首次周期推一条", first == 1)
-        t("关掉主推后新增警报不再即时推", sent == 0 and len(calls) == first)
+            sent = M.push_once()              # 新增警报：不再即时主推，改走周期拆分
+        t("关掉主推后首次周期按栏目拆分推两条（警报+活动）", first == 2)
+        # 第二轮只有「警报」内容变了（多出 A2），但距首次发送不足 WS_ACTIVE_MIN_GAP(300s)
+        # 周期限频，按栏目去重后被拦住、本轮不发（活动没变也不重发）。这正说明关掉主推后
+        # 新增警报不再即时推，而是等周期限频过了再补。所以 sent=0、总条数仍为 2。
+        t("关掉主推后新增警报被周期限频拦住、不再即时推",
+          sent == 0 and len(calls) == 2)
 
     # ---------- 13) 稳定签名让周期推送不再因倒计时刷屏 ----------
     print("[周期签名剔除倒计时]")

@@ -59,7 +59,9 @@ _monitors = {}                       # (channel, target_id) -> set(types)
 _switches = {}                       # (channel, target_id) -> {type: bool}  聊天指令设的开关
 _pending = {}                        # (channel, target_id) -> {"text":str,"at":float,"fails":int}
 _attached_at = {}                    # (channel, target_id) -> 上次随查询附带的时刻
-_last_sent = {}                      # (channel, target_id) -> (周期内容签名, 主动推送成功时刻)
+_last_sent = {}                      # (channel, target_id) -> {类型键: (该栏目内容签名, 主动推送成功时刻)}
+                                        # 周期推送按栏目拆分后，去重粒度细化到单个栏目：
+                                        # 只有内容变化的栏目才重发，避免每条都刷屏。
 _seen_priority = {}                  # (channel, target_id) -> {type: set(条目键)}  主推基线
 _priority_sent_at = {}               # (channel, target_id) -> 上次主推成功时刻
 _next_probe = 0.0                    # 下次允许尝试主动发送的时刻（失败后退避探测）
@@ -68,7 +70,10 @@ _push_thread = None
 _stop = threading.Event()
 
 PROBE_GAP = 300.0                    # 主动通道不通时，每 5 分钟才再试一次（别空打接口）
-PRIORITY_DEFAULT = "alerts,events"   # 默认主推：警报 + 活动
+# 默认【不】开主推即时推：警报 / 活动不再一出现就立刻单独发一条，而是随周期全量
+# 拆分推送（等一轮抓取完成再发，结构统一、不杂乱）。需要即时主推时显式设
+# WS_PRIORITY_TYPES=alerts,events 即可恢复旧行为。
+PRIORITY_DEFAULT = ""
 # 倒计时标准化：3天4小时5分 / 2小时30分10秒 / 5分30秒 / 30秒 一律换成 <T>
 _DURATION = re.compile(r"(?:\d+(?:天|小时|分|秒)){1,4}")
 
@@ -137,6 +142,24 @@ def priority_min_gap():
 def priority_skip_in_full():
     """周期全量推送是否剔除主推栏目（避免同一条警报被推两遍）。"""
     return _on("WS_PRIORITY_SKIP_IN_FULL", True)
+
+
+def push_split_max():
+    """周期全量推送【按栏目拆分】后，单轮推送最多发几条独立消息（防「全部」刷屏）。
+
+    默认 10：监控「全部」(约 18 个栏目) 时，单轮最多发 10 条，超出的最不紧急栏目
+    本轮不发、等下轮内容变化再补。配合「按栏目独立去重」，稳态下通常只发 1~3 条
+    （仅变化的栏目），这个上限只在「刚开启监控 / 大量栏目同时变化」时兜底。
+    """
+    return int(_num("WS_PUSH_SPLIT_MAX", 10))
+
+
+def push_interval():
+    """拆分推送时相邻两条消息之间的间隔（秒），避免一次性连发被官方频控。
+
+    设 0 关闭间隔。默认 0.6 秒。
+    """
+    return _num("WS_PUSH_INTERVAL", 0.6)
 
 
 def auto_priority_enabled():
@@ -748,50 +771,66 @@ def push_once():
         if prio_res == -1:
             continue                  # 主推没发出去，别让周期覆盖它的暂存
 
-        # ② 周期推送：主推栏目默认从这里剔除，避免同一条警报推两遍
+        # ② 周期推送：主推栏目默认从这里剔除，避免同一条警报推两遍。
+        #    按栏目【拆分】成多条独立消息发送：每条 = 「【X监控信息如下】」文字标签
+        #    （send_active 内由内容关键字自动匹配，如赏金/裂缝/商人…）+ 该栏目卡片图
+        #    （图在下）。这样监控「全部」也不会把十几个栏目塞进一张超长图——超长图
+        #    既容易加载失败、又会被 render_card 的页数上限截断（「超出了就没有了」）。
+        #    每个栏目各自一张小图，清晰可靠。
+        #    发送是【串行排队】的：本循环在本推送线程里一条条发，且两条之间停
+        #    WS_PUSH_INTERVAL 秒，绝不会「一起发」刷屏；回复消息也是一问一答天然串行，
+        #    所以全机器人所有外发消息都是一条条排队，不杂乱。
+        #    各栏目按【内容签名】独立去重：只有变化的栏目才重发，避免每条都刷屏。
         full = set(types)
         if prio and skip_full:
             full -= set(prio)
         parts = _parts_of(state, full)
         if not parts:
             continue
-        text = "\n\n".join(x for _, x in parts)
-        sig = stable_sig(text)
-        with _lock:
-            last = _last_sent.get(key)      # 只有「主动推送成功过」才有记录
-        if last:
-            if last[0] == sig:
-                continue
-            if now - last[1] < active_min_gap():
-                continue
-        ok = False
-        if _sender is not None and now >= _next_probe:
-            try:
-                ok = bool(_sender(ch, tid, text))
-            except Exception:
-                ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
-            _note_probe(ok)         # 只有真去试了才更新探测时刻，否则退避会被无限推后
-        with _lock:
-            if ok:
-                _last_sent[key] = (sig, now)
-                if not (_pending.get(key) or {}).get("priority"):
-                    _pending.pop(key, None)  # 主动通道通了，不用再捎带
-                sent += 1
-            else:
-                prev = _pending.get(key) or {}
-                if prev.get("priority"):
-                    # 主推暂存优先：只刷新时间与失败计数，不覆盖内容
-                    prev["at"] = now
-                    prev["fails"] = int(prev.get("fails") or 0) + 1
-                    _pending[key] = prev
+        split_max = push_split_max()
+        interval = push_interval()
+        sent_any = False
+        for t, x in parts[:split_max]:
+            sig_t = stable_sig(x)
+            with _lock:
+                rec = (_last_sent.get(key) or {}).get(t)
+            if rec and rec[0] == sig_t:
+                continue                    # 该栏目内容没变，跳过
+            if rec and now - rec[1] < active_min_gap():
+                continue                    # 该栏目刚推过，太频繁，跳过
+            ok = False
+            if _sender is not None and now >= _next_probe:
+                try:
+                    ok = bool(_sender(ch, tid, x))
+                except Exception:
+                    ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
+                _note_probe(ok)             # 只有真去试了才更新探测时刻
+            with _lock:
+                ls = _last_sent.setdefault(key, {})
+                if ok:
+                    ls[t] = (sig_t, now)
+                    if not (_pending.get(key) or {}).get("priority"):
+                        _pending.pop(key, None)  # 主动通道通了，不用再捎带
+                    sent_any = True
                 else:
-                    _pending[key] = {
-                        "text": text,
-                        "at": now,
-                        "fails": int(prev.get("fails") or 0) + 1,
-                        "types": set(full),
-                        "parts": parts,
-                    }
+                    prev = _pending.get(key) or {}
+                    if prev.get("priority"):
+                        # 主推暂存优先：只刷新时间与失败计数，不覆盖内容
+                        prev["at"] = now
+                        prev["fails"] = int(prev.get("fails") or 0) + 1
+                        _pending[key] = prev
+                    else:
+                        _pending[key] = {
+                            "text": x,
+                            "at": now,
+                            "fails": int(prev.get("fails") or 0) + 1,
+                            "types": {t},
+                            "parts": [(t, x)],
+                        }
+            if interval and ok:
+                time.sleep(interval)        # 相邻两条之间稍歇，防官方频控
+        if sent_any:
+            sent += 1
     return sent
 
 
