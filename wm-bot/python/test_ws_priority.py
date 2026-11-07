@@ -396,6 +396,21 @@ def main():
     t("None 也不报错", M.monitor_label(None) == "【监控信息如下】")
     t("大小写不敏感（Fissure）",
       M.monitor_label("FISSURE 虚空裂隙") == "【裂缝监控信息如下】")
+    # 全覆盖回归：TYPES 里每个栏目都必须拿到自己的标签，不许掉进通用兜底。
+    # （曾经漏了「突击 / 仲裁」，监控全部时这两条显示成【监控信息如下】。）
+    missing = []
+    for _key in ws.TYPES:
+        try:
+            _txt = ws.TYPES[_key][1]({})
+        except Exception:
+            _txt = ""
+        if M.monitor_label(_txt) == "【监控信息如下】":
+            missing.append(ws.TYPES[_key][0])
+    t("TYPES 全栏目都有专属标签（未命中：%s）" % (missing or "无"), not missing)
+    t("突击 → 突击监控信息如下",
+      M.monitor_label("⚔️ 突击 · Grineer · 结束 1天2小时") == "【突击监控信息如下】")
+    t("仲裁 → 仲裁监控信息如下",
+      M.monitor_label("🛡️ 仲裁：Gabii · 拦截 · Infested · Lv40") == "【仲裁监控信息如下】")
 
     print("\n结果：通过 %d / 失败 %d" % (ok, total - ok))
     return 0 if ok == total else 1

@@ -683,6 +683,8 @@ _MONITOR_LABEL_RULES = [
     (("钢铁裂缝", "steel"), "钢铁裂缝"),
     (("裂缝", "裂隙", "fissure"), "裂缝"),
     (("后纪中断", "中断", "强袭", "assault"), "中断"),
+    (("突击", "sortie"), "突击"),
+    (("仲裁", "arbitration", "arbi"), "仲裁"),
     # —— 平原各区域：每个区域独立标签（否则正文里内嵌的「赏金 ·」行会让
     #    平原栏目全被误标成「赏金」，监控全部时看起来一堆重复）——
     (("希图斯", "cetus"), "希图斯"),
@@ -709,6 +711,10 @@ _MONITOR_LABEL_RULES = [
 # 平原各区域标签：多区域拼接（平原昼夜组合视图）时另判为「平原昼夜」。
 _REGION_LABELS = ("希图斯", "奥布山谷", "魔胎之境", "双衍王境", "扎里曼")
 
+# 栏目规范名（取自 worldstate.TYPES 的第二列），长的排前面供兜底匹配用。
+_TYPE_NAMES_LONGEST_FIRST = tuple(sorted(
+    {v[0] for v in ws.TYPES.values() if v and v[0]}, key=len, reverse=True))
+
 
 def monitor_label(text):
     """监控推送图文混排时用的文字标签：返回「【来源监控信息如下】」。
@@ -732,6 +738,14 @@ def monitor_label(text):
                 break
         if matched:
             break
+    if not matched:
+        # 兜底：直接拿 TYPES 里的栏目规范名去匹配首行（长的优先，避免「赏金」
+        # 抢了「赏金轮换」）。这样以后 TYPES 新增栏目、忘了补规则表时，也不会
+        # 掉进通用标签——本次「突击 / 仲裁」显示成通用标签就是这个坑。
+        for name in _TYPE_NAMES_LONGEST_FIRST:
+            if name and name in head:
+                matched = name
+                break
     if not matched:
         return "【监控信息如下】"
     # 平原昼夜 = 多个区域拼接而成的组合视图：首行只会落成第一个区域，
