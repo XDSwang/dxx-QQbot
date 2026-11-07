@@ -340,6 +340,34 @@ def main():
     t("基线被清掉", KA not in M._seen_priority)
     t("防抖时刻被清掉", KA not in M._priority_sent_at)
 
+    # ---------- 16) 监控推送文字标签：按关键字匹配来源 ----------
+    print("[监控文字标签 monitor_label]")
+    t("赏金 → 赏金监控信息如下",
+      M.monitor_label("开放世界赏金(3个集团)\n赏金 · 索拉里斯") == "【赏金监控信息如下】")
+    t("希图斯/夜灵平原 → 平原监控信息如下",
+      M.monitor_label("希图斯（昼）\n夜灵平原 剩余") == "【平原监控信息如下】")
+    t("虚空裂隙 → 裂缝监控信息如下",
+      M.monitor_label("虚空裂隙\n中断事件") == "【裂缝监控信息如下】")
+    t("后纪中断/强袭 → 中断监控信息如下",
+      M.monitor_label("后纪中断\n强袭") == "【中断监控信息如下】")
+    t("星图/地图 → 地图监控信息如下",
+      M.monitor_label("星图轮换\n地图") == "【地图监控信息如下】")
+    t("警报 → 警报监控信息如下",
+      M.monitor_label("警报\n地球/Everest") == "【警报监控信息如下】")
+    t("活动 → 活动监控信息如下",
+      M.monitor_label("活动\norphys 的赠礼") == "【活动监控信息如下】")
+    t("入侵 → 入侵监控信息如下",
+      M.monitor_label("入侵\nGrineer 节点") == "【入侵监控信息如下】")
+    t("赏金优先于平原（避免误标）",
+      M.monitor_label("赏金 · 希图斯集团") == "【赏金监控信息如下】")
+    t("裂缝优先于平原（避免误标）",
+      M.monitor_label("裂缝\n奥布山谷附近") == "【裂缝监控信息如下】")
+    t("无关键字 → 通用监控信息如下",
+      M.monitor_label("") == "【监控信息如下】")
+    t("None 也不报错", M.monitor_label(None) == "【监控信息如下】")
+    t("大小写不敏感（Fissure）",
+      M.monitor_label("FISSURE 虚空裂隙") == "【裂缝监控信息如下】")
+
     print("\n结果：通过 %d / 失败 %d" % (ok, total - ok))
     return 0 if ok == total else 1
 

@@ -344,12 +344,20 @@ class OfficialBot:
 
         前提：群管理员 / 用户在机器人资料页打开「机器人主动在群聊内发言」开关
         （对应 GROUP_MSG_RECEIVE / C2C_MSG_RECEIVE 事件），否则固定 40034105。
-        按「所有回复优先图片」的要求，先渲染白底卡片发图；发图失败或
-        WM_WS_CARD=off 时回退纯文本。两者都失败才返回 False，由 ws_monitor
-        暂存、等本会话有人发消息时随回复带出。失败日志按 5 分钟节流。
+        按「所有回复优先图片」的要求，先渲染白底卡片发图；发图时把监控文字标签
+        （如「【平原监控信息如下】」）作为图文混排的 content 放在图片前面——
+        与 WM 交易卡片「图片 + content 文字」是同一套机制，原图完全不变。发图失败、
+        WM_WS_CARD=off、或服务端不支持图文混排时回退纯文本（标签一并带在正文前）。
+        两者都失败才返回 False，由 ws_monitor 暂存、等本会话有人发消息时随回复带出。
+        失败日志按 5 分钟节流。
         """
         if not target_id:
             return False
+        try:
+            from ws_monitor import monitor_label
+            label = monitor_label(text)
+        except Exception:
+            label = ""
         try:
             token = self.token_mgr.get_token()
         except Exception as e:
@@ -362,15 +370,24 @@ class OfficialBot:
                 pngs = render_card.render(text, title="星际战甲 · 监控推送")
             except Exception:
                 pngs = None
-            if pngs and self._reply_images(token, kind, target_id, pngs, None):
-                _active_fail_at[0] = 0.0
-                flog(f"主动推送图片成功: {kind} {target_id} 张数={len(pngs)}")
-                print(f"[official] 主动推送图片 {kind} {target_id}（{len(pngs)} 张）",
-                      file=sys.stderr)
-                return True
+            if pngs:
+                res = self._reply_images(token, kind, target_id, pngs, None,
+                                         content=label or None)
+                if res:
+                    # 服务端不支持图文混排时，_reply_images 已改发纯图，
+                    # 这里补发标签文字，保证「文字 + 原图」不丢。
+                    if not res.mixed and label:
+                        send_message(token, self.appid, self.api_base,
+                                     kind, target_id, label, msg_id=None)
+                    _active_fail_at[0] = 0.0
+                    flog(f"主动推送图片成功: {kind} {target_id} 张数={len(pngs)}")
+                    print(f"[official] 主动推送图片 {kind} {target_id}（{len(pngs)} 张）",
+                          file=sys.stderr)
+                    return True
             flog("主动推送图片未成功，回退纯文本")
+        body = (label + "\n\n" + text) if label else text
         ok, info = send_message(token, self.appid, self.api_base,
-                                kind, target_id, text, msg_id=None)
+                                kind, target_id, body, msg_id=None)
         if not ok:
             now = time.time()
             if now - _active_fail_at[0] >= 300:
