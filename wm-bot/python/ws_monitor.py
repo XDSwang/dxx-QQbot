@@ -549,6 +549,22 @@ def my_types(channel, target_id, user):
     return [t for t in ws.TYPES if t in have]
 
 
+def at_users_of(channel, target_id):
+    """本会话所有开过监控的人：推送时全部 @ 上，消息是大家一起要的。
+
+    只认成员级订阅（空 uid 的会话级订阅没有具体人，跳过）；
+    老数据没有订阅者时退回单个发起人记录，保证升级后照常 @ 得到人。
+    """
+    key = (channel, str(target_id))
+    with _lock:
+        cols = _subs.get(key) or {}
+        uids = sorted({u for us in cols.values() for u in us if u})
+        if uids:
+            return uids
+        one = _at_users.get(key)
+    return [one] if one else []
+
+
 
 _sender_at = [None]      # 缓存的探测结果：sender 是否收第四参 at_user
 
@@ -570,7 +586,10 @@ def _sender_takes_at():
 
 
 def _send_one(ch, tid, text, at_user=None):
-    """调后端 sender 发一条：能给就顺手 @ 发起人，后端不支持就退回三参。"""
+    """调后端 sender 发一条：能给就把发起人全 @ 上，后端不支持就退回三参。
+
+    at_user 允许单个号或号列表（群里多人开监控时逐个 @）。
+    """
     if at_user and _sender_takes_at():
         return _sender(ch, tid, text, at_user)
     return _sender(ch, tid, text)
@@ -1210,7 +1229,7 @@ def _push_priority(ch, tid, key, state, prio, now):
         ok = False
         if _sender is not None and now >= _next_probe:
             try:
-                ok = bool(_send_one(ch, tid, x, at_user_of(ch, tid)))
+                ok = bool(_send_one(ch, tid, x, at_users_of(ch, tid)))
             except Exception:
                 ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
             _note_probe(ok)
@@ -1347,7 +1366,7 @@ def push_once():
             ok = False
             if _sender is not None and now >= _next_probe:
                 try:
-                    ok = bool(_send_one(ch, tid, x, at_user_of(ch, tid)))
+                    ok = bool(_send_one(ch, tid, x, at_users_of(ch, tid)))
                 except Exception:
                     ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
                 _note_probe(ok)             # 只有真去试了才更新探测时刻

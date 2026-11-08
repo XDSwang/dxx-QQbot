@@ -31,9 +31,12 @@ worldstate.py — 星际战甲（国际服）世界状态查询 / 监控（独�
     - 主任务只有【一个】后台循环：睡到 queue 队首（最快结束的那条）；
       到点发【一次全量请求】，写缓存，重新扫描 + 排序，继续睡。
       没到点就【零请求】，绝不反复查询。
-    - 任意两次请求之间不短于 10 -> 20 -> 50 -> 10 秒节拍：接口给出极短到期点、
-      或队列为空（拿不到任何结束时刻）时，按节拍兜底再查一次全量，
+    - 任意两次请求之间不短于 2 -> 3 -> 5 -> 2 分钟节拍（WS_STEP_GAPS 可改）：
+      接口给出极短到期点、或队列为空（拿不到任何结束时刻）时，按节拍兜底再查一次全量，
       直到扫到新的未来结束时刻，再重新睡到它。
+    - **请求次数只跟世界状态本身有关，与群数 / 用户数无关**：全世界状态只有这一条队列
+      + 一份缓存（data/worldstate.json），所有群共用；用户查询只读缓存，不触发请求，
+      所以群再多也不会把对端打爆（多出来的只有「发消息」，受 QQ 频控与推送间隔约束）。
     - 商人 active=False 时结束点就是下次抵达（可能十几天），期间零请求。
     - 【单飞 + 缓存优先，防重复查询】一次全量请求会把【全部】数据写回缓存，
       所以「待查任务」不能各自留着再查一遍：
@@ -129,7 +132,25 @@ ARBI_NODES_URL = ARBI_BASE + "/data/arbys.nodes.zh.json"
 # 同域名硬规则：每次 HTTP 前都过 3~5 秒节流（与 WM 一致，不允许调小）
 WS_PACE_MIN, WS_PACE_MAX = 3.0, 5.0
 
-WS_STEP_GAPS = (10.0, 20.0, 50.0)      # 主任务节拍：任意两次全量请求之间的最小间隔
+def _step_gaps():
+    """两次全量请求之间的最小间隔（秒），默认 2/3/5 分钟循环。
+
+    群再多也只走这一条队列、共用一份缓存，请求次数不随人数增长；
+    这个参数只决定「世界状态最多多久刷一次」，可用 WS_STEP_GAPS=秒,秒… 覆盖。
+    """
+    raw = os.environ.get("WS_STEP_GAPS") or "120,180,300"
+    out = []
+    for p in str(raw).split(","):
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out.append(v)
+    return tuple(out) or (120.0, 180.0, 300.0)
+
+
+WS_STEP_GAPS = _step_gaps()           # 主任务节拍：任意两次全量请求之间的最小间隔
 WS_RETRY_GAPS = (10.0, 30.0, 60.0)    # 网络失败退避
 WS_PUSH_SECONDS = float(os.environ.get("WS_PUSH_SECONDS") or 10)
 WS_WAKE_MAX = float(os.environ.get("WS_WAKE_MAX") or 3600)
@@ -2551,11 +2572,13 @@ def describe_plan():
             return "（首次抓取进行中，正在请求 api.warframestat.us，请稍候…）"
         return "（队列为空，尚未抓取过世界状态）"
     q = c.get("queue") or []
-    gaps = "/".join(f"{g:g}" for g in WS_STEP_GAPS)
+    gaps = "/".join(f"{g / 60:g}分" if g >= 60 else f"{g:g}秒"
+                    for g in WS_STEP_GAPS)
     lines = [
         f"抓取时刻：{_fmt_when(c.get('fetched_at', 0))}",
         "主任务：一个后台循环 / 一次全量请求 / 一条按结束时刻排序的队列",
-        f"节拍：{gaps} 秒循环（任意两次请求的最小间隔）；同域名底线 3~5 秒（硬规则）",
+        f"节拍：{gaps}循环（任意两次请求的最小间隔，与群数无关）；"
+        f"同域名底线 3~5 秒（硬规则）",
         f"下次请求：{_fmt_when(next_due())}",
         "",
         f"排序后的到期队列（共 {len(q)} 个到期点，裂缝/警报列表里每条单独排）：",

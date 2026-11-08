@@ -8,7 +8,7 @@ test_worldstate.py — 世界状态模块离线回归（零依赖，全部走 mo
   - 【一次全量请求】不再按 16 个端点一个个查，一次请求就拿到全部数据
   - 【排序队列】递归扫描每一条数据的结束时刻：裂缝/钢铁裂缝/警报列表里每条单独排
   - 【队首 = 最快结束】主任务睡到队首，到点只查一次全量，没到点零请求
-  - 【10/20/50 节拍】队列为空 / 极短到期点兜底，且节拍计数落盘循环
+  - 【2/3/5 分钟节拍】队列为空 / 极短到期点兜底，且节拍计数落盘循环
   - 同域名 3~5 秒底线（mock 也走，中文回退那次也走；主任务到点那次也不漏）
   - 缓存优先：缓存里已有新数据就不联网，找不到才由主任务按排序队列查一次
   - 【单飞防重复查询】多个任务同时进来只执行最快到期的一个；一次全量写回全部
@@ -33,6 +33,14 @@ from unittest.mock import patch
 # 必须在 import worldstate 之前确定走 mock 源（模块在导入时读取该环境变量）
 os.environ["WS_SOURCE"] = "mock"
 
+# 会话类落盘文件一律指到临时目录：测试绝不能覆盖本机正在跑的监控设置
+_WS_TMP = tempfile.mkdtemp(prefix="ws-files-")
+for _k, _n in (("WS_SWITCH_FILE", "ws_switches.json"),
+               ("WS_FILTER_FILE", "ws_filters.json"),
+               ("WS_AT_FILE", "ws_at_users.json"),
+               ("WS_SUB_FILE", "ws_subs.json")):
+    os.environ[_k] = str(Path(_WS_TMP) / _n)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
@@ -40,6 +48,8 @@ import worldstate as ws
 import ws_monitor
 import qq_common
 import wm
+
+ws_monitor.LAST_SENT_FILE = Path(_WS_TMP) / "ws_last_sent.json"
 
 
 PASS = 0
@@ -203,16 +213,17 @@ def test_no_repeat():
               ws.get_queue() and ws.get_queue()[0]["due"] > time.time())
 
 
-# ----------------------------- 5. 10/20/50 节拍 -----------------------------
+# ----------------------------- 5. 2/3/5 分钟节拍 -----------------------------
 def test_step_gaps():
-    print("[10/20/50 节拍：队列为空 / 极短到期点兜底]")
+    print("[2/3/5 分钟节拍：队列为空 / 极短到期点兜底]")
     with isolated():
         gaps = []
         for _ in range(4):
             ws.refresh_once()
             c = ws.get_cache()
             gaps.append(round(ws._next_allowed - c["fetched_at"]))
-        check("节拍 10 -> 20 -> 50 -> 10 循环且落盘", gaps == [10, 20, 50, 10])
+        check("节拍 120 -> 180 -> 300 -> 120 循环且落盘",
+              gaps == [120, 180, 300, 120])
         check("build_queue 无到期信息时返回空", ws.build_queue({}, time.time()) == [])
         # 队列空时不连打：next_due 被节拍推到未来
         wm.save_json(ws.WS_CACHE_FILE, {

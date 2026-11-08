@@ -46,6 +46,20 @@ def _bot_self_id(msg):
     return str(sid).strip()
 
 
+def _at_list(at_user):
+    """把 at_user 归一成去重后的号列表：支持单个号、「a,b」字符串、列表/元组/集合。"""
+    if not at_user:
+        return []
+    items = (at_user if isinstance(at_user, (list, tuple, set))
+             else str(at_user).split(","))
+    out = []
+    for u in items:
+        u = str(u).strip()
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
 def _parse_message(raw, self_id):
     """把 OneBot 的 message 拆成 (纯文本, 是否 @ 了机器人)。
 
@@ -362,16 +376,17 @@ class OneBotClient:
     def send_active(self, channel, target_id, text, at_user=None):
         """主动发送（供世界状态监控推送）：直接走 OneBot API（send_group_msg / send_private_msg）。
 
-        at_user：开监控的人。给了就在群消息最前面 @ 他 —— 推送是他要的，
-        回到他头上；私聊没有 @ 概念，忽略。
+        at_user：开监控的人（单个号或号列表）。给了就在群消息最前面逐个 @ ——
+        推送是大家一起要的，回到每个人头上；私聊没有 @ 概念，忽略。
         """
         if self._conn is None or not target_id:
             return False
         if channel == "group":
+            uids = _at_list(at_user)
             message = text
-            if at_user:
-                message = [{"type": "at", "data": {"qq": str(at_user)}},
-                           {"type": "text", "data": {"text": str(text)}}]
+            if uids:
+                message = [{"type": "at", "data": {"qq": u}} for u in uids]
+                message.append({"type": "text", "data": {"text": str(text)}})
             action, params = "send_group_msg", {"group_id": target_id, "message": message}
         elif channel == "private":
             action, params = "send_private_msg", {"user_id": target_id, "message": text}

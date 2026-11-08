@@ -29,6 +29,8 @@ os.environ["WS_AUTO_PRIORITY"] = "0"
 os.environ["WS_ACTIVE_MIN_GAP"] = "0"
 os.environ["WS_SWITCH_FILE"] = os.path.join(TMP, "ws_switches.json")
 os.environ["WS_FILTER_FILE"] = os.path.join(TMP, "ws_filters.json")
+os.environ["WS_AT_FILE"] = os.path.join(TMP, "ws_at_users.json")
+os.environ["WS_SUB_FILE"] = os.path.join(TMP, "ws_subs.json")
 
 import wm
 import worldstate as ws

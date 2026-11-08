@@ -193,6 +193,7 @@ class TestAtBot(unittest.TestCase):
         os.environ["WS_AT_FILE"] = os.path.join(d, "ws_at.json")
         os.environ["WS_SWITCH_FILE"] = os.path.join(d, "ws_sw.json")
         os.environ["WS_FILTER_FILE"] = os.path.join(d, "ws_fl.json")
+        os.environ["WS_SUB_FILE"] = os.path.join(d, "ws_subs.json")
         ws_monitor.LAST_SENT_FILE = Path(d) / "ws_last_sent.json"
         cls._dir = d
 
@@ -289,6 +290,18 @@ class TestAtBot(unittest.TestCase):
         segs = sent[-1]["params"]["message"]
         self.assertEqual(segs[0], {"type": "at", "data": {"qq": "12345"}})
         self.assertEqual(segs[1]["data"]["text"], "警报：新")
+        sent.clear()
+        # 群里多人开了监控：逐个 @，文本段仍只有一条
+        c.send_active("group", 777, "警报：新", at_user=["111", "222"])
+        segs = sent[-1]["params"]["message"]
+        self.assertEqual([s["data"]["qq"] for s in segs if s["type"] == "at"],
+                         ["111", "222"])
+        self.assertEqual(segs[-1], {"type": "text", "data": {"text": "警报：新"}})
+        sent.clear()
+        c.send_active("group", 777, "警报：新", at_user="111,222")
+        segs = sent[-1]["params"]["message"]
+        self.assertEqual([s["data"]["qq"] for s in segs if s["type"] == "at"],
+                         ["111", "222"])
         sent.clear()
         c.send_active("group", 777, "警报：新")
         self.assertEqual(sent[-1]["params"]["message"], "警报：新")

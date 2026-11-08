@@ -139,6 +139,8 @@ def main():
     reset()
     on(M.set_switch, "group", "G8", ["alerts"], True)   # 开关没写发起人 = 会话级
     t("开关注册成会话级订阅", M.subscribers_of("group", "G8") == {"alerts": {""}})
+    t("会话级订阅不 @ 任何人（没有具体发起人）",
+      M.at_users_of("group", "G8") == [])
     t("别人来停自己：返回 False",
       on(M.stop_monitor, "group", "G8", user="u9") is False)
     t("会话级监控还在", M._monitors.get(("group", "G8")) == {"alerts"})
@@ -168,11 +170,14 @@ def main():
     reset()
     on(M.start_monitor, "group", "G7", {"alerts"}, at_user="u1")
     on(M.start_monitor, "group", "G7", {"fissures"}, at_user="u2")
+    t("推送一次 @ 全部开监控的人", M.at_users_of("group", "G7") == ["u1", "u2"])
     t("最近发起人是 u2", M.at_user_of("group", "G7") == "u2")
     on(M.stop_monitor, "group", "G7", user="u2")
-    t("u2 走了改 @ 剩下的 u1", M.at_user_of("group", "G7") == "u1")
+    t("u2 走了只剩 @ u1", M.at_users_of("group", "G7") == ["u1"])
+    t("发起人记录改成 u1", M.at_user_of("group", "G7") == "u1")
     on(M.stop_monitor, "group", "G7", user="u1")
     t("没人了就清掉 @ 记录", M.at_user_of("group", "G7") is None)
+    t("没人了也不 @ 任何人", M.at_users_of("group", "G7") == [])
 
     print("== 10) 指令入口按发言人隔离 ==")
     reset()

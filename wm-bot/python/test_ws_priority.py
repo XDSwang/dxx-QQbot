@@ -13,6 +13,7 @@
 """
 import os
 import sys
+import tempfile
 import time
 from contextlib import ExitStack
 from unittest.mock import patch
@@ -27,6 +28,14 @@ os.environ["WS_PRIORITY_MIN_GAP"] = "0"
 os.environ["WS_PRIORITY_SKIP_IN_FULL"] = "1"
 os.environ["WS_AUTO_PRIORITY"] = "0"
 os.environ["WS_ACTIVE_MIN_GAP"] = "300"
+
+# 会话类落盘文件一律指到临时目录：测试绝不能覆盖本机正在跑的监控设置
+_WS_TMP = tempfile.mkdtemp(prefix="prio_")
+for _k, _n in (("WS_SWITCH_FILE", "ws_switches.json"),
+               ("WS_FILTER_FILE", "ws_filters.json"),
+               ("WS_AT_FILE", "ws_at_users.json"),
+               ("WS_SUB_FILE", "ws_subs.json")):
+    os.environ[_k] = os.path.join(_WS_TMP, _n)
 
 import worldstate as ws
 import ws_monitor as M

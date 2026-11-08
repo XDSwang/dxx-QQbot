@@ -11,11 +11,20 @@
 """
 import os
 import sys
+import tempfile
 import time
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# 会话类落盘文件一律指到临时目录：测试绝不能覆盖本机正在跑的监控设置
+_WS_TMP = tempfile.mkdtemp(prefix="attach_")
+for _k, _n in (("WS_SWITCH_FILE", "ws_switches.json"),
+               ("WS_FILTER_FILE", "ws_filters.json"),
+               ("WS_AT_FILE", "ws_at_users.json"),
+               ("WS_SUB_FILE", "ws_subs.json")):
+    os.environ[_k] = os.path.join(_WS_TMP, _n)
 
 import qq_common as q
 import worldstate as ws
