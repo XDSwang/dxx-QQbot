@@ -480,12 +480,13 @@ def _header(img, d, w, title, subtitle, fonts):
 
 
 def render(text, title="星际战甲 · 世界状态", subtitle=None, footer=True,
-           colors=None):
+           colors=None, foot=None):
     """
     文本 → 卡片 PNG 列表（每项是 bytes）。失败/不可用时返回 None。
     subtitle 不给时自动写「数据源 · 更新时间」，让图自带时间戳。
     超长处理顺序：单栏 → 双栏 → 分页。
     colors: {昵称: RGB}，命中昵称按状态上色（WM 行情卡片用）。
+    foot: 自定义页脚提示；不给就用世界状态那套默认文案。
     """
     fonts = _load_fonts()
     if fonts is None:
@@ -500,8 +501,8 @@ def render(text, title="星际战甲 · 世界状态", subtitle=None, footer=Tru
         foot_txt = ("「文字 WM 物品名」可复制正文；/w 发起聊天指令见本条消息的文字"
                     if footer else None)
     else:
-        foot_txt = ("发「裂缝」「突击」「仲裁」等单词看单栏明细；「计划」看到期时间表。"
-                    if footer else None)
+        foot_txt = ((foot or "发「裂缝」「突击」「仲裁」等单词看单栏明细；"
+                            "「计划」看到期时间表。") if footer else None)
 
     # 先用临时画布做测量
     probe = ImageDraw.Draw(Image.new("RGB", (10, 10), "white"))

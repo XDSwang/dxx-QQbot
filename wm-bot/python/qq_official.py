@@ -98,6 +98,7 @@ try:                       # 可选通道：手机漏拷这个文件也不能让
     import qq_markdown
 except ImportError:        # pragma: no cover - 取决于部署文件是否齐全
     qq_markdown = None
+import drops
 import wm
 
 # ---------------- 覆盖式运行流程日志 ----------------
@@ -979,6 +980,8 @@ def main():
     if auto_n:
         print(f"[official] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "
               f"{ws_monitor.priority_types()}（新条目即时推送）", file=sys.stderr)
+    # 遗物 / 掉落索引：后台预抓一次（首次约 30 秒），之后查询只读本地索引秒回
+    drops.ensure_async()
 
     bot = OfficialBot(appid, secret, handler, api_base=api_base, intents=intents)
     print(f"[official] 官方 QQ 机器人启动，appid={appid}，intents={intents}",

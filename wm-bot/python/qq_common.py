@@ -18,6 +18,7 @@ import time
 import wm
 import worldstate
 import ws_monitor
+import drops
 
 HERE = Path(__file__).resolve().parent
 # 群白名单文件：每行一个群号 / 群 OpenID（# 开头为注释，行内 # 后为备注）。
@@ -130,6 +131,8 @@ _HELP_QUERY_WORDS = (
     "裂缝", "钢铁裂缝", "突击", "仲裁", "入侵", "警报", "活动",
     "商人", "瓦奇娅", "特惠", "电波", "加成",
     "赏金轮换", "赏金", "信条", "终幕", "新闻", "全部", "计划",
+    # 遗物 / 掉落来源（官方中文导出）
+    "遗物", "掉落", "获取",
 )
 
 _HELP_OTHER_WORDS = (
@@ -222,10 +225,12 @@ def _card_warn(msg):
         _card_log(msg)
 
 
-def maybe_image(text, force_image=False, force_text=False, title=None, colors=None):
+def maybe_image(text, force_image=False, force_text=False, title=None, colors=None,
+                foot=None):
     """长文本 → 卡片图片；Pillow/字体缺失、渲染出错都原样返回文本，绝不打断回复。
 
     colors: {昵称: RGB}，只有 WM 行情卡片传，用来给卖家昵称按在线状态上色。
+    foot: 自定义卡片页脚提示（遗物/掉落卡片用自己的指引，不套世界状态那套）。
     渲染失败时写一条节流日志（5 分钟一次），说明缺 Pillow 还是缺中文字体，
     免得手机端「图片和红蓝灰昵称突然都没了」却查不到原因。
     """
@@ -248,7 +253,7 @@ def maybe_image(text, force_image=False, force_text=False, title=None, colors=No
                 + text)
     try:
         pngs = render_card.render(text, title=title or "星际战甲 · 世界状态",
-                                  colors=colors)
+                                  colors=colors, foot=foot)
     except Exception as e:
         _card_warn(f"卡片渲染异常，改发纯文字: {e}")
         return (f"⚠️【图片渲染异常】{e}（render_card 已存在但出错，多为字体/权限）。\n"
@@ -286,17 +291,18 @@ def attach_monitor(text, ctx=None, covered=None):
 
 
 def finalize(text, ctx=None, force_image=False, force_text=False,
-             title=None, attach=True, covered=None, colors=None):
+             title=None, attach=True, covered=None, colors=None, foot=None):
     """统一出口：先捎带监控内容，再按配置渲染成卡片（失败自动退回文字）。
 
     covered：本次查询已包含的栏目；监控内容若全被覆盖就不重复附带。
+    foot：卡片页脚提示（遗物/掉落的卡片要自己的指引文案）。
     """
     if not isinstance(text, str) or not text:
         return text
     if attach:
         text = attach_monitor(text, ctx, covered=covered)
     return maybe_image(text, force_image=force_image,
-                       force_text=force_text, title=title, colors=colors)
+                       force_text=force_text, title=title, colors=colors, foot=foot)
 
 
 def _wm_reply(result, ctx, force_img, force_txt):
@@ -480,6 +486,10 @@ def make_handler(allowed_groups=None, allow_all=False):
         if is_ws_command(q):
             return handle_ws(q, ctx, force_image=force_img,
                              force_text=force_txt)
+        # 遗物 / 掉落来源查询：同样带前缀（或 @机器人）才触发
+        if drops.is_drop_command(q):
+            return handle_drop(q, ctx, force_image=force_img,
+                               force_text=force_txt)
         # WM 查询（wm / zk / 紫卡 / 翻译）：带前缀才触发
         if not is_wm_command(q):
             # 完整指令才算数：一条都没精确命中就当闲聊，静默（不猜、不提示）。
@@ -686,6 +696,15 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
                         covered=set(cmd.get("types") or ()))
     return finalize(worldstate.HELP_TEXT, ctx, force_image=force_image,
                     force_text=force_text, title="星际战甲 · 世界状态指令")
+
+
+def handle_drop(text, ctx=None, force_image=False, force_text=False):
+    """遗物 / 掉落查询的统一入口（数据源与缓存都在 drops 模块里）。"""
+    cmd = drops.parse_command(text)
+    return finalize(drops.format_reply(cmd), ctx,
+                    force_image=force_image, force_text=force_text,
+                    title="星际战甲 · 遗物 / 掉落",
+                    foot="「遗物 后纪B10」看某遗物奖励；「掉落 名称」反查出自哪些遗物。")
 
 
 def _ctx_ids(ctx):

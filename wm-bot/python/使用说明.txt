@@ -46,13 +46,26 @@ python wm.py "/报错 WM Boltor Prime"
 #   每个候选请求仍各自走 3~5 秒节流；只有明确 404 才试下一个，超时/5xx 立即失败。
 #   全部候选 404 会提示改用完整名称，且不启动后台重试（重试也不会变）。
 
+# ---- 遗物 / 掉落来源（官方中文数据）----
+D/XX/遗物 后纪B10                 该虚空遗物四档精炼（完好/卓越/无瑕/光辉）的奖励与概率
+D/XX/遗物 A1                      A1 这个编号分别属于哪些纪（避免查错纪）
+D/XX/掉落 布里斯提卡Prime蓝图      反查它出自哪些遗物（含稀有度与概率）
+D/XX/掉落 布莱顿                  制作材料 / 信用点 / 工时
+# 数据源：DE 官方 PublicExport 中文导出。先取 index_zh.txt.lzma 清单拿最新哈希，
+#   再抓 ExportRelicArcane/Recipes/Resources/Weapons/Warframes/Sentinels/Upgrades_zh.json，
+#   奖励里的 uniqueName 用同批物品表反查中文名（19208 条引用只有 1 条查不到）。
+# 索引落 data/drops.json（约 0.4MB，800 个遗物 / 1474 条配方），查询只读本地、零请求；
+#   7 天过期（WS_DROPS_DAYS 可调），过期后重抓，重抓失败沿用旧索引并在回复里标「N 天前」。
+# 首次构建要顺序抓 8 个文件，同域名 3~5 秒节流，约 30 秒；启动时后台预抓，不卡第一次查询。
+
 # ---- 接入 QQ ----
 # 把 q.qq.com 申请的 appid / secret 填进 data/config.txt，然后 python qq_bot.py。
 # 群里必须【从 @ 列表点选机器人】后发：WM <物品名|中文名> / ZK <武器名> / 翻译 <名称> / /报错 WM <名称>
 #   WM 支持中文名（如 螺钉步枪，先翻英文再查价）；翻译 <名称> 只做名称中英对照
 #   （如 翻译 Boltor / 翻译 螺钉步枪），回复带「英文名 / 中文名」+ 两个 wiki 链接。
 #   首次发「翻译 同步」联网拉全量词库（约 3447 条），之后查询纯本地、不再联网。
-#   注意：wiki 正文（获取方式/锻造材料等）机器人抓不到，请点回复里的链接自己看。
+#   注意：wiki 正文机器人抓不到；「获取方式 / 锻造材料」请用「掉落 名称」查
+#   （官方导出给材料与遗物来源），其余正文点回复里的链接自己看。
 # 白名单 data/groups.txt 填 group_openid（字符串，不是 QQ 显示的数字群号）。
 # 备选 OneBot：把 data/config.txt 里 WM_QQ_BACKEND 改成 onebot、WM_QQ_MODE 改成 server、
 #   WM_QQ_URL 改成监听地址，保存后重跑即可。

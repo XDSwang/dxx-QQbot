@@ -28,6 +28,7 @@ os.environ["WS_SWITCH_FILE"] = os.path.join(TMP, "ws_switches.json")
 os.environ["WS_FILTER_FILE"] = os.path.join(TMP, "ws_filters.json")
 os.environ["WS_AT_FILE"] = os.path.join(TMP, "ws_at_users.json")
 os.environ["WS_SUB_FILE"] = os.path.join(TMP, "ws_subs.json")
+os.environ["WS_PUSH_INTERVAL"] = "0"   # 测试不真睡
 
 import wm
 import worldstate as ws
@@ -194,6 +195,37 @@ def main():
         h("停止监控", ctx1)
     t("1001 停止后只剩 1002 的裂缝",
       M._monitors.get(("group", "GC")) == {"fissures"})
+
+    print("== 11) 推送按栏目分别 @ 人 ==")
+    reset()
+    M._next_probe = 0.0
+    on(M.start_monitor, "group", "G9", {"alerts"}, at_user="u1")
+    on(M.start_monitor, "group", "G9", {"alerts"}, at_user="u3")
+    on(M.start_monitor, "group", "G9", {"fissures"}, at_user="u2")
+    t("同一栏目多人订阅 -> 一起 @", M.at_users_for("group", "G9", "alerts") == ["u1", "u3"])
+    t("另一栏目只 @ 自己要的人", M.at_users_for("group", "G9", "fissures") == ["u2"])
+    t("没人订阅的栏目不 @ 人", M.at_users_for("group", "G9", "sortie") == [])
+    on(M.set_switch, "group", "G9", {"sortie"}, True)
+    t("会话级开关（全群）不 @ 具体人",
+      M.at_users_for("group", "G9", "sortie") == [])
+
+    sent = []
+
+    def _sender_at(ch, tid, text, at_user=None):
+        sent.append((text.splitlines()[0], at_user))
+        return True
+
+    M.set_sender(_sender_at)
+    with patch.object(M.ws, "ensure_fresh", lambda: {}), \
+            patch.object(M.ws, "activity_touch", lambda: None), \
+            patch.object(M, "query_busy", lambda: False), \
+            patch.object(M, "_parts_of",
+                         lambda st, types, key=None: [
+                             ("alerts", "📢 警报（共 1）\n  · 新警报"),
+                             ("fissures", "🌌 裂缝\n  · 地球 灭绝")]):
+        M.push_once()
+    t("一轮两条消息，各 @ 各的订阅者",
+      sent == [("📢 警报（共 1）", ["u1", "u3"]), ("🌌 裂缝", ["u2"])])
 
     print("\n%d/%d 通过" % (ok, total))
     return 0 if ok == total else 1

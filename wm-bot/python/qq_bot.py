@@ -35,6 +35,7 @@ import sys
 
 import config as bot_config
 import qq_common
+import drops
 import wm
 
 
@@ -76,6 +77,8 @@ def _run_onebot():
     if auto_n:
         print(f"[qq_bot] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "
               f"{ws_monitor.priority_types()}（新条目即时推送）", file=sys.stderr)
+    # 遗物 / 掉落索引：后台预抓一次（首次约 30 秒），之后查询只读本地索引秒回
+    drops.ensure_async()
     print(f"[qq_bot] WM→QQ（OneBot {mode}）启动，URL={url}",
           file=sys.stderr)
     if allow_all:

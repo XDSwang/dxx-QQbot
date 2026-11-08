@@ -549,20 +549,37 @@ def my_types(channel, target_id, user):
     return [t for t in ws.TYPES if t in have]
 
 
-def at_users_of(channel, target_id):
-    """本会话所有开过监控的人：推送时全部 @ 上，消息是大家一起要的。
+def at_users_for(channel, target_id, ws_type=None):
+    """这一条推送该 @ 谁。
 
-    只认成员级订阅（空 uid 的会话级订阅没有具体人，跳过）；
-    老数据没有订阅者时退回单个发起人记录，保证升级后照常 @ 得到人。
+    ws_type 给了就【只 @ 订阅了这一栏的人】：
+      - 甲乙都要「警报」→ 同一条警报消息里一起 @ 甲乙（内容相同就一起 @）；
+      - 甲要「警报」、乙要「裂缝」→ 本来就是两条独立消息（推送按栏目拆开串行发），
+        各 @ 各的人，不会把乙 @ 到他要的裂缝消息上。
+    该栏目只有会话级订阅（主推开关 / 自动注册）时没有具体人，不 @ 任何人。
+    ws_type 为 None 时退回「本会话所有订阅者」。
+    老数据没有订阅者表时退回单个发起人记录，保证升级后照常 @ 得到人。
     """
     key = (channel, str(target_id))
     with _lock:
         cols = _subs.get(key) or {}
-        uids = sorted({u for us in cols.values() for u in us if u})
-        if uids:
-            return uids
+        if ws_type is not None:
+            uids = sorted({u for u in (cols.get(ws_type) or ()) if u})
+            if uids:
+                return uids
+            if cols:
+                return []
+        else:
+            uids = sorted({u for us in cols.values() for u in us if u})
+            if uids:
+                return uids
         one = _at_users.get(key)
     return [one] if one else []
+
+
+def at_users_of(channel, target_id):
+    """本会话所有开过监控的人（不分栏目）。"""
+    return at_users_for(channel, target_id, None)
 
 
 
@@ -1229,13 +1246,15 @@ def _push_priority(ch, tid, key, state, prio, now):
         ok = False
         if _sender is not None and now >= _next_probe:
             try:
-                ok = bool(_send_one(ch, tid, x, at_users_of(ch, tid)))
+                ok = bool(_send_one(ch, tid, x, at_users_for(ch, tid, t)))
             except Exception:
                 ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
             _note_probe(ok)
         if ok:
             sent_types.append(t)
             sent_any = True
+            if push_interval():
+                time.sleep(push_interval())   # 排队发：相邻两条之间稍歇，防官方频控
         else:
             failed_parts.append((t, body))
     with _lock:
@@ -1366,7 +1385,7 @@ def push_once():
             ok = False
             if _sender is not None and now >= _next_probe:
                 try:
-                    ok = bool(_send_one(ch, tid, x, at_users_of(ch, tid)))
+                    ok = bool(_send_one(ch, tid, x, at_users_for(ch, tid, t)))
                 except Exception:
                     ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
                 _note_probe(ok)             # 只有真去试了才更新探测时刻
