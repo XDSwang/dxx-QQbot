@@ -166,14 +166,26 @@ _LOCK_HANDLE = None
 
 
 def _lock_fd(f):
-    """OS 级非阻塞文件锁：进程被杀 / 手机重启由系统自动释放，pid 复用不会误判。"""
+    """OS 级非阻塞文件锁：进程被杀 / 手机重启由系统自动释放，pid 复用不会误判。
+
+    返回 False 表示文件系统不支持文件锁（手机共享存储 FUSE 常见），调用方降级为无锁，
+    不能因此拒绝启动；返回 True 表示已拿到锁。
+    """
     if os.name == "nt":
         import msvcrt
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
     else:
         import fcntl
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno not in updater.LOCK_UNSUPPORTED_ERRNOS:
+                raise
+            updater.elog("文件系统不支持文件锁",
+                         "errno=%s，单实例锁降级为无锁" % e.errno)
+            return False
+    return True
 
 
 def acquire_lock():
@@ -188,6 +200,7 @@ def acquire_lock():
                      "本进程已持有实例锁；不要开第二个 run.py")
         return False
     updater.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    updater.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     f = open(str(updater.LOCK_FILE), "a+b")
     try:
         f.seek(0, os.SEEK_END)
@@ -195,12 +208,15 @@ def acquire_lock():
             f.write(b"0")
             f.flush()
         f.seek(0)
-        _lock_fd(f)
+        lock_held = _lock_fd(f)
     except Exception as e:
         f.close()
         updater.elog("已有统一 RUN 在运行",
                      "文件锁被占用：%s；不要开第二个 run.py" % e)
         return False
+    if lock_held is False:
+        f.close()
+        return True          # 降级：无锁继续，异常日志已在 _lock_fd 记下
     f.seek(0)
     f.truncate()
     f.write(str(os.getpid()).encode("ascii"))
@@ -456,10 +472,25 @@ def sync_update_cfg(base, prev_hash, bots):
     return h
 
 
+def _replace_process(argv):
+    """换成本进程的新版本：Windows 的 execv 另起进程会脱离前台控制台，
+    Ctrl+C 传不过去，所以改成前台等待新进程、保持命令行前台链不断；
+    POSIX 仍用 execv 直接替换。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.call(argv)
+        except KeyboardInterrupt:
+            pass          # 收尾交给新进程，旧进程不再重复报异常
+        os._exit(0)
+        return
+    os.execv(argv[0], argv)
+
+
 def restart_self(bots):
     """git pull 改到 run.py / updater.py 时重启本进程，让新逻辑真正生效。
 
-    execv 会替换进程映像，try/finally 不会再跑，所以先停所有服务、放掉单实例锁；
+    换进程后 try/finally 不会再跑，所以先停所有服务、放掉单实例锁；
     失败则补回来，继续用旧进程服务，并留下异常日志。
     """
     if not self_syntax_ok():
@@ -470,8 +501,8 @@ def restart_self(bots):
         b.stop()
     release_lock()
     try:
-        os.execv(sys.executable,
-                 [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
+        _replace_process([sys.executable, str(Path(__file__).resolve())]
+                         + sys.argv[1:])
     except Exception as e:
         updater.elog("重启统一 RUN 失败，继续用当前进程运行", str(e))
         acquire_lock()

@@ -56,7 +56,8 @@ class _Base(unittest.TestCase):
             PACE_FILE=self.state / "pace.json",
             STATE_FILE=self.state / "state.json",
             BACKUP_ROOT=self.state / "backup",
-            LOCK_FILE=self.state / "updater.lock",
+            LOCK_DIR=self.state / "locks",
+            LOCK_FILE=self.state / "locks" / "updater.lock",
             TEMPLATE_PATH=self.template_file,
             SCHEMA_PATH=self.schema_file)
         p2 = mock.patch.multiple(
@@ -349,14 +350,15 @@ class TestSelfRestart(_Base):
         a, _ = self._files()
         a.write_text("def (\n", encoding="utf-8")
         self.assertFalse(run.self_syntax_ok())
-        with mock.patch.object(run.os, "execv") as ex, mock.patch("builtins.print"):
+        with mock.patch.object(run, "_replace_process") as ex, \
+             mock.patch("builtins.print"):
             self.assertFalse(run.restart_self(FakeBot()))
         ex.assert_not_called()
 
     def test_good_code_stops_bot_then_execv(self):
         self._files()
         bot = FakeBot()
-        with mock.patch.object(run.os, "execv") as ex, \
+        with mock.patch.object(run, "_replace_process") as ex, \
              mock.patch.object(run, "release_lock") as rel, \
              mock.patch("builtins.print"):
             self.assertTrue(run.restart_self(bot))
@@ -1606,7 +1608,8 @@ class TestUnattended(_Base):
         self.assertEqual(bs.normalize_host("git@gitee.com:me/p.git"),
                          updater.normalize_host("git@gitee.com:me/p.git"))
         dest = self.root / "public"
-        with mock.patch.object(bs.time, "sleep") as slp:
+        with mock.patch.object(bs, "LOCK_DIR", self.root / "locks"), \
+             mock.patch.object(bs.time, "sleep") as slp:
             bs._pace("https://github.com/me/a.git", dest)
             bs._pace("https://api.github.com/me/b.git", dest)
         pf = dest / "data" / "updater_pace.json"
@@ -1759,6 +1762,108 @@ class TestPrivateUpdateCfg(_Base):
              mock.patch.object(run, "restart_self") as rs:
             self.assertEqual(run.sync_update_cfg(base, h2, {}), h2)
             self.assertEqual(rs.call_count, 0, "读不到就保持现状")
+
+
+class TestPlatformCompat(_Base):
+    """手机 FUSE 不支持 flock、Windows 控制台 Ctrl+C 与 GBK 解码的回归。"""
+
+    def _load_bootstrap(self, root=None):
+        import importlib.util
+        bs_path = (Path(__file__).resolve().parent.parent
+                   / "dxx_private_data" / "bootstrap.py")
+        spec = importlib.util.spec_from_file_location("bs_platform_test", str(bs_path))
+        bs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bs)
+        if root is not None:
+            bs.DATA_CFG_FILE = root / "update.cfg"
+            bs.CONFIG_FILE = root / "bootstrap.cfg"
+        return bs
+
+    @staticmethod
+    def _fake_fcntl(errno=38):
+        import types
+        m = types.ModuleType("fcntl")
+        m.LOCK_EX = 2
+        m.LOCK_NB = 4
+        m.flock = mock.Mock(side_effect=OSError(errno, "Function not implemented"))
+        return m
+
+    def test_pace_lock_unsupported_degrades(self):
+        """手机共享存储 flock 抛 ENOSYS：闸门锁降级为无锁，不崩且记异常日志。"""
+        import tempfile as _tf
+        with _tf.TemporaryFile() as f, \
+             mock.patch.dict(sys.modules, {"fcntl": self._fake_fcntl()}), \
+             mock.patch.object(updater.os, "name", "posix"):
+            self.assertFalse(updater._hold_pace_lock(f))
+        self.assertIn("文件系统不支持文件锁",
+                      (self.state / "updater_error.log").read_text(encoding="utf-8"))
+
+    def test_acquire_lock_unsupported_degrades(self):
+        """单实例锁同样降级：手机不能因为文件锁不支持就拒绝启动。"""
+        run.release_lock()
+        with mock.patch.dict(sys.modules, {"fcntl": self._fake_fcntl()}), \
+             mock.patch.object(updater.os, "name", "posix"):
+            self.assertTrue(run.acquire_lock())
+        self.assertIn("单实例锁降级为无锁",
+                      (self.state / "updater_error.log").read_text(encoding="utf-8"))
+        self.assertIsNone(run._LOCK_HANDLE, "降级时不能假装持有锁")
+
+    def test_lock_dir_shared_by_bootstrap_and_updater(self):
+        """启动器与长期运行用同一处锁目录，跨进程互斥才成立。"""
+        root = Path(__file__).resolve().parent.parent / "dxx_private_data"
+        bs_text = (root / "bootstrap.py").read_text(encoding="utf-8")
+        up_text = (Path(__file__).resolve().parent / "updater.py").read_text(
+            encoding="utf-8")
+        needle = 'LOCK_DIR = Path.home() / ".dxx-updater"'
+        self.assertIn(needle, bs_text, "启动器必须与公共库写死同一处锁目录")
+        self.assertIn(needle, up_text)
+        self.assertEqual(updater.LOCK_FILE.parent, updater.LOCK_DIR)
+        self.assertEqual(updater._pace_lock_path().parent, updater.LOCK_DIR)
+
+    def test_git_cmd_forces_utf8_decoding(self):
+        """git 输出显式按 UTF-8 解码并容错，不再吃 Windows 默认 GBK。"""
+        import types
+        self._git_cmd_patch.stop()
+        try:
+            fake = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+            with mock.patch.object(updater.subprocess, "run",
+                                   return_value=fake) as sr:
+                rc, out, _ = updater.git_cmd(["status"])
+            self.assertEqual((rc, out), (0, "ok"))
+            kw = sr.call_args[1]
+            self.assertEqual(kw.get("encoding"), "utf-8")
+            self.assertEqual(kw.get("errors"), "replace")
+        finally:
+            self._git_cmd_patch.start()
+
+    def test_bootstrap_git_net_forces_utf8_decoding(self):
+        """启动器的 git 出口同样显式 UTF-8，避免首跑就抛解码异常。"""
+        import types
+        bs = self._load_bootstrap(self.root)
+        fake = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(bs, "LOCK_DIR", self.root / "locks"), \
+             mock.patch.object(bs.subprocess, "run", return_value=fake) as sr, \
+             mock.patch.object(bs, "log"):
+            bs.git_net(["status"], "https://example.com/o/pub.git", self.root)
+        kw = sr.call_args[1]
+        self.assertEqual(kw.get("encoding"), "utf-8")
+        self.assertEqual(kw.get("errors"), "replace")
+
+    def test_bootstrap_windows_starts_run_in_foreground(self):
+        """Windows 不再用 execv 另起脱离控制台的进程，Ctrl+C 才传得过去。"""
+        root = Path(__file__).resolve().parent.parent / "dxx_private_data"
+        text = (root / "bootstrap.py").read_text(encoding="utf-8")
+        self.assertIn('if os.name == "nt":', text)
+        self.assertIn("return subprocess.call(argv)", text)
+
+    def test_replace_process_windows_spawns_new_run(self):
+        """run.py 自重启在 Windows 也走前台拉起，不留在 execv 的旧行为。"""
+        with mock.patch.object(run.os, "name", "nt"), \
+             mock.patch.object(run.subprocess, "call", return_value=0) as cl, \
+             mock.patch.object(run.os, "_exit") as ex:
+            run._replace_process(["python", "run.py"])
+        cl.assert_called_once_with(["python", "run.py"])
+        ex.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

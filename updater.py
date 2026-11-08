@@ -41,7 +41,10 @@ FLOW_LOG = STATE_DIR / "updater_flow.log"       # 流程日志：追加式，正
 PACE_FILE = STATE_DIR / "updater_pace.json"     # 同域名节流状态（落盘）
 STATE_FILE = STATE_DIR / "update_state.json"    # 全局指纹（无服务归属时用）
 BACKUP_ROOT = STATE_DIR / "backup"
-LOCK_FILE = STATE_DIR / "updater.lock"
+# 锁单独放用户主目录：手机共享存储（FUSE）不实现 flock，锁放那里会直接崩。
+LOCK_DIR = Path.home() / ".dxx-updater"
+LOCK_FILE = LOCK_DIR / "updater.lock"
+LOCK_UNSUPPORTED_ERRNOS = (9, 13, 22, 38, 95)   # EBADF/EACCES/EINVAL/ENOSYS/EOPNOTSUPP
 
 CONFIG_NAME = "config.txt"                      # 私有地址：机器人真实配置（只存值）
 RUNTIME_NAME = "runtime.json"                   # 私有地址：服务端回写的迁移结果
@@ -134,8 +137,8 @@ def _atomic_write(path, text):
 
 
 def _pace_lock_path():
-    """闸门锁与节流状态同目录同前缀，由统一入口推导，不各模块自己起名。"""
-    return PACE_FILE.with_name(PACE_FILE.name + ".lock")
+    """闸门锁统一放 LOCK_DIR（用户主目录），避开手机共享存储不支持 flock 的位置。"""
+    return LOCK_DIR / (PACE_FILE.name + ".lock")
 
 
 def _hold_pace_lock(f):
@@ -155,7 +158,15 @@ def _hold_pace_lock(f):
                 time.sleep(1)
         return False
     import fcntl
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    except OSError as e:
+        # 手机共享存储（FUSE）不实现 flock：降级为无锁，仍按落盘状态排队
+        if e.errno in LOCK_UNSUPPORTED_ERRNOS:
+            elog("文件系统不支持文件锁",
+                 "errno=%s，节流降级为无锁排队" % e.errno)
+            return False
+        raise
     return True
 
 
@@ -693,7 +704,7 @@ def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
             run_env.update(env)
         r = subprocess.run(["git"] + list(args), cwd=str(cwd) if cwd else None,
                            capture_output=True, text=True, timeout=timeout,
-                           env=run_env)
+                           encoding="utf-8", errors="replace", env=run_env)
         out = r.stdout or ""
         return r.returncode, (out.strip() if strip else out), (r.stderr or "").strip()
     except Exception as e:

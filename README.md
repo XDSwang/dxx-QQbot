@@ -3,7 +3,8 @@
 > 两个仓库分工：**公共库（本仓库）＝代码本体**（代码 + `services.json` 服务清单），
 > **你的私有库 ＝数据**（真实配置值、运行记录、启动器 `bootstrap.py`）。
 > 长期运行的是本仓库根目录的 `run.py`；私有库的 `bootstrap.py` 只在首次部署跑一次，
-> 跑完就 `execv` 成 `run.py`，之后不再常驻。
+> 跑完拉起 `run.py`（手机 / Linux 用 `execv` 替换进程，Windows 用前台等待保证
+> Ctrl+C 能传到），之后不再常驻。
 >
 > 路径一律按**项目根目录相对书写**，本文不写任何盘符，需要绝对路径时自己拼：
 > 私有库根 → `bootstrap.py`、`update.cfg`（真实配置，进私有库 git）、
@@ -67,9 +68,12 @@ python run.py
 
 ### 停止与日志
 
-- `Ctrl+C` 正常退出。不要开第二个 `python run.py`：`data/updater.lock`
-  用系统文件锁拦住（不再靠 pid 猜，手机重启后 pid 复用不会误拒启动）；
-  且同一个 AppID 只能有一条网关长连接。
+- `Ctrl+C` 正常退出；日常请在公共库目录直接跑 `python run.py`，这样停止信号能
+  一路传到服务进程。不要开第二个 `python run.py`：用户主目录
+  `~/.dxx-updater/updater.lock` 用系统文件锁拦住（不再靠 pid 猜，手机重启后
+  pid 复用不会误拒启动）；且同一个 AppID 只能有一条网关长连接。
+  锁所在文件系统不支持 `flock`（手机共享存储常见）时会降级为无锁并记异常日志，
+  不会因此拒绝启动。
 - 流程日志 `data/updater_flow.log`、异常日志 `data/updater_error.log`、
   机器人收发日志 `wm-bot/python/data/bot_flow.log`。
 
@@ -134,14 +138,14 @@ cd bot
 python bootstrap.py
 ```
 
-`bootstrap.py` 只做四件事，然后把自己换成 `run.py`：
+`bootstrap.py` 只做四件事，然后拉起 `run.py`：
 
 1. 克隆 / 更新公共库：主库失败自动改从备用公共库拷，两个都失败才报错；
    目标已有公共库（含 `.git`）时对两个源依次 `pull --ff-only`。
 2. 把私有库根目录的 `update.cfg` **原样拷**到公共库根目录（不生成、不改写）。
 3. 本地没有 `wm-bot/python/data/config.txt` 时，从私有库
    `services/wm-bot/config.txt` 拷一份过来（含真实密钥，不用手工填）。
-4. `execv` 成 `python run.py`，进入上面的「运行流程」。
+4. 拉起 `python run.py`（Windows 前台等待、其余平台 `execv` 替换），进入上面的「运行流程」。
 
 ### 部署完成怎么确认
 
