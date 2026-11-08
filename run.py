@@ -52,12 +52,17 @@ DEFAULTS = {
     "UPDATER_GITEE_BRANCH": "main",
     "UPDATER_GITEE_API": updater.GITEE_API,
     "UPDATER_CODE_REPO": "https://github.com/XDSwang/dxx-QQbot.git",
-    "UPDATER_CODE_REPO_BACKUP": "https://gitee.com/xdswang/dxx-QQbot.git",
+    "UPDATER_CODE_REPO_BACKUP": "git@gitee.com:xdswang/dxx-QQbot.git",
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
-    # code = 信号在公共仓库本体 signals/（默认）；data = 兼容旧的「信号放私有库」布局
-    "UPDATER_SIGNAL_SOURCE": "code",
+    # git = 用 GIT 指令把两个私有库接口都拷贝下来，比版本选最新，拷贝无变化就不更新（默认）；
+    # code / data = 兼容旧的 runN 信号文件布局
+    "UPDATER_SIGNAL_SOURCE": "git",
+    # 两个私有库接口的 git 地址（SSH 已配好，不需要 token）
+    "UPDATER_DATA_REPO": "git@github.com:XDSwang/dxx_private_data.git",
+    "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:xdswang/dxx_private_data.git",
+    "UPDATER_DATA_BRANCH": "main",
     # 同一套代码、不同授权的多台服务端各配一个，数据目录就不会撞在一起
     "UPDATER_DATA_NAMESPACE": "",
     "UPDATER_INSTANCE_ID": "default",
@@ -270,12 +275,19 @@ def preflight(cfg, store, services=None, service_stores=None,
                     problems.append("当前不是 git 仓库：启动时会用 UPDATER_CODE_REPO 自动自举")
                 else:
                     problems.append("当前不是 git 仓库且没配 UPDATER_CODE_REPO，自动同步不可用")
-    signal_place = ("公共仓库 signals/" if
-                    (cfg.get("UPDATER_SIGNAL_SOURCE") or "code").strip().lower() == "code"
-                    else "数据后端")
+    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "git").strip().lower()
+    if source == "git":
+        signal_place = "GIT 双源同步（GitHub + Gitee 私有库）"
+    elif source == "code":
+        signal_place = "公共仓库 signals/"
+    else:
+        signal_place = "数据后端"
+    if source == "git" and not (cfg.get("UPDATER_DATA_REPO") or "").strip() \
+            and not (cfg.get("UPDATER_DATA_REPO_BACKUP") or "").strip():
+        problems.append("GIT 双源同步没配 UPDATER_DATA_REPO / BACKUP，无法拷贝私有库")
     try:
         sig = (root_signals or store).signal()
-        if sig.name == "(missing)":
+        if source != "git" and sig.name == "(missing)":
             problems.append("%s 里没有全局 runN 信号文件（先放一个 run0）"
                             % signal_place)
     except Exception as e:
@@ -307,7 +319,7 @@ def preflight(cfg, store, services=None, service_stores=None,
                 continue
             try:
                 sig = sig_store.signal()
-                if sig.name == "(missing)":
+                if source != "git" and sig.name == "(missing)":
                     problems.append("[%s] %s 里没有 runN 信号文件（先放 run0）"
                                     % (s.name, signal_place))
             except Exception as e:
@@ -382,29 +394,46 @@ def restart_self(bots):
 
 
 def git_pull(cfg):
-    """代码与配置必须同一版：主库 pull 失败自动改从备用公共库（Gitee）拉。
+    """代码同步：用 GIT 指令把两个公共库接口都拷贝下来，比版本用最新的那份。
 
-    两边都失败才算异常，返回信息带「数据拉取异常」供调用方写进异常日志；
-    整次作废，不迁数据、不更新指纹。改的是拉取指令本身，不改 origin 配置。
+    一个接口因网络失败就用拷贝成功的那个继续判断；两个都失败才算
+    「数据拉取异常」，整次作废。本地版本比远端新时不回退、不覆盖本地较新的代码。
     """
     if _off(cfg.get("UPDATER_GIT_PULL", "1")):
         return True, "已关闭"
-    code, out, err = _git(["pull", "--ff-only"])
-    if code == 0:
-        return True, out[:200]
-    primary = (err or out)[:300]
-    backup = (cfg.get("UPDATER_CODE_REPO_BACKUP") or "").strip()
-    if _off(cfg.get("UPDATER_FAILOVER", "1")) or not backup:
-        return False, "%s：git pull 失败（未配备用公共库）| %s" % (
-            updater.DATA_ANOMALY, primary)
     branch = (cfg.get("UPDATER_CODE_BRANCH") or "main").strip()
-    code2, out2, err2 = _git(["pull", "--ff-only", backup, branch])
-    if code2 == 0:
-        updater.flog("代码同步已切换到备用公共库(Gitee)")
-        return True, ("备用库(Gitee): " + (out2 or "无变更"))[:200]
-    updater.flog("主库与备用公共库 git pull 均失败")
-    return False, "%s：主库与备用公共库 git pull 均失败 | %s | %s" % (
-        updater.DATA_ANOMALY, primary, (err2 or out2)[:300])
+    sources = [("主库(GitHub)", "origin")]
+    backup = (cfg.get("UPDATER_CODE_REPO_BACKUP") or "").strip()
+    if not _off(cfg.get("UPDATER_FAILOVER", "1")) and backup:
+        sources.append(("备用库(Gitee)", backup))
+    found = []
+    failures = []
+    for idx, (label, target) in enumerate(sources):
+        code, out, err = _git(["fetch", "--no-tags", target, branch])
+        if code != 0:
+            failures.append("%s: %s" % (label, (err or out)[:200]))
+            updater.flog("[%s] 代码拷贝失败：%s" % (label, (err or out)[:200]))
+            continue
+        c2, sha, _ = _git(["rev-parse", "FETCH_HEAD"])
+        c3, ts, _ = _git(["log", "-1", "--format=%ct", "FETCH_HEAD"])
+        if c2 or c3 or not sha or not ts.isdigit():
+            failures.append("%s: 读不到版本" % label)
+            continue
+        found.append((int(ts), -idx, label, sha))
+    if not found:
+        updater.flog("两个公共库接口的 GIT 拷贝均失败")
+        return False, "%s：主库与备用公共库 git fetch 均失败 | %s" % (
+            updater.DATA_ANOMALY, " | ".join(failures)[:300])
+    ts, _, label, sha = max(found)
+    # 本地新用本地：本地 HEAD 的提交时间不早于远端就不回退
+    lc, lts, _ = _git(["log", "-1", "--format=%ct", "HEAD"])
+    if lc == 0 and lts.isdigit() and int(lts) >= ts:
+        return True, "本地版本已是最新，不回退（%s）" % label
+    code, out, err = _git(["merge", "--ff-only", sha])
+    if code != 0:
+        return False, "%s：%s 拷贝成功但无法快进合并 | %s" % (
+            updater.DATA_ANOMALY, label, (err or out)[:300])
+    return True, ("%s: " % label) + (out or ("已同步到 %s" % sha[:8]))[:200]
 
 
 def sync_code(cfg):
@@ -607,9 +636,10 @@ def main():
         service_stores = {s.name: updater.make_store_chain(cfg, s.remote_path)
                           for s in services}
         # 信号读公共仓库本体，数据读私有后端：10 秒轮询只在真有更新时才打私有库。
-        root_signals = updater.make_signal_store(cfg)
-        signal_stores = {s.name: updater.make_signal_store(cfg, s.remote_path)
-                         for s in services}
+        root_signals = updater.make_signal_store(cfg, chain=root_store)
+        signal_stores = {s.name: updater.make_signal_store(
+            cfg, s.remote_path, chain=service_stores[s.name])
+            for s in services}
     except Exception as e:
         _console("[fatal] 启动装配失败：%s" % e)
         updater.elog("启动装配失败", str(e))

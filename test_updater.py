@@ -62,10 +62,15 @@ class _Base(unittest.TestCase):
         p2 = mock.patch.multiple(
             run, BOT_DATA_DIR=self.data, BOT_CONFIG=self.data / "config.txt",
             CFG_FILE=self.root / "update.cfg", HERE=self.root)
+        # 离线测试：默认禁掉真实 git 拷贝（GitSignalStore 走模块级 git_cmd）
+        p3 = mock.patch.object(updater, "git_cmd",
+                               return_value=(1, "", "offline-test: git disabled"))
         p1.start()
         p2.start()
+        p3.start()
         self.addCleanup(p1.stop)
         self.addCleanup(p2.stop)
+        self.addCleanup(p3.stop)
         self.addCleanup(self.tmp.cleanup)
 
     def store(self):
@@ -368,7 +373,8 @@ class TestPreflight(_Base):
                     "UPDATER_GITHUB_REPO": "你的账号/私有仓库名",
                     "UPDATER_GITHUB_TOKEN": "github_pat_xxxxxxxx",
                     "UPDATER_GITHUB_PATH": "bot-sync",
-                    "UPDATER_GIT_PULL": "0"})
+                    "UPDATER_GIT_PULL": "0",
+                    "UPDATER_SIGNAL_SOURCE": "code"})
         with mock.patch("builtins.print"):
             problems = run.preflight(cfg, self.store())
         text = " ".join(problems)
@@ -580,12 +586,13 @@ class TestMultiService(_Base):
 class TestSignalSeparation(_Base):
     """runN 是公共库的发布指令，不该跟着私有库 PAT 一起走。"""
 
-    def test_default_signal_source_is_public_repo(self):
+    def test_code_signal_source_is_public_repo(self):
         cfg = dict(run.DEFAULTS)
         cfg.update({"UPDATER_BACKEND": "local",
                     "UPDATER_LOCAL_DIR": str(self.remote),
                     "UPDATER_GITHUB_REPO": "me/private",
-                    "UPDATER_GITHUB_TOKEN": "tok"})
+                    "UPDATER_GITHUB_TOKEN": "tok",
+                    "UPDATER_SIGNAL_SOURCE": "code"})
         signals = updater.make_signal_store(cfg)
         data = updater.make_store(cfg, "wm-bot")
         self.assertIsInstance(signals, updater.LocalStore)
@@ -609,7 +616,9 @@ class TestSignalSeparation(_Base):
     def test_no_pat_needed_to_see_a_release(self):
         """私有目录里故意什么都不放：信号照样能判出要更新。"""
         (self.signals / "run1").write_text("1", encoding="utf-8")
-        sig = updater.make_signal_store(dict(run.DEFAULTS)).signal()
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_SIGNAL_SOURCE"] = "code"
+        sig = updater.make_signal_store(cfg).signal()
         self.assertTrue(sig.need_update)
         self.assertEqual(sig.name, "run1")
 
@@ -639,6 +648,7 @@ class TestSignalSeparation(_Base):
         cfg.update({"UPDATER_BACKEND": "local",
                     "UPDATER_LOCAL_DIR": str(self.remote),
                     "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
+                    "UPDATER_SIGNAL_SOURCE": "code",
                     "UPDATER_PUSH_RUNTIME": "0"})
         bot_a, bot_b = FakeBot(), FakeBot()
         with mock.patch.object(run, "load_cfg", return_value=cfg), \
@@ -1106,26 +1116,81 @@ class TestFailover(_Base):
 
 
 class TestGitPullFailover(_Base):
-    """代码同步：git pull 失败自动改从 Gitee 公共库拉，全失败报数据拉取异常。"""
+    """代码同步：两个接口都用 GIT 指令拷贝，比版本用最新的；全失败报数据拉取异常。"""
 
-    def test_primary_pull_failure_falls_back_to_gitee(self):
+    def test_primary_fetch_failure_uses_gitee_copy(self):
         calls = []
 
         def fake(args, timeout=60):
             calls.append(list(args))
-            if len(args) == 2:                      # 主库 git pull --ff-only
+            if args[0] == "fetch":
+                if any("gitee" in a for a in args):
+                    return 0, "", ""
                 return 1, "", "github down"
-            return 0, "Already up to date.", ""
+            if args[0] == "rev-parse":
+                return 0, "GSHA111", ""
+            if args[0] == "log":
+                return 0, ("100" if args[-1] == "HEAD" else "200"), ""
+            if args[0] == "merge":
+                return 0, "Fast-forward", ""
+            return 0, "", ""
 
         with mock.patch.object(run, "_git", side_effect=fake):
             ok, info = run.git_pull(dict(run.DEFAULTS))
         self.assertTrue(ok)
         self.assertIn("备用库(Gitee)", info)
-        self.assertEqual(len(calls), 2)
-        self.assertIn("https://gitee.com/xdswang/dxx-QQbot.git", calls[1])
-        self.assertIn("main", calls[1])
+        fetches = [c for c in calls if c[0] == "fetch"]
+        self.assertEqual(len(fetches), 2, "两个接口都要尝试拷贝")
+        self.assertTrue(any(c[0] == "merge" for c in calls))
 
-    def test_both_pulls_fail_report_data_anomaly(self):
+    def test_newer_gitee_version_is_the_one_merged(self):
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if args[0] == "fetch":
+                return 0, "", ""
+            if args[0] == "rev-parse":
+                n = sum(1 for c in calls if c[0] == "rev-parse")
+                return 0, ("AAA111" if n == 1 else "BBB222"), ""
+            if args[0] == "log":
+                if args[-1] == "HEAD":
+                    return 0, "100", ""
+                n = sum(1 for c in calls if c[0] == "log" and c[-1] != "HEAD")
+                return 0, ("200" if n == 1 else "300"), ""
+            if args[0] == "merge":
+                return 0, "Fast-forward", ""
+            return 0, "", ""
+
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(dict(run.DEFAULTS))
+        self.assertTrue(ok)
+        self.assertIn("备用库(Gitee)", info)
+        merges = [c for c in calls if c[0] == "merge"]
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(merges[0][-1], "BBB222", "必须合并版本更新的那个接口")
+
+    def test_local_newer_than_remote_does_not_roll_back(self):
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if args[0] == "fetch":
+                return 0, "", ""
+            if args[0] == "rev-parse":
+                return 0, "AAA111", ""
+            if args[0] == "log":
+                return 0, ("900" if args[-1] == "HEAD" else "200"), ""
+            return 0, "", ""
+
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(dict(run.DEFAULTS))
+        self.assertTrue(ok)
+        self.assertIn("本地版本已是最新", info)
+        self.assertFalse(any(c[0] == "merge" for c in calls),
+                         "本地比远端新时绝不能回退覆盖")
+
+    def test_both_fetches_fail_report_data_anomaly(self):
         def fake(args, timeout=60):
             return 1, "", "down"
 
@@ -1134,7 +1199,7 @@ class TestGitPullFailover(_Base):
         self.assertFalse(ok)
         self.assertIn(updater.DATA_ANOMALY, info)
 
-    def test_failover_disabled_does_not_try_gitee(self):
+    def test_failover_disabled_only_copies_primary(self):
         calls = []
 
         def fake(args, timeout=60):
@@ -1146,8 +1211,92 @@ class TestGitPullFailover(_Base):
         with mock.patch.object(run, "_git", side_effect=fake):
             ok, info = run.git_pull(cfg)
         self.assertFalse(ok)
-        self.assertEqual(len(calls), 1, "关掉故障转移就不该打第二次 git pull")
+        self.assertEqual(len([c for c in calls if c[0] == "fetch"]), 1)
         self.assertIn(updater.DATA_ANOMALY, info)
+
+
+class TestGitSignalStore(_Base):
+    """更新判断只看 GIT 拷贝结果：比版本、无变化不更新、单源失败降级、全失败报异常。"""
+
+    def _cfg(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_SIGNAL_SOURCE": "git",
+                    "UPDATER_DATA_REPO": "git@github.com:me/private.git",
+                    "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:me/private.git"})
+        return cfg
+
+    def _fake_git(self, results):
+        """results = [(ok, sha, ts)]，按 fetch 顺序给出每个接口的版本。"""
+        seq = iter(results)
+        cur = {"v": None}
+
+        def fake(args, cwd=None, timeout=None):
+            if args[0] == "init":
+                return 0, "", ""
+            if args[0] == "fetch":
+                cur["v"] = next(seq)
+                return (0, "", "") if cur["v"][0] else (1, "", "down")
+            if args[0] == "rev-parse":
+                return (0, cur["v"][1], "") if cur["v"][0] else (1, "", "")
+            if args[0] == "log":
+                return (0, cur["v"][2], "") if cur["v"][0] else (1, "", "")
+            return 0, "", ""
+
+        return fake
+
+    def test_default_source_is_git_not_run_files(self):
+        self.assertIsInstance(updater.make_signal_store(dict(run.DEFAULTS)),
+                              updater.GitSignalStore)
+
+    def test_newer_gitee_version_wins_and_switches_data_backend(self):
+        chain = updater.FailoverStore([object(), object()])
+        store = updater.GitSignalStore(self._cfg(), chain=chain)
+        fake = self._fake_git([(True, "AAA111", "100"),
+                               (True, "BBB222", "300")])
+        with mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertTrue(sig.need_update)
+        self.assertEqual(sig.fingerprint, "BBB222")
+        self.assertEqual(chain.index, 1, "数据读写要跟着版本最新的那个接口")
+
+    def test_copy_without_changes_means_no_update(self):
+        updater.save_state({"last_signal": "AAA111"}, "__global__")
+        store = updater.GitSignalStore(self._cfg())
+        fake = self._fake_git([(True, "AAA111", "100"),
+                               (True, "AAA111", "100")])
+        with mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertFalse(sig.need_update, "拷贝没有内容更新就是不用更新")
+        flow = (self.state / "updater_flow.log").read_text(encoding="utf-8")
+        self.assertIn("拷贝没有内容更新", flow)
+
+    def test_one_interface_fails_use_the_successful_copy(self):
+        chain = updater.FailoverStore([object(), object()])
+        store = updater.GitSignalStore(self._cfg(), chain=chain)
+        fake = self._fake_git([(False, "", ""), (True, "BBB222", "300")])
+        with mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertTrue(sig.need_update)
+        self.assertEqual(sig.fingerprint, "BBB222")
+        self.assertEqual(chain.index, 1)
+
+    def test_both_fail_reports_data_anomaly(self):
+        store = updater.GitSignalStore(self._cfg())
+        fake = self._fake_git([(False, "", ""), (False, "", "")])
+        with mock.patch("builtins.print"),              mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertFalse(sig.need_update)
+        self.assertIn(updater.DATA_ANOMALY,
+                      (self.state / "updater_error.log").read_text(encoding="utf-8"))
+
+    def test_owner_repo_only_config_still_has_a_copy_source(self):
+        cfg = self._cfg()
+        cfg["UPDATER_DATA_REPO"] = ""
+        cfg["UPDATER_DATA_REPO_BACKUP"] = ""
+        cfg["UPDATER_GITHUB_REPO"] = "me/private"
+        store = updater.GitSignalStore(cfg)
+        self.assertEqual(len(store.sources()), 1)
+        self.assertIn("github.com/me/private.git", store.sources()[0][1])
 
 
 if __name__ == "__main__":

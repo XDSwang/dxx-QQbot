@@ -9,34 +9,42 @@
 服务端只跑这一条：`python run.py`
 
 启动后：读 `update.cfg` → 装配数据后端 → 先同步代码（拷贝来的目录没有 `.git` 会自动自举，
-**绝不覆盖本地较新的版本**）→ 按 `services.json` 逐个拉起服务 → 每 10 秒查信号。
-一次 `git pull` 是整仓库的，但只停 / 迁 / 启【被触发的那个服务】；指纹、备份、进程按服务隔离。
+**绝不覆盖本地较新的版本**）→ 按 `services.json` 逐个拉起服务 → 每 10 秒用 GIT 指令
+把两个私有库接口都拷贝下来比版本。代码同步与更新判断都是双接口拷贝，
+但只停 / 迁 / 启【被触发的那个服务】；指纹、备份、进程按服务隔离。
 
 - `services.json`（进 git）：服务清单，以后加服务只加一项，不改 `run.py`。
-- **信号与数据分开**：`runN` 只说明公共库该不该更新，放在公共仓库本体
-  `signals/{runN, <服务名>/runN}`（进 git，随代码 push，**不需要 PAT**）；
-  私有库只放数据 `services/<服务名>/{config.txt, runtime.json, owner.json}`；结构权威
+- **更新判断不再看 `runN` 文件**：每轮用 git 指令把 GitHub / Gitee 两个私有库接口都
+  `fetch` 拷贝下来，比 commit 版本选最新的那份，数据读写也切到同一接口；
+  **拷贝没有内容变化就是不用更新**，本轮直接跳过。一个接口网络失败就用拷贝成功的那个，
+  两个都失败才报「数据拉取异常」。`signals/runN` 仅作历史兼容（`UPDATER_SIGNAL_SOURCE = code`）。
+- 私有库只放数据 `services/<服务名>/{config.txt, runtime.json, owner.json}`；结构权威
   （配置模板 + 迁移规则）在公共仓库 `wm-bot/python/`，随代码同提交，不在私有库。
-  10 秒轮询只读本地信号，真有更新时才访问私有库，服务变多也不会拖慢轮询。
+  只有拷贝判定真有更新时才读配置、迁数据、回写。
 - 配置模板见 `update.cfg.example`；`update.cfg`、`data/`、`remote/` 都不进 git。
 - 首次部署仍要手工放一次 `update.cfg` 和各服务自己的真实配置
   （wm-bot 是 `wm-bot/python/data/config.txt`）：PAT 不能经 git 下发。
 
-⚠️ **代码必须先 push 到公共仓库**：本地提交没推上去，服务端 `git pull` 拉不到新代码；
+⚠️ **代码必须先 push 到公共仓库**：本地提交没推上去，服务端 GIT 双源拷贝也拉不到新代码；
 即使把新版本整个拷过去，自举后本地领先远端，`--ff-only` 会拒绝非快进（不会回退，但也更新不了）。
 
-### 主库挂了自动切 Gitee（故障转移）
+### GIT 双源拷贝 + Gitee 故障转移
 
-- **数据拉取 / 回写**：主库（GitHub）最多 3 轮尝试；单轮超 5 秒记「窗口过长」并回到第一步
-  重新拉取，以本地迁移结果为基准重合并云端独有文件（不冲掉别的设备刚写的数据）。
-  3 轮都失败才自动切到 Gitee 备用私有库，用同样的 3 轮流程继续。主备全失败报
-  **「数据拉取异常」**，本地数据始终完整，最新监控记录不会丢。
-- **代码同步**：`git pull` 失败自动改从 `UPDATER_CODE_REPO_BACKUP`（Gitee 公共库镜像）拉，
-  不改本地 `origin` 配置；两边都失败同样报「数据拉取异常」并作废本轮。
-- 配置见 `update.cfg.example` 的 ①-b 段：Gitee 私有库要填自己的 `access_token`
-  （`UPDATER_GITEE_TOKEN`），没填就不启用备用数据后端；公共库镜像是公开的，pull 不需要凭证。
-- Gitee 与 GitHub 的 Contents API 差异（`access_token` 认证 / 新建用 POST / 更新用 PUT + sha）
-  由 `updater.GiteeStore` 适配，其余 Store 接口与 `GitHubStore` 一致。
+- **更新判断（默认）**：每轮用 `git fetch` 把 GitHub / Gitee 两个私有库接口都拷贝下来，
+  比 commit 版本选最新的那份，数据后端活跃源也切到同一接口；HEAD 与上次处理过的相同
+  （拷贝无内容变化）就返回「不用更新」，本轮直接跳过。一个接口失败用成功的那个，
+  两个都失败记 **「数据拉取异常」**，本地数据保持原样。**不再用 `runN` 信号文件判断**，
+  `signals/` 只作历史兼容（`UPDATER_SIGNAL_SOURCE = code`）。
+- **代码同步**：同样两个接口都 `fetch`，比版本用最新的，本地领先不回退，
+  用 `merge --ff-only` 落地；两边都失败报「数据拉取异常」并作废本轮。不改本地 `origin`。
+- **数据读写的兜底**（Contents API）：主库最多 3 轮，单轮超 5 秒记「窗口过长」并回到
+  第一步重拉，以本地迁移结果为基准重合并云端独有文件；3 轮都失败才切 Gitee 备用私有库
+  再 3 轮。主备全失败报「数据拉取异常」，本地最新监控记录不会丢。
+- 配置见 `update.cfg.example` 的 ①-b / ①-c 段：Gitee 私有库的 Contents API 写回需要
+  `UPDATER_GITEE_TOKEN`；**GIT 双源拷贝走 SSH，不需要任何 token**（`git@gitee.com:...`）。
+  `origin` 保持 GitHub，另加 `gitee` SSH 远端即可双推镜像。
+- Gitee 与 GitHub 的 Contents API 差异（`access_token` 认证 / 新建 POST / 更新 PUT + sha）
+  由 `updater.GiteeStore` 适配；GIT 双源判断由 `updater.GitSignalStore` 负责。
 
 ### 多台服务端 / 多个授权 / 其他平台
 

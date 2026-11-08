@@ -25,11 +25,11 @@ UPDATER_GITHUB_PATH = services
 UPDATER_GITHUB_BRANCH = main
 # UPDATER_GITHUB_API = https://api.github.com
 
-# ---------------- ①-b 故障转移：主库挂了自动切 Gitee ----------------
-# 主库（GitHub）连续 3 轮拉取 / 回写失败（单轮超 5 秒也记「窗口过长」并回到
-# 第一步重新拉），程序自动切到下面这份 Gitee 备用私有库，用同样的 3 轮流程继续；
-# 主备全失败才报「数据拉取异常」，本地数据始终完整不丢。
-# 公共库代码同步同理：git pull 失败自动改从 UPDATER_CODE_REPO_BACKUP 拉。
+# ---------------- ①-b 数据读写：主库 3 轮失败切 Gitee ----------------
+# 这是【数据读写层】的兜底（Contents API）：主库（GitHub）连续 3 轮拉取 / 回写失败
+# （单轮超 5 秒也记「窗口过长」并回到第一步重新拉），自动切到下面这份 Gitee 备用
+# 私有库，用同样的 3 轮流程继续；主备全失败报「数据拉取异常」，本地数据始终完整。
+# 「要不要更新」的判断不在这里，见下面 ①-c 的 GIT 双源拷贝。
 # ⚠️ Gitee 的 access_token 必须自己填，否则备用私有库不启用（仍只报主库失败）。
 #    Gitee 私有库务必是 Private；Contents API 写文件需要 token，公开库也写不了。
 #    主库恢复后把 UPDATER_GITEE_TOKEN 清空即可回到只用主库。
@@ -40,20 +40,35 @@ UPDATER_GITEE_PATH = services
 UPDATER_GITEE_BRANCH = main
 # UPDATER_GITEE_API = https://gitee.com/api/v5
 
+# ---------------- ①-c 更新判断：GIT 双源拷贝（默认） ----------------
+# 不再用 runN 信号文件判断。每轮用 GIT 指令把两个私有库接口都拷贝(fetch)下来：
+#   · 谁的版本新就用谁，数据读写也跟着切到那个接口；
+#   · 拷贝下来没有内容变化（HEAD 没变）就是「不用更新」，本轮直接跳过；
+#   · 一个接口因网络失败，就用拷贝成功的那个继续判断；
+#   · 两个都失败才报「数据拉取异常」，本地数据保持原样；
+#   · 本地版本比远端新时不回退、不覆盖本地。
+# SSH 已配好时直接用 git@ 地址，不需要任何 token；HTTPS 地址也可以（需本机凭证）。
+UPDATER_SIGNAL_SOURCE = git
+UPDATER_DATA_REPO = git@github.com:XDSwang/dxx_private_data.git
+UPDATER_DATA_REPO_BACKUP = git@gitee.com:xdswang/dxx_private_data.git
+UPDATER_DATA_BRANCH = main
+# UPDATER_FAILOVER = 0 可关掉备用接口（只拷贝主库）
+
 # 以后接数据库 / 第三方接口时填这里（当前版本读了也只报「未实现」，不会假装能连）
 # UPDATER_DATA_URL = postgres://... 或 https://your-api/...
 # UPDATER_DATA_TOKEN =
 
 # local 后端才生效：目录里按服务名建子目录，各放 config.txt / runtime.json /
-# owner.json（schema.json 在公共仓库，私有库不存结构文件）。信号不在这里，在公共仓库的 signals/。
+# owner.json（schema.json 在公共仓库，私有库不存结构文件）。更新判断走 ①-c 的 GIT 双源拷贝。
 UPDATER_LOCAL_DIR = remote
 
 # ---------------- ② 公共仓库本体（代码同步） ----------------
-# 首次把整个仓库拷到服务端时若没有 .git，run.py 会用它自动 git init + fetch + checkout；
-# 之后每轮 git pull --ff-only。公开仓库 pull 不需要凭证。
+# 首次把整个仓库拷到服务端时若没有 .git，run.py 会用它自动 git init + fetch；
+# 之后每轮用 GIT 指令把下面两个接口都拷贝下来，比版本用最新的（本地新则不回退）。
+# 一个失败用成功的，两个都失败报「数据拉取异常」。公开仓库拉取不需要凭证。
 UPDATER_CODE_REPO = https://github.com/XDSwang/dxx-QQbot.git
-# 主库 git pull 失败时自动改从这个备用公共库（Gitee 镜像）拉，公开库不需要凭证
-UPDATER_CODE_REPO_BACKUP = https://gitee.com/xdswang/dxx-QQbot.git
+# 备用公共库（Gitee 镜像）；SSH 已配好，也可填 https://gitee.com/xdswang/dxx-QQbot.git
+UPDATER_CODE_REPO_BACKUP = git@gitee.com:xdswang/dxx-QQbot.git
 UPDATER_CODE_BRANCH = main
 # 启动时先自动同步一次（把「拷贝来的旧版」拉到最新，必要时自动重启 RUN）
 UPDATER_SYNC_ON_START = 1
@@ -71,9 +86,9 @@ UPDATER_DATA_NAMESPACE =
 UPDATER_INSTANCE_ID = default
 
 # ---------------- ④ 更新行为 ----------------
-# code = 信号放公共仓库本体 signals/（默认）：10 秒轮询零网络、零 PAT。
-# data = 兼容旧布局：信号仍放私有库（每轮都要打 API，服务多时不推荐）。
-UPDATER_SIGNAL_SOURCE = code
+# git  = 默认：GIT 双源拷贝比版本，拷贝无变化就不更新（见 ①-c，已在上面配好）。
+# code / data = 历史兼容：仍用 runN 信号文件判断，一般不用再选。
+# UPDATER_SIGNAL_SOURCE = git
 UPDATER_POLL_SECONDS = 10
 UPDATER_GIT_PULL = 1
 # structure = 以公共模板为结构基准、私有库真实值为覆盖（默认，安全；新字段留空、未知字段保留）
@@ -86,14 +101,12 @@ UPDATER_CONFIG_MERGE = structure
 UPDATER_PUSH_RUNTIME = 1
 
 # ============================================================
-# 两处文件，职责分开：信号属于公共库发布，数据才属于私有库
+# 两处文件，职责分开：更新判断走 GIT 双源拷贝，数据才属于私有库
 # ------------------------------------------------------------
-# 【公共仓库本体 · 进 git · 不需要任何授权】
-# signals/
-#   run0 / run1                 全局信号：改 run1 = 所有服务端的所有服务一起更新
-#   wm-bot/run0 / run1          本服务信号：只更新这一个服务，不惊动别人
-#   <以后的服务名>/             同样一份，服务名取 services.json 的 remote_path
-# 改完跟代码一起 push；服务端 git pull 后 10 秒内看到，轮询不打私有库。
+# 【更新判断 · 默认 GIT 双源拷贝 · 不需要 PAT】
+# 每轮 fetch 两个私有库接口，比 commit 版本选最新的那份；HEAD 没变就是不用更新。
+# signals/ 里的 runN 只作【历史兼容】：把 UPDATER_SIGNAL_SOURCE 设成 code 才会读它，
+# 默认路径完全不看这些文件，也不再需要手工改 run1 来发布。
 #
 # 【私有仓库 · 只在真正更新时才访问 · 需要 PAT】
 # 私有仓库只存「真实值」；字段结构 / 描述 / 迁移规则在公共仓库（方案 A）。
@@ -123,15 +136,15 @@ UPDATER_PUSH_RUNTIME = 1
 # 启动流程与几个前提
 # ------------------------------------------------------------
 # · 读 update.cfg → 装配数据后端 → 启动先同步代码 → 需要时自动重启 RUN
-#   → 按 services.json 逐个拉起服务 → 每 10 秒读公共仓库 signals/（本地读，
-#   不打私有库）；只有真检测到 run1 才会访问私有库拉配置、迁数据、回写。
-# · git pull 是整仓库一次，但只停 / 迁 / 启【被触发的那个服务】；
+#   → 按 services.json 逐个拉起服务 → 每 10 秒用 GIT 指令双源拷贝私有库比版本；
+#   拷贝有内容更新才拉配置、迁数据、回写；没变化本轮直接跳过。
+# · 代码同步同样两个接口都拷贝、比版本用最新的；只停 / 迁 / 启【被触发的服务】；
 #   指纹、备份、进程按服务隔离，单实例锁全局一份。
-# · 一轮更新失败：整次回滚、照常用旧数据启动，该信号指纹记入 failed_signal，
-#   不会每 10 秒自动重试；修好后改一下 runN 内容或换 run2/run3 再触发。
+# · 一轮更新失败：整次回滚、照常用旧数据启动，该版本指纹记入 failed_signal，
+#   不会每 10 秒自动重试；私有库有新提交才会重新触发。
 # · 启动自检会在控制台直接列出：数据后端还是模板占位值、缺 services.json、
 #   不在 git 仓库且没配 UPDATER_CODE_REPO、没有 git 命令、
-#   公共仓库 signals/ 缺 runN、某服务私有目录缺 config。
+#   没配 UPDATER_DATA_REPO / BACKUP、某服务私有目录缺 config。
 # · 首次部署绕不过去：PAT 不能经 git 下发，服务端要手工放一次 update.cfg，
 #   以及各服务自己的真实配置（wm-bot 是 wm-bot/python/data/config.txt）。
 # · 一个 fine-grained PAT 是【仓库级】权限，不是目录级：多台服务端各跑不同服务时，
@@ -152,6 +165,7 @@ UPDATER_PUSH_RUNTIME = 1
 #   每台各放一份 update.cfg / PAT，用 SERVICES_ENABLED 决定这台跑哪几个服务；
 #   全局 run1 会让所有机器一起更新，这是「统一发布」的预期行为。
 # · 其他平台（Termux / QPython / Linux）：代码零第三方依赖，但 git 是外部命令，
-#   Termux 要先 pkg install git；没有 git 时启动自检会明确提示，服务照常跑、
-#   只是不会自动同步。os.execv 自重启、Path 路径、CRLF 都在这些平台上可用。
+#   Termux 要先 pkg install git；没有 git 时启动自检会提示，GIT 双源拷贝失败会报
+#   「数据拉取异常」，服务照常跑、只是不会自动同步（也可把 UPDATER_SIGNAL_SOURCE
+#   设回 code 用 runN 兼容路径）。os.execv 自重启、Path 路径、CRLF 都可用。
 # ============================================================

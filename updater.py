@@ -3,7 +3,8 @@
 """updater.py — 自动更新的远程读取 / 配置合并 / 运行数据迁移（零第三方依赖）。
 
 私有地址（GitHub 私有仓库）只存【真实值】，结构权威在公共仓库本体：
-  run0 / run1     信号（放公共仓库 signals/，10 秒轮询零网络零 PAT；见 SIGNAL_DIR）
+  更新判断        用 GIT 指令把两个私有库接口都拷贝(fetch)下来，比版本选最新；
+                  拷贝无内容变化 = 不用更新（runN 仅历史兼容，不再作判断依据）
   config.txt      机器人真实配置（只存值；模板 + 描述在公共仓库 wm-bot/python/config.txt）
   runtime.json    服务端回写的「最新完整 + 旧数据迁移」结果（机器维护，用户只读）
 
@@ -20,6 +21,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -30,8 +32,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # 仓库根：公共仓库本体所在目录
 STATE_DIR = HERE / "data"                       # 更新器自身状态（根 .gitignore 已忽略 data/）
-# runN 只说明「公共库该不该更新」，属于代码发布，随 git pull 到每台服务端：
-# 放公共仓库本体里，10 秒轮询零网络、零 PAT，私有库挂了也不影响判断要不要更新。
+# runN 属于旧版发布指令，仅 UPDATER_SIGNAL_SOURCE=code 的历史兼容路径会读：
+# 默认判断走 GitSignalStore 的 GIT 双源拷贝，不再依赖这些文件。
 SIGNAL_DIR = HERE / "signals"
 
 ERROR_LOG = STATE_DIR / "updater_error.log"     # 异常日志：覆盖式，只记异常
@@ -56,6 +58,7 @@ GITEE_API = "https://gitee.com/api/v5"
 DATA_ANOMALY = "数据拉取异常"           # 主库与备用库全失败的统一报告用语
 FAILOVER_MAX_ATTEMPTS = 3                 # 规范 1.1：静默重试最多 3 轮
 FAILOVER_WINDOW = 5.0                    # 单轮超 5 秒视为窗口过长，回到第一步重拉
+GIT_SYNC_TIMEOUT = 60                     # git 拷贝两个接口时单条指令的超时
 CONFIG_KV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
@@ -413,6 +416,12 @@ class FailoverStore(object):
         flog("数据后端切换 → %s" % self.label())
         return True
 
+    def set_index(self, i):
+        """GIT 双源比版本后直接把活跃后端切到最新那份，不必等 3 轮失败。"""
+        if 0 <= i < len(self.stores) and i != self.index:
+            self.index = i
+            flog("数据后端按版本切换 → %s" % self.label())
+
     # Store 接口：全部代理到当前活跃后端
     def refresh(self):
         return self.current.refresh()
@@ -458,14 +467,125 @@ def make_store_chain(cfg, service=None):
     return FailoverStore(stores)
 
 
-def make_signal_store(cfg, service=None):
-    """信号与数据分离：默认读公共仓库本体 signals/，不需要 PAT、不产生 API 调用。
+# --------------------- GIT 双源拷贝：更新判断 ---------------------
+def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT):
+    """跑一条 git 指令，返回 (returncode, stdout, stderr)；失败不抛，交给编排层判。"""
+    try:
+        r = subprocess.run(["git"] + list(args), cwd=str(cwd) if cwd else None,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception as e:
+        return 1, "", str(e)
 
-    全局信号在 signals/runN，每服务信号在 signals/<remote_path>/runN；随代码一起
-    git pull 到每台服务端，所以所有服务端看到的是同一份发布指令。
-    UPDATER_SIGNAL_SOURCE = data 时退回旧布局（信号也放数据后端），便于平滑迁移。
+
+class GitSignalStore(object):
+    """用 GIT 拷贝结果判断更新：两个私有库接口都 fetch 下来，谁的版本新用谁。
+
+    拷贝下来没有内容变化（HEAD 与上次处理过的相同）就是「不用更新」；
+    一个接口因网络失败就用拷贝成功的那个继续判断；两个都失败才记
+    「数据拉取异常」，本地数据保持原样。本地比远端新时不回退、不覆盖本地
+    （数据文件依旧由 Store 的重拉-重合并保护）。选中版本后把后端链切到
+    同一接口，读 / 写都走那份最新的数据。
     """
-    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "code").strip().lower()
+
+    def __init__(self, cfg, service=None, chain=None):
+        self.cfg = cfg
+        self.service = service
+        self.state_key = service or "__global__"
+        self.chain = chain
+        self.branch = (cfg.get("UPDATER_DATA_BRANCH") or "main").strip()
+        self.mirror = STATE_DIR / "gitsync" / self.state_key
+        self.last = None
+
+    def sources(self):
+        pairs = [("主库(GitHub)", self.cfg.get("UPDATER_DATA_REPO")),
+                 ("备用库(Gitee)", self.cfg.get("UPDATER_DATA_REPO_BACKUP"))]
+        out = []
+        for label, url in pairs:
+            url = (url or "").strip()
+            if url:
+                out.append((label, url))
+        if not out:
+            # 老配置只填了 owner/repo：拼成 GitHub 地址，仍能做一次拷贝
+            repo = (self.cfg.get("UPDATER_GITHUB_REPO") or "").strip()
+            if repo and "你的账号" not in repo:
+                out.append(("主库(GitHub)", "https://github.com/%s.git" % repo))
+        return out
+
+    def _ensure_repo(self):
+        if (self.mirror / ".git").exists():
+            return True
+        self.mirror.mkdir(parents=True, exist_ok=True)
+        code, out, err = git_cmd(["init", "--quiet"], cwd=self.mirror)
+        if code != 0:
+            elog("git 同步缓存目录初始化失败", err or out)
+            return False
+        return True
+
+    def sync(self):
+        if not self._ensure_repo():
+            elog(DATA_ANOMALY, "git 缓存目录不可用，两个接口都没拷贝成功")
+            return None
+        found = []
+        for idx, (label, url) in enumerate(self.sources()):
+            code, out, err = git_cmd(["fetch", "--no-tags", url, self.branch],
+                                     cwd=self.mirror)
+            if code != 0:
+                flog("[%s] %s 拷贝失败：%s"
+                     % (self.state_key, label, (err or out)[:200]))
+                continue
+            c2, sha, _ = git_cmd(["rev-parse", "FETCH_HEAD"], cwd=self.mirror)
+            c3, ts, _ = git_cmd(["log", "-1", "--format=%ct", "FETCH_HEAD"],
+                                cwd=self.mirror)
+            if c2 or c3 or not sha or not ts.isdigit():
+                flog("[%s] %s 拷贝成功但读不到版本，跳过" % (self.state_key, label))
+                continue
+            found.append({"label": label, "url": url, "sha": sha,
+                          "ts": int(ts), "index": idx})
+        if not found:
+            elog(DATA_ANOMALY,
+                 "%s：两个接口的 GIT 拷贝均失败（本地数据保持原样）" % self.state_key)
+            return None
+        # 比版本：commit 时间新者优先；同时间优先主库，避免两边来回抖
+        best = max(found, key=lambda x: (x["ts"], -x["index"]))
+        if self.chain is not None and hasattr(self.chain, "set_index"):
+            self.chain.set_index(best["index"])
+        self.last = best
+        flog("[%s] GIT 拷贝成功 %d 个接口，选用 %s 版本 %s"
+             % (self.state_key, len(found), best["label"], best["sha"][:8]))
+        return best
+
+    def signal(self):
+        best = self.sync()
+        if best is None:
+            return Signal("(git-sync-failed)", "none", False)
+        prev = load_state(self.state_key).get("last_signal")
+        changed = best["sha"] != prev
+        if not changed:
+            flog("[%s] 拷贝没有内容更新，本轮不用更新" % self.state_key)
+        return Signal("git:" + best["label"], best["sha"], changed)
+
+    def signals(self):
+        best = self.last or self.sync()
+        if best is None:
+            return []
+        return [("git:" + best["label"], best["sha"])]
+
+    def refresh(self):
+        return self.sync()
+
+
+def make_signal_store(cfg, service=None, chain=None):
+    """更新判断默认走 GIT 双源拷贝，不再看 runN 信号文件。
+
+    git  = 用 git 指令把两个私有库接口都拷贝下来，比版本选最新，拷贝无变化就不更新；
+    code = 兼容旧布局：信号在公共仓库本体 signals/runN；
+    data = 兼容更旧布局：信号与数据都在数据后端。
+    chain 传入时，git 同步选中的接口会同步成为数据后端活跃源。
+    """
+    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "git").strip().lower()
+    if source == "git":
+        return GitSignalStore(cfg, service, chain)
     if source == "data":
         return make_store(cfg, service)
     if source != "code":
