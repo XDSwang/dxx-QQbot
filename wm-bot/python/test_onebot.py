@@ -257,6 +257,45 @@ class TestAtBot(unittest.TestCase):
         c._on_message(FakeConn(), at_other)
         self.assertEqual(sent, [], "@ 别人不该回")
 
+    def test_login_info_fills_self_and_nick(self):
+        """连上自动问 get_login_info：自身号与昵称不用再手填。"""
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c._ask_login_info(FakeConn())
+        self.assertEqual(sent[0]["action"], "get_login_info")
+        c._on_api_resp({"status": "ok", "retcode": 0, "echo": c._login_echo,
+                        "data": {"user_id": 9, "nickname": "自动化服务查询_D/XX/"}})
+        self.assertEqual(c.self_id, "9")
+        self.assertEqual(c.nickname, "自动化服务查询_D/XX/")
+        # 别的 action 的回执不能把自身信息改坏
+        c._on_api_resp({"status": "ok", "retcode": 0, "echo": 987654,
+                        "data": {"user_id": 111, "nickname": "别人"}})
+        self.assertEqual(c.self_id, "9")
+        self.assertEqual(c.nickname, "自动化服务查询_D/XX/")
+
+    def test_auto_nickname_tight_at(self):
+        """自动取到昵称后，明文「@昵称紧贴指令」且事件无 self_id 也能回。"""
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c.handler = qq_bot.make_handler()
+        c.self_id = "9"
+        c.nickname = "自动化服务查询_D/XX/"
+        msg = {"post_type": "message", "message_type": "group", "group_id": 77,
+               "user_id": 5, "message": "@自动化服务查询_D/XX/自检"}
+        c._on_message(FakeConn(), msg)
+        self.assertEqual(len(sent), 1, "自动昵称应能切开紧贴的指令")
+        self.assertIn("[CQ:at,qq=5]", sent[0]["params"]["message"])
+
     def test_monitor_records_at_user(self):
         """@机器人 开监控要记住是谁开的，推送才 @ 得到人；停止监控要连带清掉。"""
         from unittest import mock

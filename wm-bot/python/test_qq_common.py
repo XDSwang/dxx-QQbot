@@ -183,6 +183,12 @@ def main():
     total += 1
     ok += check("配置写简称、实际昵称带后缀时按简称切开",
                 q.strip_mentions("@自动化服务查询_D/XX/平原", "自动化服务查询")[0] == "D/XX/平原")
+    # 7.02) 只认【开头】的 @：句中、句尾 @ 机器人都不算「对着我说」
+    _G = {"channel": "group", "group_id": "G1", "self_id": "9"}
+    total += 1
+    ok += check("句尾 @机器人 不触发免前缀", H("平原 @%s" % NAME, dict(_G)) is None)
+    total += 1
+    ok += check("句中 @机器人 不触发免前缀", H("平原 @%s 自检" % NAME, dict(_G)) is None)
 
     # 7.05) 「@ 的是不是我」判定：官方机器人占位符带叹号、成员不带；号 / 昵称也能对
     GAT = {"channel": "group", "group_id": "G1"}

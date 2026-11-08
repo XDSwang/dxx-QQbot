@@ -39,10 +39,11 @@ WSS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _CQ_AT = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
 
 
-def _bot_self_id(msg):
+def _bot_self_id(msg, fallback=""):
     """机器人自己的 QQ 号：优先事件里的 self_id（OneBot 标准字段），
-    缺失时用 WM_QQ_SELF_ID 兜底（个别实现不填 self_id）。"""
-    sid = msg.get("self_id") or os.environ.get("WM_QQ_SELF_ID") or ""
+    其次 WM_QQ_SELF_ID（个别实现不填 self_id、又没配 get_login_info 时），
+    最后是 fallback（连上时 get_login_info 自动拿到的号）。"""
+    sid = msg.get("self_id") or os.environ.get("WM_QQ_SELF_ID") or fallback or ""
     return str(sid).strip()
 
 
@@ -291,6 +292,10 @@ class OneBotClient:
         self._echo_lock = threading.Lock()
         self._srv = None
         self._conn = None   # 当前活跃连接（供主动发送使用）
+        self._login_echo = None
+        # get_login_info 自动取回的自身信息（不必再手填 WM_QQ_SELF_ID / WM_QQ_BOT_NAME）
+        self.self_id = ""
+        self.nickname = ""
 
     def stop(self):
         self._stop.set()
@@ -378,6 +383,7 @@ class OneBotClient:
     # ---- 收发主循环 ----
     def _loop(self, conn):
         self._conn = conn
+        self._ask_login_info(conn)
         try:
             while not self._stop.is_set():
                 typ, payload = conn.recv_message()
@@ -393,9 +399,47 @@ class OneBotClient:
                     msg = json.loads(payload.decode("utf-8"))
                 except Exception:
                     continue
+                if "post_type" not in msg and "echo" in msg:
+                    self._on_api_resp(msg)   # API 调用回执，不是消息事件
+                    continue
                 self._on_message(conn, msg)
         finally:
             self._conn = None
+
+    def _next_echo(self):
+        with self._echo_lock:
+            self._echo += 1
+            return self._echo
+
+    def _ask_login_info(self, conn):
+        """连上就问一次「我是谁」：OneBot 的 get_login_info 返回 user_id + nickname。
+
+        拿到后「@ 的是不是我」不再依赖消息里的 self_id，明文「@昵称」也能对上，
+        WM_QQ_SELF_ID / WM_QQ_BOT_NAME 都不用再手填。老实现不支持这个 API 时
+        静默跳过（不报错），继续走事件字段与配置兜底。
+        """
+        try:
+            self._login_echo = self._next_echo()
+            conn.send_text(json.dumps(
+                {"action": "get_login_info", "params": {}, "echo": self._login_echo},
+                ensure_ascii=False))
+        except Exception as e:
+            self._login_echo = None
+            print(f"[onebot] 取自身信息失败: {e}", file=sys.stderr)
+
+    def _on_api_resp(self, msg):
+        """API 调用回执（带 echo、没有 post_type）：只认 get_login_info 那一条。"""
+        if self._login_echo is None or msg.get("echo") != self._login_echo:
+            return
+        data = msg.get("data") or {}
+        uid = str(data.get("user_id") or "").strip()
+        nick = str(data.get("nickname") or "").strip()
+        if not uid and not nick:
+            return
+        self.self_id = uid or self.self_id
+        self.nickname = nick or self.nickname
+        bot_config.echo("[onebot] 自身信息：昵称=%r 号=%s"
+                        % (self.nickname or "-", self.self_id or "-"))
 
     def send_active(self, channel, target_id, text, at_user=None):
         """主动发送（供世界状态监控推送）：直接走 OneBot API（send_group_msg / send_private_msg）。
@@ -416,9 +460,7 @@ class OneBotClient:
             action, params = "send_private_msg", {"user_id": target_id, "message": text}
         else:
             return False
-        with self._echo_lock:
-            self._echo += 1
-            e = self._echo
+        e = self._next_echo()
         self._conn.send_text(json.dumps(
             {"action": action, "params": params, "echo": e}, ensure_ascii=False))
         return True
@@ -431,9 +473,9 @@ class OneBotClient:
             return
         # @ 机器人 = 这句话是明确对着我说的：ctx.at_me 亮起来，qq_common 就允许
         # 不带 D/XX/ 前缀；同时把发送者放进 ctx，回复和后续推送都 @ 他。
-        text, at_me = _parse_message(msg.get("message", ""), _bot_self_id(msg))
+        self_id = _bot_self_id(msg, self.self_id)
+        text, at_me = _parse_message(msg.get("message", ""), self_id)
         ats = _at_targets(msg.get("message", ""))
-        self_id = _bot_self_id(msg)
         if not at_me and ats and not self_id:
             # 这个实现连自己的号都不给（事件里没 self_id、也没配 WM_QQ_SELF_ID）：
             # 没法比对，就按「群里有人 @ 了本机器人」处理 —— 宁可多回一句，
@@ -443,6 +485,8 @@ class OneBotClient:
             return
         ctx = dict(msg)
         ctx["at_me"] = at_me
+        ctx["self_id"] = self_id
+        ctx["bot_name"] = self.nickname
         ctx["user_id"] = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
         # 收到就打一行：手机上分不清「机器人没收到」还是「收到了但静默」，全靠这行。
         bot_config.echo("[recv] %s 用户=%s @我=%s at=%s self=%s 文本=%r"
@@ -495,9 +539,7 @@ class OneBotClient:
             action = "send_private_msg"
         else:
             return
-        with self._echo_lock:
-            self._echo += 1
-            e = self._echo
+        e = self._next_echo()
         payload = json.dumps(
             {"action": action, "params": params, "echo": e}, ensure_ascii=False
         )

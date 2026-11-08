@@ -539,7 +539,8 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 有的实现不单发 at 段而是把 @ 混进正文，不剥就会让 D/XX/ 前缀匹配失败。
         # 顺带一句：@ 的正是自己的话，也算「对着我说」，等价于 ctx["at_me"]。
         sid = str(ctx.get("self_id") or "").strip()
-        bot_name = (os.environ.get("WM_QQ_BOT_NAME") or "").strip()
+        # 昵称优先用传输层自动问到的（OneBot get_login_info），再退回配置兜底
+        bot_name = (ctx.get("bot_name") or os.environ.get("WM_QQ_BOT_NAME") or "").strip()
         body, at_marks = strip_mentions(text, bot_name)
         at_me = bool(ctx.get("at_me")) or _mentioned_me(at_marks, sid, bot_name)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
