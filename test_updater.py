@@ -1161,7 +1161,36 @@ class TestGitPullFailover(_Base):
         self.assertTrue(ok)
         self.assertIn("备用库(Gitee)", info)
         fetches = [c for c in calls if c[0] == "fetch"]
-        self.assertEqual(len(fetches), 2, "两个接口都要尝试拷贝")
+        self.assertEqual(len(fetches), 2, "主库(origin)无可派生备选协议，备用库首协议即成功，共 2 次 fetch")
+        self.assertTrue(any(c[0] == "merge" for c in calls))
+
+    def test_primary_https_fails_falls_back_to_ssh_same_repo(self):
+        calls = []
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if args[0] == "fetch":
+                url = args[2] if len(args) > 2 else ""
+                # 主库 HTTPS 失败，但 SSH 备选成功；关掉备用库聚焦协议兜底
+                if url == "git@github.com:mirror/public.git":
+                    return 0, "", ""
+                return 1, "", "https down"
+            if args[0] == "rev-parse":
+                return 0, "SHA111", ""
+            if args[0] == "log":
+                if args[-1] == "HEAD":
+                    return 0, "100", ""      # 本地较旧，需要合并
+                return 0, "300", ""           # FETCH_HEAD 时间
+            if args[0] == "merge":
+                return 0, "Fast-forward", ""
+            return 0, "", ""
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_CODE_REPO"] = "https://github.com/mirror/public.git"
+        cfg["UPDATER_FAILOVER"] = "0"
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(cfg)
+        self.assertTrue(ok)
+        fetches = [c for c in calls if c[0] == "fetch"]
+        self.assertEqual(len(fetches), 2, "主库 HTTPS 失败应改试 SSH 备选，共 2 次 fetch")
         self.assertTrue(any(c[0] == "merge" for c in calls))
 
     def test_newer_gitee_version_is_the_one_merged(self):
@@ -1296,7 +1325,9 @@ class TestGitSignalStore(_Base):
     def test_one_interface_fails_use_the_successful_copy(self):
         chain = updater.FailoverStore([object(), object()])
         store = updater.GitSignalStore(self._cfg(), chain=chain)
-        fake = self._fake_git([(False, "", ""), (True, "BBB222", "300")])
+        # 主库两种协议都失败才走备用库；每个不可达源会多发一次「备选协议」fetch
+        fake = self._fake_git([(False, "", ""), (False, "", ""),
+                               (True, "BBB222", "300")])
         with mock.patch.object(updater, "git_cmd", side_effect=fake):
             sig = store.signal()
         self.assertTrue(sig.need_update)
@@ -1305,7 +1336,9 @@ class TestGitSignalStore(_Base):
 
     def test_both_fail_reports_data_anomaly(self):
         store = updater.GitSignalStore(self._cfg())
-        fake = self._fake_git([(False, "", ""), (False, "", "")])
+        # 两个源各两种协议都失败：共 4 次 fetch 都要给到结果
+        fake = self._fake_git([(False, "", ""), (False, "", ""),
+                               (False, "", ""), (False, "", "")])
         with mock.patch("builtins.print"),              mock.patch.object(updater, "git_cmd", side_effect=fake):
             sig = store.signal()
         self.assertFalse(sig.need_update)
@@ -1320,6 +1353,31 @@ class TestGitSignalStore(_Base):
         store = updater.GitSignalStore(cfg)
         self.assertEqual(len(store.sources()), 1)
         self.assertIn("github.com/me/private.git", store.sources()[0][1])
+
+    def test_primary_protocol_fails_falls_back_to_alternate_same_repo(self):
+        chain = updater.FailoverStore([object(), object()])
+        store = updater.GitSignalStore(self._cfg(), chain=chain)
+        # 主库 SSH 不可达、但 HTTPS 备选可达；备用库两种协议都不可达。
+        # 每个不可达源会多发一次「备选协议」fetch，结果要按 fetch 顺序给够。
+        fake = self._fake_git([(False, "", ""), (True, "AAA111", "100"),
+                               (False, "", ""), (False, "", "")])
+        with mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertTrue(sig.need_update)
+        self.assertEqual(sig.fingerprint, "AAA111")
+        self.assertEqual(chain.index, 0, "主库靠备选协议成功，仍是主库(idx=0)")
+
+    def test_repo_unreachable_on_both_protocols_falls_through_to_next_repo(self):
+        chain = updater.FailoverStore([object(), object()])
+        store = updater.GitSignalStore(self._cfg(), chain=chain)
+        # 主库两种协议都不可达 → 落到备用库（index=1）。
+        fake = self._fake_git([(False, "", ""), (False, "", ""),
+                               (True, "BBB222", "300")])
+        with mock.patch.object(updater, "git_cmd", side_effect=fake):
+            sig = store.signal()
+        self.assertTrue(sig.need_update)
+        self.assertEqual(sig.fingerprint, "BBB222")
+        self.assertEqual(chain.index, 1)
 
 
 class TestGitRepoStore(_Base):
@@ -1864,6 +1922,56 @@ class TestPlatformCompat(_Base):
             run._replace_process(["python", "run.py"])
         cl.assert_called_once_with(["python", "run.py"])
         ex.assert_called_once_with(0)
+
+    def test_derive_alternate_url_both_directions(self):
+        self.assertEqual(updater.derive_alternate_url("https://github.com/me/p.git"),
+                         "git@github.com:me/p.git")
+        self.assertEqual(updater.derive_alternate_url("git@gitee.com:me/p.git"),
+                         "https://gitee.com/me/p.git")
+        self.assertEqual(
+            updater.derive_alternate_url("ssh://git@github.com/me/p.git"),
+            "https://github.com/me/p.git")
+        self.assertEqual(
+            updater.derive_alternate_url("https://gitee.com/a/b/c.git"),
+            "git@gitee.com:a/b/c.git")
+        self.assertEqual(updater.derive_alternate_url("/local/path.git"), "")
+        self.assertEqual(updater.derive_alternate_url("me/p.git"), "")
+        # 往返：HTTPS→SSH→HTTPS 还原
+        https = "https://github.com/me/p.git"
+        self.assertEqual(updater.derive_alternate_url(
+            updater.derive_alternate_url(https)), https)
+
+    def test_bootstrap_derive_alternate_url_both_directions(self):
+        bs = self._load_bootstrap(self.root)
+        self.assertEqual(bs.derive_alternate_url("https://github.com/me/p.git"),
+                         "git@github.com:me/p.git")
+        self.assertEqual(bs.derive_alternate_url("git@gitee.com:me/p.git"),
+                         "https://gitee.com/me/p.git")
+        self.assertEqual(bs.derive_alternate_url("ssh://git@github.com/me/p.git"),
+                         "https://github.com/me/p.git")
+        self.assertEqual(bs.derive_alternate_url("/local/path.git"), "")
+        self.assertEqual(bs.derive_alternate_url("me/p.git"), "")
+
+    def test_bootstrap_clone_tries_alternate_protocol_when_primary_fails(self):
+        import types
+        bs = self._load_bootstrap(self.root)
+        dest = self.root / "public"
+        cfg = dict(bs.DEFAULTS)
+        cfg["PUBLIC_REPO"] = "https://github.com/mirror/public.git"
+        cfg["PUBLIC_REPO_BACKUP"] = "git@gitee.com:mirror/public.git"
+        cfg["PUBLIC_BRANCH"] = "main"
+        tried = []
+        def fake(args, url, dest_dir, cwd=None, timeout=180):
+            tried.append(url)
+            if url == "git@github.com:mirror/public.git":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="https down")
+        with mock.patch.object(bs, "git_net", side_effect=fake), \
+             mock.patch.object(bs, "log"):
+            rc = bs.clone_or_pull(cfg, dest)
+        self.assertTrue(rc)
+        self.assertIn("git@github.com:mirror/public.git", tried,
+                      "主库 HTTPS 克隆失败应改试 SSH 备选")
 
 
 if __name__ == "__main__":

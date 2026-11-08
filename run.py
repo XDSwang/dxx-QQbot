@@ -533,10 +533,21 @@ def git_pull(cfg):
     found = []
     failures = []
     for idx, (label, target) in enumerate(sources):
-        code, out, err = _git(["fetch", "--no-tags", target, branch])
-        if code != 0:
-            failures.append("%s: %s" % (label, (err or out)[:200]))
-            updater.flog("[%s] 代码拷贝失败：%s" % (label, (err or out)[:200]))
+        candidates = [target]
+        alt = updater.derive_alternate_url(target)
+        if alt and alt != target:
+            candidates.append(alt)
+        ok = False
+        for cand in candidates:
+            code, out, err = _git(["fetch", "--no-tags", cand, branch])
+            if code == 0:
+                ok = True
+                break
+            failures.append("%s(%s): %s" % (label, updater.normalize_host(cand),
+                                            (err or out)[:200]))
+            updater.flog("[%s] 代码拷贝失败（%s）：%s"
+                         % (label, updater.normalize_host(cand), (err or out)[:200]))
+        if not ok:
             continue
         c2, sha, _ = _git(["rev-parse", "FETCH_HEAD"])
         c3, ts, _ = _git(["log", "-1", "--format=%ct", "FETCH_HEAD"])

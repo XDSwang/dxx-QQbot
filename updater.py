@@ -122,6 +122,52 @@ def normalize_host(value):
     return host
 
 
+def parse_repo_identity(value):
+    """从 git 地址解析 (host, owner/repo 路径)，把 https 与 ssh 两种写法归一成同一仓库身份。
+
+    支持 https://host/owner/repo(.git) 与 git@host:owner/repo(.git)（含 ssh:// 前缀）；
+    解析不出合法 host + 路径（本地路径 / 裸字符串）返回 None。
+    """
+    s = (value or "").strip()
+    if not s:
+        return None
+    if (len(s) >= 3 and s[1] == ":" and s[0].isalpha()
+            and s[2] in ("\\", "/")) or s.startswith(("/", ".", "~")):
+        return None          # 本地文件系统路径不是 git 地址
+    if "://" in s:
+        rest = s.split("://", 1)[1]
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+        host, _, path = rest.partition("/")
+    elif "@" in s and ":" in s and s.index("@") < s.index(":"):
+        rest = s.split("@", 1)[1]
+        host, _, path = rest.partition(":")
+    else:
+        return None
+    host = host.split(":")[0].lower().rstrip(".")
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not host or path.count("/") < 1:
+        return None
+    return host, path
+
+
+def derive_alternate_url(value):
+    """同一仓库的另一种协议写法：HTTPS ⇄ SSH（含 git@ 与 ssh://）。
+
+    认证各设备自理（SSH 用密钥、HTTPS 用凭据管理器），代码不碰；仅用于
+    「同一仓库自动尝试两种协议」兜底，不依赖设备恰好支持某一种传输。
+    """
+    ident = parse_repo_identity(value)
+    if not ident:
+        return ""
+    host, path = ident
+    if (value or "").strip().startswith("http"):
+        return "git@%s:%s.git" % (host, path)
+    return "https://%s/%s.git" % (host, path)
+
+
 def _read_json(path, fallback):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -462,14 +508,27 @@ class GitRepoStore(object):
         return True
 
     def refresh(self):
-        """把本源最新 commit 拉到专用 ref；不写 FETCH_HEAD，不干扰判断层。"""
+        """把本源最新 commit 拉到专用 ref；不写 FETCH_HEAD，不干扰判断层。
+
+        同一仓库配齐另一种协议兜底：主协议失败自动换一种试，不依赖设备
+        恰好支持某一种传输（SSH 密钥 / HTTPS 凭据各环境自理）。
+        """
         if not self._ensure():
             raise RuntimeError("GIT 数据镜像不可用")
-        code, out, err = git_cmd(
-            ["fetch", "--no-tags", "-f", self.url,
-             "%s:%s" % (self.branch, self.base_ref)], cwd=self.mirror)
-        if code != 0:
-            raise RuntimeError("GIT 拉取失败：%s" % (err or out)[:200])
+        candidates = [self.url]
+        alt = derive_alternate_url(self.url)
+        if alt and alt != self.url:
+            candidates.append(alt)
+        last_err = ""
+        for cand in candidates:
+            code, out, err = git_cmd(
+                ["fetch", "--no-tags", "-f", cand,
+                 "%s:%s" % (self.branch, self.base_ref)], cwd=self.mirror)
+            if code == 0:
+                break
+            last_err = (err or out)[:200]
+        else:
+            raise RuntimeError("GIT 拉取失败：%s" % last_err)
         code, sha, err = git_cmd(["rev-parse", self.base_ref], cwd=self.mirror)
         if code != 0 or not sha:
             raise RuntimeError("GIT 版本读取失败：%s" % (err or "")[:200])
@@ -755,17 +814,35 @@ class GitSignalStore(object):
             return False
         return True
 
+    def _repo_candidates(self, url):
+        """给一个源 URL 配齐另一种协议的等价写法；协议失败自动换一种试。
+
+        同一仓库身份的 HTTPS / SSH 写法都被 normalize_host 归一到同一 host，
+        所以两种协议视作同一源，节流与版本比较不会把它们当两个不同源。
+        """
+        alts = [(url, "主协议")]
+        alt = derive_alternate_url(url)
+        if alt and alt != url and alt not in [a for a, _ in alts]:
+            alts.append((alt, "备用协议"))
+        return alts
+
     def sync(self):
         if not self._ensure_repo():
             elog(DATA_ANOMALY, "git 缓存目录不可用，两个接口都没拷贝成功")
             return None
         found = []
         for idx, (label, url) in enumerate(self.sources()):
-            code, out, err = git_cmd(["fetch", "--no-tags", url, self.branch],
-                                     cwd=self.mirror)
-            if code != 0:
-                flog("[%s] %s 拷贝失败：%s"
-                     % (self.state_key, label, (err or out)[:200]))
+            success_url = None
+            for cand, kind in self._repo_candidates(url):
+                code, out, err = git_cmd(["fetch", "--no-tags", cand, self.branch],
+                                         cwd=self.mirror)
+                if code == 0:
+                    success_url = cand
+                    break
+                flog("[%s] %s（%s）拷贝失败：%s"
+                     % (self.state_key, label, kind, (err or out)[:200]))
+            if success_url is None:
+                flog("[%s] %s 两种协议均拷贝失败，跳过" % (self.state_key, label))
                 continue
             c2, sha, _ = git_cmd(["rev-parse", "FETCH_HEAD"], cwd=self.mirror)
             c3, ts, _ = git_cmd(["log", "-1", "--format=%ct", "FETCH_HEAD"],
@@ -773,7 +850,7 @@ class GitSignalStore(object):
             if c2 or c3 or not sha or not ts.isdigit():
                 flog("[%s] %s 拷贝成功但读不到版本，跳过" % (self.state_key, label))
                 continue
-            found.append({"label": label, "url": url, "sha": sha,
+            found.append({"label": label, "url": success_url, "sha": sha,
                           "ts": int(ts), "index": idx})
         if not found:
             elog(DATA_ANOMALY,
