@@ -4,7 +4,7 @@
 
 私有地址（GitHub 私有仓库）只存【真实值】，结构权威在公共仓库本体：
   更新判断        用 GIT 指令把两个私有库接口都拷贝(fetch)下来，比版本选最新；
-                  拷贝无内容变化 = 不用更新（runN 仅历史兼容，不再作判断依据）
+                  拷贝无内容变化 = 不用更新
   config.txt      机器人真实配置（只存值；模板 + 描述在公共仓库 wm-bot/python/config.txt）
   runtime.json    服务端回写的「最新完整 + 旧数据迁移」结果（机器维护，用户只读）
 
@@ -32,9 +32,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # 仓库根：公共仓库本体所在目录
 STATE_DIR = HERE / "data"                       # 更新器自身状态（根 .gitignore 已忽略 data/）
-# runN / signals/ 属于旧版发布指令，编排层已不再读取；下面的 pick_signal 与
-# LocalStore.signals() 只保留给离线测试与旧布局读取，不参与「要不要更新」的判断。
-# 判断统一走 GitSignalStore 的 GIT 双源拷贝。
+# 下面的 pick_signal 与 LocalStore.signals() 只用于离线测试的假信号源，
+# 不参与「要不要更新」的判断；判断统一走 GitSignalStore 的 GIT 双源拷贝。
 SIGNAL_DIR = HERE / "signals"
 
 ERROR_LOG = STATE_DIR / "updater_error.log"     # 异常日志：覆盖式，只记异常
@@ -273,7 +272,7 @@ class GitHubStore(object):
         self._listing = None
 
     def signal(self):
-        self.refresh()                # 每轮重新列目录，否则永远看不到新的 runN
+        self.refresh()                # 每轮重新列目录，否则看不到信号变化（仅底层能力）
         return pick_signal(self.signals())
 
     def read(self, name):
@@ -579,8 +578,8 @@ class GitSignalStore(object):
 def make_signal_store(cfg, service=None, chain=None):
     """更新判断统一走 GIT 双源拷贝：git fetch 两个私有库接口，比版本选最新。
 
-    UPDATER_SIGNAL_SOURCE 已停用：旧配置里写 code / data / 任意值都不会改变判断方式，
-    runN 信号文件不再参与「要不要更新」。chain 传入时，选中的接口同步成为数据后端活跃源。
+    判断方式固定，旧配置里残留的任何信号源设置都会被忽略。
+    chain 传入时，选中的接口同步成为数据后端活跃源。
     """
     return GitSignalStore(cfg, service, chain)
 

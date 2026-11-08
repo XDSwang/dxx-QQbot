@@ -56,7 +56,7 @@ DEFAULTS = {
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
-    # 判断恒为 GIT 双源拷贝；UPDATER_SIGNAL_SOURCE 已停用，旧配置写了也被忽略
+    # 判断恒为 GIT 双源拷贝，不依赖任何发布标记文件
     # 两个私有库接口的 git 地址（SSH 已配好，不需要 token）
     "UPDATER_DATA_REPO": "git@github.com:XDSwang/dxx_private_data.git",
     "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:xdswang/dxx_private_data.git",
@@ -226,7 +226,7 @@ def _console(msg):
 
 
 def mark_failed(sig, service=None):
-    """失败信号落盘：同一个指纹不再每 10 秒重试（改 runN 内容或换版本号才重试）。"""
+    """失败版本落盘：同一版本不再每 10 秒重试（私有库有新提交才会重试）。"""
     st = updater.load_state(service)
     st["failed_signal"] = sig.fingerprint
     st["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -568,7 +568,7 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
     finally:
         if not succeeded:
             # 失败信号必须落盘：否则每 10 秒轮询会把同一次失败更新重跑一遍。
-            # 修好后改 runN 的内容或换成 run2/run3 产生新指纹才会再触发。
+            # 修好后私有库有新提交、产生新版本指纹才会再触发。
             try:
                 mark_failed(sig, service)
             except Exception as e:

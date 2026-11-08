@@ -14,6 +14,9 @@
 # github   = 用私有仓库文件当数据库（当前实现）
 # local    = 本地目录当数据后端（离线测试 / 内网挂载）
 # database / http = 以后接数据库 / 第三方数据接口，现在只留位，填了会明确报「未实现」
+# ⚠️ 本文件是【数据后端的装配入口】，不是接口本身，别删：以后接数据库 / 第三方接口，
+#    就是在这里换 UPDATER_BACKEND + 填 UPDATER_DATA_URL / UPDATER_DATA_TOKEN，
+#    再按 Store 接口在 updater.make_store 注册一个适配器，服务与迁移逻辑都不用动。
 UPDATER_BACKEND = github
 
 # 私有仓库：必须是【独立 Private 仓库】，不要复用公开图床仓库。
@@ -41,14 +44,14 @@ UPDATER_GITEE_BRANCH = main
 # UPDATER_GITEE_API = https://gitee.com/api/v5
 
 # ---------------- ①-c 更新判断：GIT 双源拷贝（默认） ----------------
-# 不再用 runN 信号文件判断。每轮用 GIT 指令把两个私有库接口都拷贝(fetch)下来：
+# 每轮用 GIT 指令把两个私有库接口都拷贝(fetch)下来：
 #   · 谁的版本新就用谁，数据读写也跟着切到那个接口；
 #   · 拷贝下来没有内容变化（HEAD 没变）就是「不用更新」，本轮直接跳过；
 #   · 一个接口因网络失败，就用拷贝成功的那个继续判断；
 #   · 两个都失败才报「数据拉取异常」，本地数据保持原样；
 #   · 本地版本比远端新时不回退、不覆盖本地。
 # SSH 已配好时直接用 git@ 地址，不需要任何 token；HTTPS 地址也可以（需本机凭证）。
-# 更新判断恒为 GIT 双源拷贝；UPDATER_SIGNAL_SOURCE 已停用，写任何值都不会生效。
+# 更新判断恒为 GIT 双源拷贝，比版本、无变化不更新。
 UPDATER_DATA_REPO = git@github.com:XDSwang/dxx_private_data.git
 UPDATER_DATA_REPO_BACKUP = git@gitee.com:xdswang/dxx_private_data.git
 UPDATER_DATA_BRANCH = main
@@ -86,8 +89,7 @@ UPDATER_DATA_NAMESPACE =
 UPDATER_INSTANCE_ID = default
 
 # ---------------- ④ 更新行为 ----------------
-# 更新判断恒为 ①-c 的 GIT 双源拷贝（比版本、无变化不更新），没有开关可切换；
-# 旧的 UPDATER_SIGNAL_SOURCE / runN 信号文件已停用，配置里写了也会被忽略。
+# 更新判断恒为 ①-c 的 GIT 双源拷贝（比版本、无变化不更新）。
 UPDATER_POLL_SECONDS = 10
 UPDATER_GIT_PULL = 1
 # structure = 以公共模板为结构基准、私有库真实值为覆盖（默认，安全；新字段留空、未知字段保留）
@@ -100,12 +102,11 @@ UPDATER_CONFIG_MERGE = structure
 UPDATER_PUSH_RUNTIME = 1
 
 # ============================================================
-# 两处文件，职责分开：更新判断走 GIT 双源拷贝，数据才属于私有库
+# 两处职责分开：更新判断走 GIT 双源拷贝，数据才属于私有库
 # ------------------------------------------------------------
 # 【更新判断 · 默认 GIT 双源拷贝 · 不需要 PAT】
 # 每轮 fetch 两个私有库接口，比 commit 版本选最新的那份；HEAD 没变就是不用更新。
-# signals/ 里的 runN 是历史遗留文件，编排层不再读取，也没有开关能改回它；
-# 不需要手工改 run1 来发布，私有库有新提交就会触发下一轮更新。
+# 私有库有新提交就会触发下一轮更新，不需要手工改任何发布标记。
 #
 # 【私有仓库 · 只在真正更新时才访问 · 需要 PAT】
 # 私有仓库只存「真实值」；字段结构 / 描述 / 迁移规则在公共仓库（方案 A）。
@@ -165,6 +166,6 @@ UPDATER_PUSH_RUNTIME = 1
 #   任一边有新提交，所有机器下一轮 GIT 拷贝都会看到，这是「统一发布」的预期行为。
 # · 其他平台（Termux / QPython / Linux）：代码零第三方依赖，但 git 是外部命令，
 #   Termux 要先 pkg install git；没有 git 时启动自检会提示，GIT 双源拷贝失败会报
-#   「数据拉取异常」，服务照常跑、只是不会自动同步（没有可回退的 runN 判断路径）。
+#   「数据拉取异常」，服务照常跑、只是不会自动同步。
 #   os.execv 自重启、Path 路径、CRLF 都可用。
 # ============================================================
