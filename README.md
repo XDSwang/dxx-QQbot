@@ -25,6 +25,19 @@
 ⚠️ **代码必须先 push 到公共仓库**：本地提交没推上去，服务端 `git pull` 拉不到新代码；
 即使把新版本整个拷过去，自举后本地领先远端，`--ff-only` 会拒绝非快进（不会回退，但也更新不了）。
 
+### 主库挂了自动切 Gitee（故障转移）
+
+- **数据拉取 / 回写**：主库（GitHub）最多 3 轮尝试；单轮超 5 秒记「窗口过长」并回到第一步
+  重新拉取，以本地迁移结果为基准重合并云端独有文件（不冲掉别的设备刚写的数据）。
+  3 轮都失败才自动切到 Gitee 备用私有库，用同样的 3 轮流程继续。主备全失败报
+  **「数据拉取异常」**，本地数据始终完整，最新监控记录不会丢。
+- **代码同步**：`git pull` 失败自动改从 `UPDATER_CODE_REPO_BACKUP`（Gitee 公共库镜像）拉，
+  不改本地 `origin` 配置；两边都失败同样报「数据拉取异常」并作废本轮。
+- 配置见 `update.cfg.example` 的 ①-b 段：Gitee 私有库要填自己的 `access_token`
+  （`UPDATER_GITEE_TOKEN`），没填就不启用备用数据后端；公共库镜像是公开的，pull 不需要凭证。
+- Gitee 与 GitHub 的 Contents API 差异（`access_token` 认证 / 新建用 POST / 更新用 PUT + sha）
+  由 `updater.GiteeStore` 适配，其余 Store 接口与 `GitHubStore` 一致。
+
 ### 多台服务端 / 多个授权 / 其他平台
 
 - **同授权不会并发**：官方网关 `max_concurrency=1`，本项目 `identify` 写死 `shard [0,1]`，

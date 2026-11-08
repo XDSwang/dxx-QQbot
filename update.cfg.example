@@ -25,6 +25,21 @@ UPDATER_GITHUB_PATH = services
 UPDATER_GITHUB_BRANCH = main
 # UPDATER_GITHUB_API = https://api.github.com
 
+# ---------------- ①-b 故障转移：主库挂了自动切 Gitee ----------------
+# 主库（GitHub）连续 3 轮拉取 / 回写失败（单轮超 5 秒也记「窗口过长」并回到
+# 第一步重新拉），程序自动切到下面这份 Gitee 备用私有库，用同样的 3 轮流程继续；
+# 主备全失败才报「数据拉取异常」，本地数据始终完整不丢。
+# 公共库代码同步同理：git pull 失败自动改从 UPDATER_CODE_REPO_BACKUP 拉。
+# ⚠️ Gitee 的 access_token 必须自己填，否则备用私有库不启用（仍只报主库失败）。
+#    Gitee 私有库务必是 Private；Contents API 写文件需要 token，公开库也写不了。
+#    主库恢复后把 UPDATER_GITEE_TOKEN 清空即可回到只用主库。
+UPDATER_FAILOVER = 1
+UPDATER_GITEE_REPO = 你的Gitee账号/dxx_private_data
+UPDATER_GITEE_TOKEN =
+UPDATER_GITEE_PATH = services
+UPDATER_GITEE_BRANCH = main
+# UPDATER_GITEE_API = https://gitee.com/api/v5
+
 # 以后接数据库 / 第三方接口时填这里（当前版本读了也只报「未实现」，不会假装能连）
 # UPDATER_DATA_URL = postgres://... 或 https://your-api/...
 # UPDATER_DATA_TOKEN =
@@ -37,6 +52,8 @@ UPDATER_LOCAL_DIR = remote
 # 首次把整个仓库拷到服务端时若没有 .git，run.py 会用它自动 git init + fetch + checkout；
 # 之后每轮 git pull --ff-only。公开仓库 pull 不需要凭证。
 UPDATER_CODE_REPO = https://github.com/XDSwang/dxx-QQbot.git
+# 主库 git pull 失败时自动改从这个备用公共库（Gitee 镜像）拉，公开库不需要凭证
+UPDATER_CODE_REPO_BACKUP = https://gitee.com/xdswang/dxx-QQbot.git
 UPDATER_CODE_BRANCH = main
 # 启动时先自动同步一次（把「拷贝来的旧版」拉到最新，必要时自动重启 RUN）
 UPDATER_SYNC_ON_START = 1

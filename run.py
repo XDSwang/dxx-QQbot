@@ -44,7 +44,15 @@ DEFAULTS = {
     "UPDATER_GITHUB_PATH": "services",
     "UPDATER_GITHUB_BRANCH": "main",
     "UPDATER_GITHUB_API": updater.GITHUB_API,
+    # 故障转移：主库 3 轮失败后自动切 Gitee，全失败报「数据拉取异常」
+    "UPDATER_FAILOVER": "1",
+    "UPDATER_GITEE_REPO": "",
+    "UPDATER_GITEE_TOKEN": "",
+    "UPDATER_GITEE_PATH": "services",
+    "UPDATER_GITEE_BRANCH": "main",
+    "UPDATER_GITEE_API": updater.GITEE_API,
     "UPDATER_CODE_REPO": "https://github.com/XDSwang/dxx-QQbot.git",
+    "UPDATER_CODE_REPO_BACKUP": "https://gitee.com/xdswang/dxx-QQbot.git",
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
@@ -374,13 +382,29 @@ def restart_self(bots):
 
 
 def git_pull(cfg):
-    """代码与配置必须同一版：pull 失败就整次作废，不迁数据、不更新指纹。"""
+    """代码与配置必须同一版：主库 pull 失败自动改从备用公共库（Gitee）拉。
+
+    两边都失败才算异常，返回信息带「数据拉取异常」供调用方写进异常日志；
+    整次作废，不迁数据、不更新指纹。改的是拉取指令本身，不改 origin 配置。
+    """
     if _off(cfg.get("UPDATER_GIT_PULL", "1")):
         return True, "已关闭"
     code, out, err = _git(["pull", "--ff-only"])
-    if code != 0:
-        return False, (err or out)[:300]
-    return True, out[:200]
+    if code == 0:
+        return True, out[:200]
+    primary = (err or out)[:300]
+    backup = (cfg.get("UPDATER_CODE_REPO_BACKUP") or "").strip()
+    if _off(cfg.get("UPDATER_FAILOVER", "1")) or not backup:
+        return False, "%s：git pull 失败（未配备用公共库）| %s" % (
+            updater.DATA_ANOMALY, primary)
+    branch = (cfg.get("UPDATER_CODE_BRANCH") or "main").strip()
+    code2, out2, err2 = _git(["pull", "--ff-only", backup, branch])
+    if code2 == 0:
+        updater.flog("代码同步已切换到备用公共库(Gitee)")
+        return True, ("备用库(Gitee): " + (out2 or "无变更"))[:200]
+    updater.flog("主库与备用公共库 git pull 均失败")
+    return False, "%s：主库与备用公共库 git pull 均失败 | %s | %s" % (
+        updater.DATA_ANOMALY, primary, (err2 or out2)[:300])
 
 
 def sync_code(cfg):
@@ -462,7 +486,7 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
 
         backup_dir = str(updater.backup_root(service) /
                          (time.strftime("%Y%m%d-%H%M%S") + "-%d" % os.getpid()))
-        bundle = updater.fetch_bundle(store)
+        bundle = updater.fetch_bundle_failover(store, service)
         schema = bundle["schema"]
         cloud = bundle["runtime"]
         names = set(runtime_files) | set(cloud) | set(schema.get("files") or {})
@@ -502,7 +526,7 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
                                  % (service or "default", owner),
                                  "本实例=%s；给两台服务端各配 UPDATER_DATA_NAMESPACE" % instance)
                 else:
-                    updater.push_runtime(store, migrated, schema, service)
+                    updater.push_runtime_failover(store, migrated, schema, service)
             except Exception as e:
                 updater.elog("[%s] 运行数据回写失败（服务端本地已迁移完成）"
                              % (service or "default"), str(e))
@@ -579,8 +603,8 @@ def main():
         return 1
     try:
         services = enabled_services(load_services(), cfg)
-        root_store = updater.make_store(cfg)
-        service_stores = {s.name: updater.make_store(cfg, s.remote_path)
+        root_store = updater.make_store_chain(cfg)
+        service_stores = {s.name: updater.make_store_chain(cfg, s.remote_path)
                           for s in services}
         # 信号读公共仓库本体，数据读私有后端：10 秒轮询只在真有更新时才打私有库。
         root_signals = updater.make_signal_store(cfg)

@@ -877,5 +877,278 @@ class TestPushRuntimeRebase(_Base):
         self.assertFalse(ok, "持续冲突 / 失败应返回 False 并报「私有库异常」")
 
 
+class TestGiteeStore(unittest.TestCase):
+    """Gitee 备用后端：把与 GitHub 的三处 API 差异都验证到，不联网。"""
+
+    def test_new_file_uses_post_existing_uses_put_with_sha(self):
+        calls = []
+        listing = []
+
+        def fake(method, url, body=None):
+            calls.append((method, url, body))
+            if method == "GET":
+                return list(listing)
+            return {"ok": True}
+
+        s = updater.GiteeStore("me/private", "gtok", "wm-bot")
+        s._api = fake
+        s.write("runtime.json", '{"x": 1}')      # 目录里没有 → POST 新建
+        self.assertEqual(calls[-1][0], "POST")
+        self.assertNotIn("sha", calls[-1][2])
+        listing.append({"name": "runtime.json", "sha": "GSHA", "content": _b64("{}")})
+        s.refresh()
+        s.write("runtime.json", '{"x": 2}')      # 已存在 → PUT + 当前 sha
+        self.assertEqual(calls[-1][0], "PUT")
+        self.assertEqual(calls[-1][2]["sha"], "GSHA")
+        self.assertEqual(base64.b64decode(calls[-1][2]["content"]).decode("utf-8"),
+                         '{"x": 2}')
+
+    def test_access_token_in_query_and_gitee_host_pacing(self):
+        seen = {}
+
+        def fake_pace(host):
+            seen["host"] = host
+
+        class R(object):
+            def read(self):
+                return b"[]"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["headers"] = dict(req.header_items())
+            return R()
+
+        s = updater.GiteeStore("me/private", "tok with space", "wm-bot")
+        with mock.patch.object(updater, "pace_gate", side_effect=fake_pace), \
+             mock.patch.object(updater.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            s._dir()
+        self.assertEqual(seen["host"], "gitee.com", "节流必须按 gitee.com 域名")
+        self.assertIn("access_token=tok%20with%20space", seen["url"])
+        self.assertNotIn("Authorization", seen["headers"],
+                         "Gitee 不认 Bearer，认证只能走 access_token")
+
+    def test_listing_without_content_falls_back_to_single_file_get(self):
+        gets = []
+
+        def fake(method, url, body=None):
+            gets.append(url)
+            if "contents/wm-bot?" in url:
+                return [{"name": "config.txt", "sha": "S1"}]   # Gitee 目录列表不带 content
+            return {"name": "config.txt", "sha": "S1", "content": _b64("K = 9")}
+
+        s = updater.GiteeStore("me/private", "gtok", "wm-bot")
+        s._api = fake
+        self.assertEqual(s.read("config.txt"), "K = 9")
+        self.assertEqual(len(gets), 2, "列目录没带 content 时要再 GET 一次单文件")
+
+
+class TestFailover(_Base):
+    """主库 3 轮失败 → 自动切 Gitee → 全失败报「数据拉取异常」。"""
+
+    def test_backup_store_created_only_when_token_is_set(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "github", "UPDATER_GITHUB_REPO": "me/private",
+                    "UPDATER_GITHUB_TOKEN": "tok"})
+        self.assertEqual(len(updater.make_store_chain(cfg, "wm-bot").stores), 1,
+                         "没填 Gitee token 就只有主库，行为与旧版一致")
+        cfg.update({"UPDATER_GITEE_REPO": "me/gitee-private",
+                    "UPDATER_GITEE_TOKEN": "gtok"})
+        chain = updater.make_store_chain(cfg, "wm-bot")
+        self.assertEqual(len(chain.stores), 2)
+        self.assertIsInstance(chain.stores[1], updater.GiteeStore)
+        self.assertIn("/contents/services/wm-bot?", chain.stores[1]._url())
+        cfg["UPDATER_FAILOVER"] = "0"
+        self.assertEqual(len(updater.make_store_chain(cfg, "wm-bot").stores), 1,
+                         "关掉故障转移就不装配备用库")
+
+    def test_fetch_switches_to_gitee_after_three_primary_failures(self):
+        class Primary(object):
+            def __init__(self):
+                self.reads = 0
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                self.reads += 1
+                raise RuntimeError("github down")
+
+        class Backup(object):
+            def __init__(self):
+                self.reads = 0
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                self.reads += 1
+                return "{}" if name == updater.RUNTIME_NAME else "K = 1"
+
+        primary, backup = Primary(), Backup()
+        fs = updater.FailoverStore([primary, backup])
+        bundle = updater.fetch_bundle_failover(fs, service="wm-bot")
+        self.assertEqual(bundle["config"], "K = 1")
+        self.assertEqual(primary.reads, 3, "主库必须试满 3 轮才允许切换")
+        self.assertEqual(backup.reads, 2)
+        self.assertEqual(fs.label(), "备用库(Gitee)")
+
+    def test_fetch_all_fail_reports_data_anomaly(self):
+        class Dead(object):
+            def __init__(self):
+                self.reads = 0
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                self.reads += 1
+                raise RuntimeError("down")
+
+        a, b = Dead(), Dead()
+        fs = updater.FailoverStore([a, b])
+        with self.assertRaises(RuntimeError) as ctx, \
+             mock.patch("builtins.print"):
+            updater.fetch_bundle_failover(fs, service="wm-bot")
+        self.assertEqual(str(ctx.exception), updater.DATA_ANOMALY)
+        self.assertEqual(a.reads, 3)
+        self.assertEqual(b.reads, 3)
+        self.assertIn(updater.DATA_ANOMALY,
+                      (self.state / "updater_error.log").read_text(encoding="utf-8"))
+
+    def test_push_switches_to_gitee_after_three_primary_failures(self):
+        class Store(object):
+            def __init__(self, fail_times=0):
+                self.fail_times = fail_times
+                self.writes = 0
+                self.last = None
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                return json.dumps({"ws_subs.json": {"version": 1}})
+
+            def write(self, name, text):
+                self.writes += 1
+                if self.writes <= self.fail_times:
+                    raise RuntimeError("github down")
+                self.last = text
+
+        primary, backup = Store(fail_times=99), Store()
+        fs = updater.FailoverStore([primary, backup])
+        ok = updater.push_runtime_failover(fs, {"ws_subs.json": {"version": 2}},
+                                           schema={}, service="wm-bot")
+        self.assertTrue(ok)
+        self.assertEqual(primary.writes, 3, "主库 3 轮回写都失败")
+        self.assertIsNotNone(backup.last, "切到 Gitee 后回写成功")
+        self.assertEqual(fs.index, 1)
+
+    def test_push_all_fail_reports_data_anomaly(self):
+        class Dead(object):
+            def __init__(self):
+                self.writes = 0
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                return "{}"
+
+            def write(self, name, text):
+                self.writes += 1
+                raise RuntimeError("down")
+
+        a, b = Dead(), Dead()
+        fs = updater.FailoverStore([a, b])
+        with mock.patch("builtins.print"):
+            ok = updater.push_runtime_failover(fs, {"a.json": {}},
+                                               schema={}, service="wm-bot")
+        self.assertFalse(ok)
+        self.assertEqual(a.writes, 3)
+        self.assertEqual(b.writes, 3)
+        self.assertIn(updater.DATA_ANOMALY,
+                      (self.state / "updater_error.log").read_text(encoding="utf-8"))
+
+    def test_slow_write_is_logged_as_window_overrun(self):
+        class Slow(object):
+            def __init__(self):
+                self.writes = 0
+
+            def refresh(self):
+                pass
+
+            def read(self, name):
+                return "{}"
+
+            def write(self, name, text):
+                self.writes += 1
+                raise RuntimeError("slow")
+
+        import time as _time
+        seq = iter([0, 6, 10, 16, 20, 26])
+        fake_time = mock.Mock()
+        fake_time.time = mock.Mock(side_effect=lambda: next(seq))
+        fake_time.strftime = _time.strftime
+        store = Slow()
+        with mock.patch.object(updater, "time", fake_time):
+            ok = updater.push_runtime(store, {"a.json": {}}, service="wm-bot")
+        self.assertFalse(ok)
+        self.assertEqual(store.writes, 3)
+        flow = (self.state / "updater_flow.log").read_text(encoding="utf-8")
+        self.assertIn("窗口过长", flow, "单轮超 5 秒必须记「窗口过长」并回到第一步重拉")
+
+
+class TestGitPullFailover(_Base):
+    """代码同步：git pull 失败自动改从 Gitee 公共库拉，全失败报数据拉取异常。"""
+
+    def test_primary_pull_failure_falls_back_to_gitee(self):
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if len(args) == 2:                      # 主库 git pull --ff-only
+                return 1, "", "github down"
+            return 0, "Already up to date.", ""
+
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(dict(run.DEFAULTS))
+        self.assertTrue(ok)
+        self.assertIn("备用库(Gitee)", info)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("https://gitee.com/xdswang/dxx-QQbot.git", calls[1])
+        self.assertIn("main", calls[1])
+
+    def test_both_pulls_fail_report_data_anomaly(self):
+        def fake(args, timeout=60):
+            return 1, "", "down"
+
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(dict(run.DEFAULTS))
+        self.assertFalse(ok)
+        self.assertIn(updater.DATA_ANOMALY, info)
+
+    def test_failover_disabled_does_not_try_gitee(self):
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            return 1, "", "down"
+
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_FAILOVER"] = "0"
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(cfg)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1, "关掉故障转移就不该打第二次 git pull")
+        self.assertIn(updater.DATA_ANOMALY, info)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

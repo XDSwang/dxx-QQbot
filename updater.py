@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -51,6 +52,10 @@ SIGNAL_RE = re.compile(r"^run(\d+)$")
 POLL_SECONDS = 10
 HOST_GAP_SECONDS = 3.5                           # 写死：落在规范的 3~5 秒区间内
 GITHUB_API = "https://api.github.com"
+GITEE_API = "https://gitee.com/api/v5"
+DATA_ANOMALY = "数据拉取异常"           # 主库与备用库全失败的统一报告用语
+FAILOVER_MAX_ATTEMPTS = 3                 # 规范 1.1：静默重试最多 3 轮
+FAILOVER_WINDOW = 5.0                    # 单轮超 5 秒视为窗口过长，回到第一步重拉
 CONFIG_KV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
@@ -223,8 +228,11 @@ class GitHubStore(object):
             base += "/" + suffix
         return base + ("?ref=" + self.branch)
 
+    def _pace_host(self):
+        return urllib.parse.urlparse(self.api).netloc
+
     def _api(self, method, url, body=None):
-        pace_gate("api.github.com")
+        pace_gate(self._pace_host())
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Authorization": "Bearer " + self.token,
@@ -288,6 +296,52 @@ class GitHubStore(object):
         self._listing = None
 
 
+class GiteeStore(GitHubStore):
+    """Gitee 备用数据后端：Contents API 形状与 GitHub 相同，但三处语义不同。
+
+    - 认证用 access_token 查询参数，不认 Authorization: Bearer；
+    - 新建文件是 POST，已存在文件才用 PUT（GitHub 两者都是 PUT）；
+    - 更新同样要带当前文件 sha 判并发改写。
+    只作为故障转移备用库，由编排层在「主库试满 3 轮」后 advance() 切过来。
+    """
+
+    def __init__(self, repo, token, path="", branch="main", api=GITEE_API):
+        GitHubStore.__init__(self, repo, token, path, branch, api)
+
+    def _api(self, method, url, body=None):
+        pace_gate(self._pace_host())
+        sep = "&" if "?" in url else "?"
+        url = "%s%saccess_token=%s" % (url, sep, urllib.parse.quote(self.token))
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Accept": "application/json",
+            "User-Agent": "wm-bot-updater",
+            "Content-Type": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+
+    def write(self, name, text):
+        # 新建用 POST、更新用 PUT；sha 不匹配（并发改写）会报错，同样不自行重试
+        # 同内容，交由 push_runtime 重拉-重合并，避免用旧快照冲掉别人的更新。
+        listing = self._dir()
+        body = {"message": "updater: migrated runtime data",
+                "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                "branch": self.branch}
+        method = "PUT"
+        if name in listing:
+            body["sha"] = listing[name]["sha"]
+        else:
+            method = "POST"
+        self._api(method, self._url(name), body)
+        self._listing = None
+
+
 def make_store(cfg, service=None):
     """按配置造【数据后端】；service 给定时自动切到该服务在私有仓库里的子目录。
 
@@ -308,6 +362,15 @@ def make_store(cfg, service=None):
                            path,
                            cfg.get("UPDATER_GITHUB_BRANCH", "main"),
                            cfg.get("UPDATER_GITHUB_API", GITHUB_API))
+    if kind == "gitee":
+        path = (cfg.get("UPDATER_GITEE_PATH") or "").strip().strip("/")
+        for part in parts:
+            path = (path + "/" + part) if path else part
+        return GiteeStore(cfg.get("UPDATER_GITEE_REPO"),
+                          cfg.get("UPDATER_GITEE_TOKEN"),
+                          path,
+                          cfg.get("UPDATER_GITEE_BRANCH", "main"),
+                          cfg.get("UPDATER_GITEE_API", GITEE_API))
     if kind == "local":
         root = Path(cfg.get("UPDATER_LOCAL_DIR") or str(HERE / "remote"))
         for part in parts:
@@ -318,6 +381,81 @@ def make_store(cfg, service=None):
             "数据后端 %s 尚未实现：请按 Store 接口加适配器，"
             "地址 / 凭证填 UPDATER_DATA_URL / UPDATER_DATA_TOKEN" % kind)
     raise ValueError("未知的 UPDATER_BACKEND: %s" % kind)
+
+
+class FailoverStore(object):
+    """主 → 备（Gitee）数据后端链：同一时刻只用一个活跃后端。
+
+    为什么不在 read/write 里自动切：主库必须试满 3 轮（含 5 秒窗口判定）才允许
+    换 Gitee，否则一次网络抖动就跳到备用库，两边数据容易分叉。切换由编排层在
+    单库 3 轮耗尽后显式 advance() 触发；claim_owner / push_config 等仍走同一个
+    对象，自动跟随当前活跃后端。
+    """
+
+    def __init__(self, stores):
+        self.stores = [s for s in stores if s is not None]
+        self.index = 0
+
+    @property
+    def current(self):
+        return self.stores[self.index]
+
+    def label(self):
+        return "主库" if self.index == 0 else "备用库(Gitee)"
+
+    def has_next(self):
+        return self.index + 1 < len(self.stores)
+
+    def advance(self):
+        if not self.has_next():
+            return False
+        self.index += 1
+        flog("数据后端切换 → %s" % self.label())
+        return True
+
+    # Store 接口：全部代理到当前活跃后端
+    def refresh(self):
+        return self.current.refresh()
+
+    def read(self, name):
+        return self.current.read(name)
+
+    def write(self, name, text):
+        return self.current.write(name, text)
+
+    def signals(self):
+        return self.current.signals()
+
+    def signal(self):
+        return self.current.signal()
+
+
+def as_failover(store):
+    """旧调用直接传单个 Store 也能走新编排：包成单元素链。"""
+    return store if isinstance(store, FailoverStore) else FailoverStore([store])
+
+
+def make_backup_store(cfg, service=None):
+    """造 Gitee 备用私有库；没填 repo/token 或关了故障转移就不启用。"""
+    if str(cfg.get("UPDATER_FAILOVER") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    if not (cfg.get("UPDATER_GITEE_REPO") or "").strip():
+        return None
+    if not (cfg.get("UPDATER_GITEE_TOKEN") or "").strip():
+        return None
+    sub = dict(cfg)
+    sub["UPDATER_BACKEND"] = "gitee"       # 复用 make_store 的 namespace / service 路径
+    return make_store(sub, service)
+
+
+def make_store_chain(cfg, service=None):
+    """装配主库 + Gitee 备用库；没配备用库时只有主库，行为与旧版一致。"""
+    stores = [make_store(cfg, service)]
+    backup = make_backup_store(cfg, service)
+    if backup is not None:
+        stores.append(backup)
+    return FailoverStore(stores)
 
 
 def make_signal_store(cfg, service=None):
@@ -593,7 +731,8 @@ def _rebase_runtime(migrated, schema, cloud):
     return out
 
 
-def push_runtime(store, runtime, schema=None, service=None, max_attempts=3, window=5.0):
+def push_runtime(store, runtime, schema=None, service=None,
+                 max_attempts=FAILOVER_MAX_ATTEMPTS, window=FAILOVER_WINDOW):
     """把本服务迁移结果回写私有库，带「重拉-重合并」兜底，防并发改写 / 写回卡死丢数据。
 
     风险：拉私有库与写回云端之间若另一台设备改了私有库（或本次写回卡住 / 失败），
@@ -633,9 +772,59 @@ def push_runtime(store, runtime, schema=None, service=None, max_attempts=3, wind
                 cloud = {}
             runtime = _rebase_runtime(runtime, schema, cloud)
             text = json.dumps(runtime, ensure_ascii=False, indent=2) + "\n"
-    elog("[%s] 私有库回写 %d 轮均失败，疑似私有库异常或并发改写（本地数据仍完整）"
-         % (service or "default", max_attempts), last_err)
+    flog("[%s] 数据后端 %d 轮回写均失败（本地数据仍完整）：%s"
+         % (service or "default", max_attempts, last_err))
     return False
+
+
+def fetch_bundle_failover(store, service=None,
+                          max_attempts=FAILOVER_MAX_ATTEMPTS,
+                          window=FAILOVER_WINDOW):
+    """拉私有库数据：主库最多 max_attempts 轮，单轮超 window 秒也记「窗口过长」，
+    耗尽才切备用库（Gitee）用同样轮数继续；全失败报「数据拉取异常」并抛出。
+    """
+    fs = as_failover(store)
+    last_err = ""
+    while True:
+        for attempt in range(max_attempts):
+            t0 = time.time()
+            try:
+                bundle = fetch_bundle(fs)
+                flog("[%s] 数据拉取成功（%s，第 %d 轮）"
+                     % (service or "default", fs.label(), attempt + 1))
+                return bundle
+            except Exception as e:
+                last_err = str(e)
+                elapsed = time.time() - t0
+                why = ("耗时 %.1fs > %ds，窗口过长" % (elapsed, window)
+                       if elapsed > window else last_err)
+                flog("[%s] %s 数据拉取失败（第 %d 轮）：%s"
+                     % (service or "default", fs.label(), attempt + 1, why))
+        if fs.advance():
+            flog("[%s] 主库 %d 轮拉取失败，切换备用库继续"
+                 % (service or "default", max_attempts))
+            continue
+        elog(DATA_ANOMALY, "%s：主库与备用库共 %d 轮拉取均失败（%s）"
+             % (service or "default", max_attempts * len(fs.stores), last_err))
+        raise RuntimeError(DATA_ANOMALY)
+
+
+def push_runtime_failover(store, runtime, schema=None, service=None,
+                          max_attempts=FAILOVER_MAX_ATTEMPTS,
+                          window=FAILOVER_WINDOW):
+    """回写运行数据：主库试满 3 轮 → 切 Gitee 再 3 轮 → 全失败报数据拉取异常。"""
+    fs = as_failover(store)
+    payload = runtime                      # 切库后仍以本地原始迁移结果为基准
+    while True:
+        if push_runtime(fs, payload, schema, service, max_attempts, window):
+            return True
+        if fs.advance():
+            flog("[%s] 主库 %d 轮回写失败，切换备用库继续"
+                 % (service or "default", max_attempts))
+            continue
+        elog(DATA_ANOMALY, "%s：主库与备用库回写均失败（本地数据仍完整）"
+             % (service or "default"))
+        return False
 
 
 def push_config(store, text):
