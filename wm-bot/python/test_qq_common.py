@@ -154,6 +154,44 @@ def main():
     finally:
         builtins.__import__ = real_import
 
+    # 7) @ 标记兜底剥离：三种残留形式都要能被剥掉，且句中 @ 不受影响
+    cases = [
+        ("[CQ:at,qq=123] D/XX/ 平原", "D/XX/ 平原"),
+        ("<@!A1B2C3> D/XX/ 平原", "D/XX/ 平原"),
+        ("@自动化服务查询 D/XX/ 平原", "D/XX/ 平原"),
+        ("@甲 @乙 D/XX/ 平原", "D/XX/ 平原"),
+        ("＠123 自检", "自检"),
+    ]
+    for raw, want in cases:
+        total += 1
+        got = q.strip_mentions(raw)[0]
+        ok += check("剥 @ 标记 %r -> %r" % (raw, want), got == want)
+    total += 1
+    ok += check("句中 @ 保持原样（不误删正文）",
+                q.strip_mentions("D/XX/ 我 @某人 打平原")[0] == "D/XX/ 我 @某人 打平原")
+    total += 1
+    ok += check("剥 @ 标记同时回传被剥掉的标识",
+                q.strip_mentions("@甲 @乙 D/XX/ 平原")[1] == ["甲", "乙"])
+
+    # 7.1) 「@机器人 + D/XX/ 指令」必须照常响应（线上故障：旧实现留着 CQ 码，前缀匹配失败）
+    GAT = {"channel": "group", "group_id": "G1"}
+    for raw in ("@自动化服务查询 D/XX/自检",
+                "[CQ:at,qq=123]D/XX/自检",
+                "<@!123>D/XX/自检"):
+        total += 1
+        r = H(raw, dict(GAT))
+        ok += check("%r 带前缀仍响应" % raw, isinstance(r, str) and "出图模式" in r)
+
+    # 7.2) @ 的是自己（标识与 self_id 对得上）时，免前缀也成立
+    for raw in ("@123 自检", "＠123 自检", "<@!123> 自检"):
+        total += 1
+        r = H(raw, dict(GAT, self_id="123"))
+        ok += check("%r 免前缀响应（@ 的是自己）" % raw,
+                    isinstance(r, str) and "出图模式" in r)
+    total += 1
+    ok += check("@ 的是别人（self_id 对不上）时仍静默",
+                H("@小明 自检", dict(GAT, self_id="123")) is None)
+
     print("\n结果：通过 %d / 失败 %d" % (ok, total - ok))
     return 0 if ok == total else 1
 

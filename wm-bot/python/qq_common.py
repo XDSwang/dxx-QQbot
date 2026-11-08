@@ -13,6 +13,7 @@ qq_common.py — QQ 对接共享逻辑（与传输层无关）
 """
 from pathlib import Path
 import os
+import re
 import time
 
 import wm
@@ -174,6 +175,42 @@ class ImageReply(str):
         obj.pngs = list(pngs or [])
         obj.tail = ""
         return obj
+
+
+# 消息里可能残留的 @ 标记（传输层本该剥干净，这里兜底）：
+#   OneBot 字符串协议  [CQ:at,qq=123,name=…]
+#   官方机器人占位符    <@!A1B2C3>
+#   被当成普通文字发来的  @昵称
+_CQ_AT_ANY = re.compile(r"\[CQ:at,[^\]]*\]")
+_ANGLE_AT = re.compile(r"<@!?[^>\s]{1,64}>")
+_TEXT_AT = re.compile(r"[＠@]([^\s＠@]{1,32})")
+
+
+def strip_mentions(text):
+    """剥掉消息【开头】残留的 @ 标记，返回 (剩余文本, [被剥掉的标识])。
+
+    两个传输层正常已经剥过（onebot._parse_message 剥 CQ 码、qq_official.strip_mention
+    剥 <@!openid>），但个别实现会把 @ 标记直接当正文塞进来：此时 "D/XX/" 前缀匹配
+    不上，表现出来的就是「@机器人 + 带前缀指令」没反应、裸前缀却有反应。
+    只剥开头的连续标记，句子中间的（"我 @某人 打平原"）保持原样，避免误删正文。
+    """
+    t = text or ""
+    marks = []
+    while True:
+        s = t.lstrip()
+        m = _CQ_AT_ANY.match(s) or _ANGLE_AT.match(s)
+        if m:
+            marks.append(m.group(0))
+            t = s[m.end():]
+            continue
+        m = _TEXT_AT.match(s)
+        if m:
+            marks.append(m.group(1))
+            t = s[m.end():]
+            continue
+        t = s
+        break
+    return t.strip(), marks
 
 
 def split_style_prefix(text):
@@ -453,8 +490,15 @@ def make_handler(allowed_groups=None, allow_all=False):
                 # 白名单外的群：严格静默，不回复、不打印任何提示；
                 # 不自动写入 groups.txt（否则等于监控所有群，违反"只监控白名单群"的铁律）。
                 return None
+        # 先兜底剥掉开头残留的 @ 标记（CQ 码 / <@!id> / 明文 "@昵称"）：
+        # 有的实现不单发 at 段而是把 @ 混进正文，不剥就会让 D/XX/ 前缀匹配失败。
+        # 顺带一句：@ 的正是自己的话，也算「对着我说」，等价于 ctx["at_me"]。
+        body, at_marks = strip_mentions(text)
+        sid = str(ctx.get("self_id") or "").strip()
+        at_me = bool(ctx.get("at_me")) or bool(sid) and any(
+            sid in mk for mk in at_marks)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
-        body, force_img, force_txt = split_style_prefix(text)
+        body, force_img, force_txt = split_style_prefix(body)
         # —— 所有「交互指令」必须带 D/XX/ 前缀，防群聊闲聊误触发 ——
         # 例外：机器人主动推送（send_active）是机器人外发，不是用户指令，不受影响。
         # 因此 WM 查价 / 世界状态查询 / 监控开关 / 帮助 / 自检 全部收进前缀；
@@ -465,7 +509,7 @@ def make_handler(allowed_groups=None, allow_all=False):
             bare = (body or "").strip().lstrip("/").strip().lower()
             if bare in BARELESS_HELP_WORDS:
                 q = bare
-            elif ctx.get("at_me"):
+            elif at_me:
                 # 例外 2：@ 了机器人 —— 这句话本来就是对着我说的，允许不带 D/XX/
                 # （@ 本身已是明确意图，群里闲聊不会误触；仍要求是完整指令才会回）
                 q = (body or "").strip().lstrip("/").strip()
