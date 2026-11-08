@@ -4,6 +4,10 @@
 # pace.json、slug.json、bot_flow.log、后台刷新锁全部不会被提交。
 data/
 
+# 自动更新服务的私有地址凭证（PAT / 仓库名），只放服务端本地
+update.cfg
+remote/
+
 # Python 字节码缓存
 __pycache__/
 *.py[cod]
