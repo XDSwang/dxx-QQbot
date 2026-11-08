@@ -245,6 +245,8 @@ class TestDoUpdate(_Base):
         self.assertEqual(updater.load_state()["last_signal"], sig.fingerprint)
         self.assertEqual(bot.stopped, 1)
         self.assertEqual(bot.started, 1)
+        self.assertEqual(updater.load_state()["failed_signal"], "",
+                         "成功一轮要把上一轮的失败标记清掉")
 
     def test_failure_restores_backup_and_still_starts_bot(self):
         store, sig = self._prepare()
@@ -258,6 +260,8 @@ class TestDoUpdate(_Base):
         self.assertFalse(ok)
         self.assertEqual((self.data / "config.txt").read_text(encoding="utf-8"), before)
         self.assertEqual(bot.started, 1, "更新失败也不能让机器人停摆")
+        self.assertEqual(updater.load_state()["failed_signal"], sig.fingerprint,
+                         "失败信号必须落盘，否则每 10 秒会重跑同一次失败更新")
 
     def test_git_pull_failure_aborts_without_touching_data(self):
         store, sig = self._prepare()
@@ -268,6 +272,7 @@ class TestDoUpdate(_Base):
         self.assertFalse(ok)
         self.assertEqual((self.data / "ws_subs.json").read_text(encoding="utf-8"), before)
         self.assertEqual(bot.started, 1)
+        self.assertEqual(updater.load_state()["failed_signal"], sig.fingerprint)
 
     def test_bad_local_json_is_left_alone(self):
         store, sig = self._prepare()
@@ -278,6 +283,79 @@ class TestDoUpdate(_Base):
         self.assertTrue(ok)
         self.assertEqual((self.data / "ws_subs.json").read_text(encoding="utf-8"),
                          "{broken", "坏文件绝不能被空数据覆盖")
+
+
+class TestSelfRestart(_Base):
+    """更新器改到自己时：指纹能发现、语法坏了不重启、正常时先停机器人再换进程。"""
+
+    def _files(self):
+        a = self.root / "run.py"
+        b = self.root / "updater.py"
+        a.write_text("x = 1\n", encoding="utf-8")
+        b.write_text("y = 2\n", encoding="utf-8")
+        p = mock.patch.object(run, "SELF_FILES", (a, b))
+        p.start()
+        self.addCleanup(p.stop)
+        return a, b
+
+    def test_fingerprint_tracks_code_change(self):
+        a, _ = self._files()
+        before = run.self_fingerprint()
+        a.write_text("x = 1\nz = 3\n", encoding="utf-8")
+        self.assertNotEqual(run.self_fingerprint(), before)
+
+    def test_broken_code_blocks_restart(self):
+        a, _ = self._files()
+        a.write_text("def (\n", encoding="utf-8")
+        self.assertFalse(run.self_syntax_ok())
+        with mock.patch.object(run.os, "execv") as ex, mock.patch("builtins.print"):
+            self.assertFalse(run.restart_self(FakeBot()))
+        ex.assert_not_called()
+
+    def test_good_code_stops_bot_then_execv(self):
+        self._files()
+        bot = FakeBot()
+        with mock.patch.object(run.os, "execv") as ex, \
+             mock.patch.object(run, "release_lock") as rel, \
+             mock.patch("builtins.print"):
+            self.assertTrue(run.restart_self(bot))
+        ex.assert_called_once()
+        rel.assert_called_once()
+        self.assertEqual(bot.stopped, 1)
+
+
+class TestPreflight(_Base):
+    """服务端没人告诉它私有仓库地址时，启动就要把缺什么说清楚。"""
+
+    def test_placeholder_credentials_and_missing_files_are_reported(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "github",
+                    "UPDATER_GITHUB_REPO": "你的账号/私有仓库名",
+                    "UPDATER_GITHUB_TOKEN": "github_pat_xxxxxxxx",
+                    "UPDATER_GITHUB_PATH": "bot-sync",
+                    "UPDATER_GIT_PULL": "0"})
+        with mock.patch("builtins.print"):
+            problems = run.preflight(cfg, self.store())
+        text = " ".join(problems)
+        self.assertIn("占位", text)
+        self.assertIn("bot-sync", text)
+        self.assertIn("runN", text)
+        self.assertIn("config.txt", text)
+        self.assertIn("schema.json", text)
+
+    def test_not_a_git_repo_is_reported(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_GIT_PULL": "1"})
+        (self.remote / "run0").write_text("0", encoding="utf-8")
+        (self.remote / "config.txt").write_text("A = 1\n", encoding="utf-8")
+        (self.remote / "schema.json").write_text("{}", encoding="utf-8")
+        with mock.patch.object(run.subprocess, "run",
+                               return_value=mock.Mock(returncode=1)), \
+             mock.patch("builtins.print"):
+            problems = run.preflight(cfg, self.store())
+        self.assertIn("git", " ".join(problems))
 
 
 class TestMainLoop(_Base):

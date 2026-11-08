@@ -51,6 +51,7 @@ DEFAULTS = {
 STOP_WAIT_SECONDS = 3       # 规范 1.2 单次等待缺省 3 秒
 GIT_TIMEOUT_SECONDS = 60
 MAX_CRASH_RESTART = 3       # 规范 1.1 静默重试最多 3 次
+SELF_FILES = (HERE / "run.py", HERE / "updater.py")   # 改到更新器自身就要重启才生效
 
 
 def load_cfg(path=None):
@@ -136,6 +137,105 @@ class BotProcess(object):
             return True
 
 
+def _console(msg):
+    """控制台提示 + 流程日志：配置没填、私有地址连不上这类问题必须当场看得见。"""
+    print("[run] " + msg, flush=True)
+    updater.flog(msg)
+
+
+def mark_failed(sig):
+    """失败信号落盘：同一个指纹不再每 10 秒重试（改 runN 内容或换版本号才重试）。"""
+    st = updater.load_state()
+    st["failed_signal"] = sig.fingerprint
+    st["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    updater.save_state(st)
+
+
+def preflight(cfg, store):
+    """启动自检：把「配置没填 / 不在 git 仓库 / 私有地址没放文件」直接打到控制台。
+
+    只提示不退出：网络抖动时机器人照常运行，只是暂时不会自动更新。
+    返回问题列表，便于离线测试断言。
+    """
+    problems = []
+    backend = (cfg.get("UPDATER_BACKEND") or "local").strip().lower()
+    if backend == "github":
+        repo = (cfg.get("UPDATER_GITHUB_REPO") or "").strip()
+        token = (cfg.get("UPDATER_GITHUB_TOKEN") or "").strip()
+        if not repo or "你的账号" in repo or not token or "github_pat_xxx" in token:
+            problems.append("update.cfg 的 UPDATER_GITHUB_REPO / TOKEN 还是模板占位值")
+    if str(cfg.get("UPDATER_GIT_PULL", "1")).lower() not in ("0", "false", "no", "off"):
+        try:
+            r = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(HERE),
+                               capture_output=True, text=True,
+                               timeout=GIT_TIMEOUT_SECONDS)
+            if r.returncode != 0:
+                problems.append("当前目录不在 git 仓库里：服务端要 clone 整个 dxx-QQbot，"
+                                "只拷 wm-bot/ 会让 git pull 一直失败")
+        except Exception as e:
+            problems.append("检查 git 仓库失败：%s" % e)
+    try:
+        sig = store.signal()
+        if sig.name == "(missing)":
+            path = (cfg.get("UPDATER_GITHUB_PATH") or "").strip() or "仓库根目录"
+            problems.append("私有地址 %s 里没有 runN 信号文件（先放一个 run0）" % path)
+        for name in (updater.CONFIG_NAME, updater.SCHEMA_NAME):
+            if store.read(name) is None:
+                problems.append("私有地址缺少 %s（配置同步 / 字段改名规则不会生效）" % name)
+    except Exception as e:
+        problems.append("私有地址读取失败：%s" % e)
+    for p in problems:
+        _console("[warn] " + p)
+    if not problems:
+        _console("启动自检通过：私有地址与 git 仓库都可用")
+    return problems
+
+
+def self_fingerprint():
+    """更新器自身两个文件的 mtime+size；git pull 改到它们就该重启进程。"""
+    out = []
+    for p in SELF_FILES:
+        try:
+            st = p.stat()
+            out.append("%s:%s:%s" % (p.name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(p.name + ":missing")
+    return "|".join(out)
+
+
+def self_syntax_ok():
+    """重启前先编译自检：拉下来的新代码有语法错误就别把正在跑的服务换掉。"""
+    for p in SELF_FILES:
+        try:
+            compile(p.read_text(encoding="utf-8"), str(p), "exec")
+        except (OSError, SyntaxError) as e:
+            updater.elog("更新器自身代码校验失败，保持旧进程运行", "%s %s" % (p.name, e))
+            return False
+    return True
+
+
+def restart_self(bot):
+    """git pull 改到 run.py / updater.py 时重启本进程，让新逻辑真正生效。
+
+    execv 会替换进程映像，try/finally 不会再跑，所以先停机器人、放掉单实例锁；
+    失败则补回来，继续用旧进程服务，并留下异常日志。
+    """
+    if not self_syntax_ok():
+        return False
+    _console("更新器自身代码已更新，重启 run.py 使新逻辑生效")
+    bot.stop()
+    release_lock()
+    try:
+        os.execv(sys.executable,
+                 [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
+    except Exception as e:
+        updater.elog("重启更新器失败，继续用当前进程运行", str(e))
+        acquire_lock()
+        bot.start()
+        return False
+    return True
+
+
 def git_pull(cfg):
     """代码与配置必须同一版：pull 失败就整次作废，不迁数据、不更新指纹。"""
     if str(cfg.get("UPDATER_GIT_PULL", "1")).lower() in ("0", "false", "no", "off"):
@@ -177,6 +277,7 @@ def do_update(cfg, store, bot, sig):
     """执行一轮更新；无论成败都在 finally 里把机器人拉起来，不让服务停摆。"""
     updater.flog("检测到更新信号 %s 指纹=%s" % (sig.name, sig.fingerprint))
     backup_dir = None
+    succeeded = False       # 不叫 ok：do_update 里 ok 是 git_pull / 写文件的返回值
     try:
         if not bot.stop():
             return False
@@ -227,12 +328,20 @@ def do_update(cfg, store, bot, sig):
                         len(config_report.get("kept", [])),
                         len(report["renamed"]), len(report["dropped"]),
                         len(report["added"]), ",".join(bad) or "-"))
+        succeeded = True
         return True
     except Exception as e:
         _restore_backup(backup_dir)
         updater.elog("更新失败，已还原备份并照常用旧数据启动机器人", str(e))
         return False
     finally:
+        if not succeeded:
+            # 失败信号必须落盘：否则每 10 秒轮询会把同一次失败更新重跑一遍。
+            # 修好后改 runN 的内容或换成 run2/run3 产生新指纹才会再触发。
+            try:
+                mark_failed(sig)
+            except Exception as e:
+                updater.elog("记录失败信号失败", str(e))
         bot.start()
 
 
@@ -251,8 +360,10 @@ def main():
         poll = updater.POLL_SECONDS
     bot = BotProcess(cfg.get("UPDATER_BOT_ENTRY") or DEFAULTS["UPDATER_BOT_ENTRY"])
     bot.start()
-    updater.flog("更新服务启动：后端=%s 轮询=%s 秒 入口=%s"
-                 % (cfg.get("UPDATER_BACKEND"), poll, bot.entry))
+    _console("更新服务启动：后端=%s 轮询=%s 秒 入口=%s"
+             % (cfg.get("UPDATER_BACKEND"), poll, bot.entry))
+    preflight(cfg, store)
+    self_fp = self_fingerprint()
     crashes = 0
     try:
         while True:
@@ -278,6 +389,11 @@ def main():
                     or sig.fingerprint == st.get("failed_signal")):
                 continue
             do_update(cfg, store, bot, sig)
+            if self_fingerprint() != self_fp:
+                # 代码已 pull 到磁盘，进程必须换成新版，否则后续轮询仍跑旧逻辑。
+                # 无论重启成败都刷新指纹，避免失败时每 10 秒反复尝试重启。
+                self_fp = self_fingerprint()
+                restart_self(bot)
     except KeyboardInterrupt:
         updater.flog("收到 Ctrl+C，退出更新服务")
     finally:
