@@ -1677,8 +1677,23 @@ class TestUnattended(_Base):
                          "github.com 与 api.github.com 归到同一个 key")
         self.assertEqual(slp.call_count, 1, "第二次同域名访问被补齐间隔")
 
-
-
+    def test_deploy_dir_defaults_to_sibling_of_private_repo(self):
+        """手机/电脑公共库默认放私有库同级，不嵌进私有库 git 内部。"""
+        import importlib.util
+        bs_path = (Path(__file__).resolve().parent.parent
+                   / "dxx_private_data" / "bootstrap.py")
+        spec = importlib.util.spec_from_file_location("bs_deploy", str(bs_path))
+        bs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bs)
+        fake_root = Path("/data/user/0/com.termux/files/home/dxx_private_data")
+        with mock.patch.object(bs, "HERE", fake_root):
+            self.assertEqual(bs.deploy_dir({}),
+                             fake_root.parent / "dxx-QQbot",
+                             "默认部署目录是私有库根的同级 dxx-QQbot")
+            self.assertEqual(bs.deploy_dir({"DEPLOY_DIR": "/abs/path/x"}),
+                             Path("/abs/path/x"))
+            self.assertEqual(bs.deploy_dir({"DEPLOY_DIR": "rel/code"}),
+                             fake_root / "rel/code")
 
 class TestPrivateUpdateCfg(_Base):
     """update.cfg 属于私有库数据：真实值进私有库、启动器只拷、改了自动生效。"""
