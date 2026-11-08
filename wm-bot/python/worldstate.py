@@ -1372,18 +1372,39 @@ def _cycle_left(epoch, text=None):
 PLAIN_BOUNTY = {
     "cetus":   ("cetussyndicate", "ostron", "希图斯", "夜灵", "cetus"),
     "vallis":  ("solarissyndicate", "索拉里斯", "solaris", "fortuna", "奥布", "vallis"),
-    "cambion": ("entratisyndicate", "英择谛", "entrati", "魔胎", "cambion"),
+    "cambion": ("entratisyndicate", "英择谛", "entrati", "魔胎", "cambion",
+                # 科维兽：火卫二圣所（科研 / 隔离库同区）的集团赏金
+                "entratilabsyndicate", "科维兽", "圣所"),
     "duviri":  ("duvirisyndicate", "duviri", "双衍"),
-    "zariman": ("zarimansyndicate", "zariman", "扎里曼"),
+    "zariman": ("zarimansyndicate", "zariman", "扎里曼", "坚守者"),
 }
 
 
+def _bounty_hit(item, keys):
+    blob = f"{item.get('tag') or ''} {item.get('name') or ''}".lower()
+    return any(k in blob for k in keys)
+
+
 def _bounty_for(s, key):
-    """按 bountyBoard 的 tag / name 挑出属于这个平原的集团。"""
+    """按 bountyBoard 的 tag / name 挑出属于这个平原的赏金。
+
+    两类来源结构不同，都要看：
+      bountyBoard     → 开放世界任务板（Ostron / 索拉里斯 / 英择谛），带阶段 + 奖励；
+      bounties.groups → 集团赏金轮换（坚守者 / 科维兽 / 六人组），带节点 · 任务 · 挑战。
+    扎里曼的坚守者赏金只在后者里，早先只查前者，才会误报「该区域无赏金板」。
+    """
     keys = PLAIN_BOUNTY.get(key) or ()
-    return [b for b in (s.get("bountyBoard") or [])
-            if any(k in f"{b.get('tag') or ''} {b.get('name') or ''}".lower()
-                   for k in keys)]
+    bt = s.get("bounties") or {}
+    out = []
+    for b in (s.get("bountyBoard") or []):
+        if _bounty_hit(b, keys):
+            out.append({"name": b.get("name") or "?", "expiry": b.get("expiry"),
+                        "jobs": b.get("jobs") or [], "board": True})
+    for g in (bt.get("groups") or []):
+        if _bounty_hit(g, keys):
+            out.append({"name": g.get("name") or "?", "expiry": bt.get("expiry"),
+                        "jobs": g.get("jobs") or [], "board": False})
+    return out
 
 
 def _job_text(j):
@@ -1401,10 +1422,11 @@ def _bounty_lines(groups, limit):
     out = []
     for b in groups:
         jobs = b.get("jobs") or []
-        out.append(f"   赏金 · {b.get('name') or '?'}（{len(jobs)} 个"
+        label = "赏金" if b.get("board") else "集团赏金"
+        out.append(f"   {label} · {b.get('name') or '?'}（{len(jobs)} 个"
                    f"{_bounty_board_rot(b)}）")
         for j in jobs[:limit]:
-            out.append(f"     - {_job_text(j)}")
+            out.append(f"     - {_bounty_job_line(j)}")
         more = len(jobs) - min(len(jobs), limit)
         if more > 0:
             out.append(f"     …… 还有 {more} 个（发「赏金」看全部）")
@@ -1418,9 +1440,9 @@ def _plain_with_bounty(s, key, head):
     if groups:
         out += _bounty_lines(groups, _cap(5, 2))
     else:
-        # 双衍王境 / 扎里曼 这类区域是独立周期（愤怒/喜悦、Corpus 等），
-        # 本身没有 Ostron 那种开放世界赏金任务板，所以没有赏金行是正常的。
-        out.append("    （该区域无开放世界赏金任务板 · 非集团赏金区，正常）")
+        # 双衍王境是独立周期（恐惧/喜悦等），没有任务板；其余区域两种来源都查过了，
+        # 真没有才写这句，不再把扎里曼这种「只有集团赏金」的误判成「没有赏金」。
+        out.append("    （该区域没有独立赏金任务板）")
     return "\n".join(out)
 
 
@@ -1428,8 +1450,12 @@ def _fmt_cetus(s):
     c = s.get("cetusCycle") or {}
     is_day = c.get("isDay")
     state = "☀️ 白天" if is_day else "🌙 黑夜"
-    return _plain_with_bounty(s, "cetus", "希图斯（地球平原）：" + state
-                              + _cycle_left(c.get("expiry"), c.get("timeLeft")))
+    head = ("希图斯（地球平原）：" + state
+            + _cycle_left(c.get("expiry"), c.get("timeLeft")))
+    if not is_day:
+        # 夜灵三傻只在夜里刷：天黑就直接把顺序给出来，不用再问一次
+        head += "\n    夜灵三傻：Teralyst（兆力使）→ Gantulyst（巨力使）→ Hydrolyst（水力使）"
+    return _plain_with_bounty(s, "cetus", head)
 
 
 def _fmt_vallis(s):
@@ -1448,6 +1474,35 @@ def _fmt_cambion(s):
                               + _cycle_left(c.get("expiry"), c.get("timeLeft")))
 
 
+_ZH_CACHE = {}
+
+
+def _zh(name):
+    """英文名后面补「（中文名）」；已是中文或查不到就原样返回。
+
+    回廊这类栏位数据源只给英文名（Braton / Lato / Ivara…），中文用户看不出是哪把。
+    中文表与 WM 查价共用 data/i18n.json，查不到就保持英文，绝不瞎编。
+    """
+    n = (name or "").strip()
+    if not n or wm.is_cjk(n):
+        return n
+    if n not in _ZH_CACHE:
+        try:
+            _ZH_CACHE[n] = wm.translate_en_to_zh(n) or ""
+        except Exception:
+            _ZH_CACHE[n] = ""
+    z = _ZH_CACHE[n]
+    return f"{n}（{z}）" if z else n
+
+
+def _name_lines(names, indent, lead):
+    """一行一个往下写（卡片高度够，不必横向挤），名字后面补中文。"""
+    out = [f"{indent}{lead}"]
+    for nm in names:
+        out.append(f"{indent}    {_zh(nm)}")
+    return out
+
+
 def _circuit_lines(s, indent="  "):
     """回廊轮换的正文行（不含标题）：普通回廊三选一战甲 + 钢铁回廊五把灵化武器。
 
@@ -1458,9 +1513,9 @@ def _circuit_lines(s, indent="  "):
     hard = c.get("hard") or []
     out = []
     if nrm:
-        out.append(f"{indent}· 普通回廊 · 战甲三选一：" + "、".join(nrm))
+        out += _name_lines(nrm, indent, "· 普通回廊 · 战甲三选一：")
     if hard:
-        out.append(f"{indent}· 钢铁回廊 · 灵化武器：" + "、".join(hard))
+        out += _name_lines(hard, indent, "· 钢铁回廊 · 灵化武器：")
     return out
 
 
@@ -1792,6 +1847,16 @@ def _fmt_arbitration(s):
     return line
 
 
+# 活动描述里带的地名 → 所在星球：数据源只给「热美亚裂缝（奥布山谷）」这种，
+# 补上星球才能一眼看出要去哪（已有星球名的不重复加）。
+_EVENT_PLACE = {
+    "奥布山谷": "金星", "福尔图娜": "金星",
+    "希图斯": "地球", "夜灵平原": "地球",
+    "魔胎之境": "火卫二", "圣所": "火卫二", "内融": "火卫二",
+    "扎里曼": "扎里曼", "双衍王境": "双衍", "霍姆巴": "1999",
+}
+
+
 def _fmt_events(s):
     items = s.get("events") or []
     if not items:
@@ -1801,7 +1866,12 @@ def _fmt_events(s):
         desc = ev.get("description") or ev.get("headline") or "?"
         if len(desc) > 80:
             desc = desc[:80] + "…"
-        out.append(f"{i}. {desc}")
+        line = f"{i}. {desc}"
+        for place, planet in _EVENT_PLACE.items():
+            if place in desc and planet not in desc:
+                line += f" · {planet}"
+                break
+        out.append(line)
         out.append(f"   剩余：{_fmt_left(ev.get('expiry'))}")
     return "\n".join(out)
 

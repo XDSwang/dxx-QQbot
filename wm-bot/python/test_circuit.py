@@ -116,8 +116,10 @@ def main():
     st = {"circuit": c}
     txt = ws._fmt_circuit(st)
     t("有栏目标题", "🌀 无尽回廊" in txt)
-    t("列出三套战甲", "Ivara、Inaros、Titania" in txt)
-    t("列出五把灵化武器", "Braton、Lato、Skana、Paris、Kunai" in txt)
+    t("列出三套战甲", all(n in txt for n in ("Ivara", "Inaros", "Titania")))
+    t("列出五把灵化武器",
+      all(n in txt for n in ("Braton", "Lato", "Skana", "Paris", "Kunai")))
+    t("灵化武器补中文名", "Braton（布莱顿）" in txt and "Skana（空刃）" in txt)
     t("标明每周一轮换", "每周一 00:00 UTC" in txt)
     t("标明名称沿用原名", "官方原名" in txt)
     t("缺数据时如实提示", "暂时取不到" in ws._fmt_circuit({}))
@@ -132,8 +134,9 @@ def main():
     d = dict(ws._MOCK_WS)
     dt = ws._fmt_duviri(d)
     t("双衍王境块里带出回廊", "无尽回廊" in dt)
-    t("王境块里列出三选一战甲", "Ivara、Inaros、Titania" in dt)
-    t("王境块里列出灵化武器", "Braton、Lato、Skana、Paris、Kunai" in dt)
+    t("王境块里列出三选一战甲", all(n in dt for n in ("Ivara", "Inaros", "Titania")))
+    t("王境块里列出灵化武器",
+      all(n in dt for n in ("Braton", "Lato", "Skana", "Paris", "Kunai")))
     t("回廊排在王境周期之后", dt.index("双衍王境") < dt.index("无尽回廊"))
     no_c = dict(d)
     no_c.pop("circuit")

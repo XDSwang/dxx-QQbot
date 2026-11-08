@@ -934,8 +934,8 @@ def test_bounty_plain_display():
     cyc = ws._fmt_cycles(s)
     check("平原组合含五处", all(k in cyc for k in
                             ("希图斯", "奥布山谷", "魔胎之境", "双衍王境", "扎里曼")))
-    check("双衍无赏金板时给原因说明", "无开放世界赏金任务板" in cyc)
-    check("扎里曼无赏金板时给原因说明", cyc.count("无开放世界赏金任务板") >= 2)
+    check("双衍无赏金板时给原因说明", "没有独立赏金任务板" in cyc)
+    check("扎里曼无数据时同样说明", cyc.count("没有独立赏金任务板") >= 2)
     check("有赏金板的希图斯仍显示任务", "削减" in cyc)
 
     bounty = ws._fmt_bounty(s)
@@ -949,6 +949,21 @@ def test_bounty_plain_display():
     b2 = ws._fmt_bounty(s2)
     check("过期赏金板标注上一轮任务板", "上一轮任务板" in b2)
     check("过期赏金板不再写已到期", "已到期" not in b2)
+
+    # 集团赏金在 bounties.groups 里（扎里曼的坚守者 / 火卫二的科维兽同区）：
+    # 早先只查 bountyBoard，才会把扎里曼误报成「没有赏金板」。
+    s3 = dict(s)
+    s3["bounties"] = {"expiry": now + 5400000, "groups": [
+        {"tag": "ZarimanSyndicate", "name": "坚守者",
+         "jobs": [{"node": "奥金工场", "mission": "虚空决战",
+                   "challenge": "击杀 2 名虚空天使"}]},
+        {"tag": "EntratiLabSyndicate", "name": "科维兽",
+         "jobs": [{"node": "恶涌", "mission": "刺杀", "challenge": "激活 1 个虚空泉脉"}]},
+    ]}
+    cyc3 = ws._fmt_cycles(s3)
+    check("扎里曼显示坚守者集团赏金", "坚守者" in cyc3 and "击杀 2 名虚空天使" in cyc3)
+    check("火卫二显示科维兽集团赏金", "科维兽" in cyc3)
+    check("坚守者只出现在扎里曼块里", "坚守者" not in cyc3.split("\n\n")[2])
 
 
 # ----------------------------- 19. 仲裁（arbi.wf.wiki 轮换表）-----------------------------

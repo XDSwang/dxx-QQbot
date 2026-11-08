@@ -254,6 +254,45 @@ def test_bounty_layout():
     check("无赏金时不出现赏金标题", "赏金 ·" not in nb)
     check("无赏金时时间行仍是单行", "希图斯（地球平原）：☀️ 白天" in nb)
 
+    # 集团赏金（bounties.groups）：扎里曼的坚守者、火卫二的科维兽
+    s2 = dict(s)
+    s2["bounties"] = {"expiry": NOW + 3000, "groups": [
+        {"tag": "ZarimanSyndicate", "name": "坚守者",
+         "jobs": [{"node": "奥金工场", "mission": "虚空决战",
+                   "challenge": "击杀 2 名虚空天使"}]},
+        {"tag": "EntratiLabSyndicate", "name": "科维兽",
+         "jobs": [{"node": "恶涌", "mission": "刺杀",
+                   "challenge": "激活 1 个虚空泉脉"}]},
+    ]}
+    check("扎里曼命中坚守者",
+          [b["name"] for b in ws._bounty_for(s2, "zariman")] == ["坚守者"])
+    check("火卫二同时命中英择谛与科维兽",
+          [b["name"] for b in ws._bounty_for(s2, "cambion")] == ["英择谛", "科维兽"])
+    check("双衍仍不硬凑", ws._bounty_for(s2, "duviri") == [])
+    zar = ws._fmt_zariman(s2)
+    check("扎里曼块带集团赏金", "集团赏金 · 坚守者" in zar and "虚空天使" in zar)
+    check("集团赏金一行写完节点·任务·挑战", "奥金工场 · 虚空决战 · 击杀 2 名虚空天使" in zar)
+    check("火卫二块带科维兽", "集团赏金 · 科维兽" in ws._fmt_cambion(s2))
+
+    # 回廊：英文武器名后面补中文（查不到就保持英文，不瞎编）
+    circ = {"circuit": {"normal": ["Ivara", "Inaros"],
+                        "hard": ["Braton", "Lato", "Kunai"]}}
+    cl = "\n".join(ws._circuit_lines(circ, ""))
+    check("灵化武器带中文名", "Braton（布莱顿）" in cl and "Kunai（苦无）" in cl)
+    check("中文表查不到的战甲保持英文", "Ivara" in cl and "Ivara（" not in cl)
+
+    # 地球黑夜：直接给夜灵三傻顺序
+    night = dict(s)
+    night["cetusCycle"] = {"isDay": False, "expiry": NOW + 600}
+    check("地球黑夜给三傻", "Teralyst（兆力使）" in ws._fmt_cetus(night))
+    check("地球白天不提三傻", "Teralyst" not in ws._fmt_cetus(s))
+
+    # 活动：描述里只有地名时补星球
+    ev = {"events": [{"description": "热美亚裂缝（奥布山谷）", "expiry": NOW + 600}]}
+    check("活动补所在星球", "· 金星" in ws._fmt_events(ev))
+    ev2 = {"events": [{"description": "尸鬼净化（希图斯 · 地球）", "expiry": NOW + 600}]}
+    check("已有星球名不重复加", ws._fmt_events(ev2).count("地球") == 1)
+
     # 精简模式：每处只给 2 条
     old = ws._COMPACT
     try:
