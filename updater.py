@@ -345,17 +345,135 @@ class GiteeStore(GitHubStore):
         self._listing = None
 
 
+class GitRepoStore(object):
+    """纯 GIT 数据后端：读用 git show 取单个文件，回写就是 commit + git push。
+
+    不需要任何密钥 / Contents API：私有库就是普通 git 仓库，本机已有的 HTTPS 凭证或
+    SSH key 即可读写。只读真正用到的那几个文件，不落地整个仓库；判断层
+    GitSignalStore 已把两个源 fetch 到同一个 gitsync 镜像，这里直接复用对象。
+    """
+
+    def __init__(self, url, path="services", branch="main", service=None):
+        self.url = (url or "").strip()
+        self.path = (path or "").strip().strip("/")
+        self.branch = (branch or "main").strip()
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", service or "global")
+        self.mirror = STATE_DIR / "gitsync" / (service or "__global__")
+        self.base_ref = "refs/updater/" + key
+        self._ready = False
+
+    def _host(self):
+        if "://" in self.url:
+            return urllib.parse.urlparse(self.url).netloc.split("@")[-1].split(":")[0]
+        if "@" in self.url:
+            return self.url.split("@", 1)[1].split(":", 1)[0]
+        return self.url
+
+    def _rel(self, name):
+        return (self.path + "/" + name) if self.path else name
+
+    def _ensure(self):
+        if (self.mirror / ".git").exists():
+            return True
+        self.mirror.mkdir(parents=True, exist_ok=True)
+        code, out, err = git_cmd(["init", "--quiet"], cwd=self.mirror)
+        if code != 0:
+            elog("GIT 数据镜像初始化失败", err or out)
+            return False
+        return True
+
+    def refresh(self):
+        """把本源最新 commit 拉到专用 ref；不写 FETCH_HEAD，不干扰判断层。"""
+        if not self._ensure():
+            raise RuntimeError("GIT 数据镜像不可用")
+        pace_gate(self._host())
+        code, out, err = git_cmd(
+            ["fetch", "--no-tags", "-f", self.url,
+             "%s:%s" % (self.branch, self.base_ref)], cwd=self.mirror)
+        if code != 0:
+            raise RuntimeError("GIT 拉取失败：%s" % (err or out)[:200])
+        code, sha, err = git_cmd(["rev-parse", self.base_ref], cwd=self.mirror)
+        if code != 0 or not sha:
+            raise RuntimeError("GIT 版本读取失败：%s" % (err or "")[:200])
+        self._ready = True
+        return sha
+
+    def read(self, name):
+        if not self._ready:
+            self.refresh()
+        code, out, _ = git_cmd(
+            ["show", "%s:%s" % (self.base_ref, self._rel(name))],
+            cwd=self.mirror, strip=False)
+        return out if code == 0 else None
+
+    def write(self, name, text):
+        """基于本源最新 commit 造一个新提交并上传；非快进被拒就抛给上层重合并。"""
+        base = self.refresh()
+        blob_file = self.mirror / ".git" / ("updater_blob_%d" % os.getpid())
+        idx_file = self.mirror / ".git" / ("updater_index_%d" % os.getpid())
+        env = {"GIT_INDEX_FILE": str(idx_file)}
+        try:
+            blob_file.write_text(text, encoding="utf-8")
+            code, blob, err = git_cmd(["hash-object", "-w", str(blob_file)],
+                                      cwd=self.mirror)
+            if code != 0 or not blob:
+                raise RuntimeError("GIT 写对象失败：%s" % (err or "")[:200])
+            for args in (["read-tree", base],
+                         ["update-index", "--add", "--cacheinfo",
+                          "100644,%s,%s" % (blob, self._rel(name))]):
+                code, out, err = git_cmd(args, cwd=self.mirror, env=env)
+                if code != 0:
+                    raise RuntimeError("GIT 构造提交失败：%s" % (err or out)[:200])
+            code, tree, err = git_cmd(["write-tree"], cwd=self.mirror, env=env)
+            if code != 0 or not tree:
+                raise RuntimeError("GIT 写树失败：%s" % (err or "")[:200])
+            code, commit, err = git_cmd(
+                ["-c", "user.name=wm-bot-updater",
+                 "-c", "user.email=updater@localhost",
+                 "commit-tree", tree, "-p", base, "-m", "updater: " + name],
+                cwd=self.mirror)
+            if code != 0 or not commit:
+                raise RuntimeError("GIT 建提交失败：%s" % (err or "")[:200])
+            pace_gate(self._host())
+            code, out, err = git_cmd(
+                ["push", self.url, "%s:refs/heads/%s" % (commit, self.branch)],
+                cwd=self.mirror)
+            if code != 0:
+                raise RuntimeError("GIT 上传失败（可能被别的提交抢先）：%s"
+                                   % (err or out)[:200])
+            git_cmd(["update-ref", self.base_ref, commit], cwd=self.mirror)
+        finally:
+            for p in (blob_file, idx_file):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    def signals(self):
+        return []                     # 判断恒由 GitSignalStore 的 GIT 双源拷贝负责
+
+    def signal(self):
+        return Signal("(git)", self.base_ref, False)
+
+
 def make_store(cfg, service=None):
     """按配置造【数据后端】；service 给定时自动切到该服务在私有仓库里的子目录。
 
     UPDATER_DATA_NAMESPACE 再插一层：同一套代码、不同授权的两台服务端各配一个，
-    数据就不会落到同一份 runtime.json 上。这层是可替换的：现在用 GitHub 私有仓库
-    文件代替数据库，以后换成数据库地址 / 第三方数据接口，只要按 Store 接口
-    （signals / signal / read / write）加适配器并在这里注册，服务与迁移逻辑都不用动。
+    数据就不会落到同一份 runtime.json 上。这层是可替换的：默认用 GIT 指令读写
+    私有仓库文件（不需要任何密钥 / 第三方接口），以后换成数据库地址 / 第三方数据接口，
+    只要按 Store 接口（signals / signal / read / write / refresh）加适配器并在这里注册，
+    服务与迁移逻辑都不用动。
     """
     kind = (cfg.get("UPDATER_BACKEND") or "local").strip().lower()
     parts = [p for p in ((cfg.get("UPDATER_DATA_NAMESPACE") or "").strip().strip("/"),
                          (service or "").strip().strip("/")) if p]
+    if kind == "git":
+        path = (cfg.get("UPDATER_GIT_PATH") or "services").strip().strip("/")
+        for part in parts:
+            path = (path + "/" + part) if path else part
+        return GitRepoStore(cfg.get("UPDATER_DATA_REPO"), path,
+                            cfg.get("UPDATER_DATA_BRANCH", "main"), service)
     if kind == "github":
         path = (cfg.get("UPDATER_GITHUB_PATH") or "").strip().strip("/")
         for part in parts:
@@ -382,7 +500,7 @@ def make_store(cfg, service=None):
     if kind in ("database", "http", "api"):
         raise NotImplementedError(
             "数据后端 %s 尚未实现：请按 Store 接口加适配器，"
-            "地址 / 凭证填 UPDATER_DATA_URL / UPDATER_DATA_TOKEN" % kind)
+            "请按 Store 接口加适配器并在 make_store 里注册" % kind)
     raise ValueError("未知的 UPDATER_BACKEND: %s" % kind)
 
 
@@ -445,10 +563,18 @@ def as_failover(store):
 
 
 def make_backup_store(cfg, service=None):
-    """造 Gitee 备用私有库；没填 repo/token 或关了故障转移就不启用。"""
+    """造备用数据后端；关了故障转移 / 没配备用地址就不启用。"""
     if str(cfg.get("UPDATER_FAILOVER") or "1").strip().lower() in (
             "0", "false", "no", "off"):
         return None
+    kind = (cfg.get("UPDATER_BACKEND") or "local").strip().lower()
+    if kind == "git":
+        backup_url = (cfg.get("UPDATER_DATA_REPO_BACKUP") or "").strip()
+        if not backup_url:
+            return None
+        sub = dict(cfg)
+        sub["UPDATER_DATA_REPO"] = backup_url
+        return make_store(sub, service)
     if not (cfg.get("UPDATER_GITEE_REPO") or "").strip():
         return None
     if not (cfg.get("UPDATER_GITEE_TOKEN") or "").strip():
@@ -468,12 +594,22 @@ def make_store_chain(cfg, service=None):
 
 
 # --------------------- GIT 双源拷贝：更新判断 ---------------------
-def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT):
-    """跑一条 git 指令，返回 (returncode, stdout, stderr)；失败不抛，交给编排层判。"""
+def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
+    """跑一条 git 指令，返回 (returncode, stdout, stderr)；失败不抛，交给编排层判。
+
+    env 供 GIT_INDEX_FILE 这类只影响单次调用的 plumbing 变量使用；
+    strip=False 用于 git show 取文件内容，保留首尾空白与末尾换行。
+    """
     try:
+        run_env = None
+        if env:
+            run_env = dict(os.environ)
+            run_env.update(env)
         r = subprocess.run(["git"] + list(args), cwd=str(cwd) if cwd else None,
-                           capture_output=True, text=True, timeout=timeout)
-        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+                           capture_output=True, text=True, timeout=timeout,
+                           env=run_env)
+        out = r.stdout or ""
+        return r.returncode, (out.strip() if strip else out), (r.stderr or "").strip()
     except Exception as e:
         return 1, "", str(e)
 

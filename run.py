@@ -38,6 +38,8 @@ DEFAULT_RUNTIME_FILES = (
 
 DEFAULTS = {
     "UPDATER_BACKEND": "local",
+    # 纯 GIT 后端：私有库里「所有服务数据」的根目录（由 update.cfg 选 backend=git 启用）
+    "UPDATER_GIT_PATH": "services",
     "UPDATER_LOCAL_DIR": str(HERE / "remote"),
     "UPDATER_GITHUB_REPO": "",
     "UPDATER_GITHUB_TOKEN": "",

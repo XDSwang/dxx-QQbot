@@ -1319,5 +1319,100 @@ class TestGitSignalStore(_Base):
         self.assertIn("github.com/me/private.git", store.sources()[0][1])
 
 
+class TestGitRepoStore(_Base):
+    """纯 GIT 数据后端：读用 git show、回写用 commit + push，全程不碰 API / token。"""
+
+    def _cfg(self):
+        return {"UPDATER_BACKEND": "git", "UPDATER_GIT_PATH": "services",
+                "UPDATER_DATA_REPO": "https://github.com/me/private.git",
+                "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:me/private.git",
+                "UPDATER_DATA_BRANCH": "main", "UPDATER_FAILOVER": "1"}
+
+    def _prepare(self, store):
+        (store.mirror / ".git").mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _fake(calls, push_ok=True):
+        def fake(args, cwd=None, timeout=60, env=None, strip=True):
+            a = list(args)
+            calls.append((a, env, strip))
+            if "fetch" in a:
+                return 0, "", ""
+            if "rev-parse" in a:
+                return 0, "BASE111", ""
+            if "show" in a:
+                return 0, "WM_QQ_APPID = REAL\n", ""
+            if "hash-object" in a:
+                return 0, "BLOB111", ""
+            if "write-tree" in a:
+                return 0, "TREE111", ""
+            if "commit-tree" in a:
+                return 0, "COMMIT111", ""
+            if "push" in a:
+                return (0, "", "") if push_ok else (1, "", "non-fast-forward")
+            return 0, "", ""
+        return fake
+
+    def test_make_store_git_uses_service_subpath(self):
+        store = updater.make_store(self._cfg(), "wm-bot")
+        self.assertIsInstance(store, updater.GitRepoStore)
+        self.assertEqual(store._rel("config.txt"), "services/wm-bot/config.txt")
+        self.assertEqual(store.base_ref, "refs/updater/wm-bot")
+
+    def test_chain_has_both_git_sources_without_token(self):
+        chain = updater.make_store_chain(self._cfg(), "wm-bot")
+        self.assertEqual(len(chain.stores), 2)
+        self.assertEqual(chain.stores[1].url, "git@gitee.com:me/private.git")
+        self.assertFalse(hasattr(chain.current, "token"))
+
+    def test_refresh_uses_private_ref_not_fetch_head(self):
+        store = updater.make_store(self._cfg(), "wm-bot")
+        self._prepare(store)
+        calls = []
+        with mock.patch.object(updater, "git_cmd", side_effect=self._fake(calls)), \
+             mock.patch.object(updater, "pace_gate"):
+            sha = store.refresh()
+        self.assertEqual(sha, "BASE111")
+        fetch = [c[0] for c in calls if "fetch" in c[0]][0]
+        self.assertIn("main:refs/updater/wm-bot", fetch)
+        self.assertNotIn("FETCH_HEAD", " ".join(fetch))
+
+    def test_read_uses_git_show_and_keeps_trailing_newline(self):
+        store = updater.make_store(self._cfg(), "wm-bot")
+        self._prepare(store)
+        calls = []
+        with mock.patch.object(updater, "git_cmd", side_effect=self._fake(calls)), \
+             mock.patch.object(updater, "pace_gate"):
+            text = store.read("config.txt")
+        self.assertEqual(text, "WM_QQ_APPID = REAL\n")
+        show = [c for c in calls if "show" in c[0]][0]
+        self.assertIn("refs/updater/wm-bot:services/wm-bot/config.txt", show[0])
+        self.assertFalse(show[2], "文件内容不能被 strip 掉末尾换行")
+
+    def test_write_is_commit_and_push(self):
+        store = updater.make_store(self._cfg(), "wm-bot")
+        self._prepare(store)
+        calls = []
+        with mock.patch.object(updater, "git_cmd", side_effect=self._fake(calls)), \
+             mock.patch.object(updater, "pace_gate"):
+            store.write("runtime.json", '{"a": 1}\n')
+        flat = [" ".join(c[0]) for c in calls]
+        self.assertTrue(any("hash-object" in x for x in flat))
+        self.assertTrue(any("commit-tree" in x for x in flat))
+        pushes = [c[0] for c in calls if "push" in c[0]]
+        self.assertEqual(len(pushes), 1)
+        self.assertIn("COMMIT111:refs/heads/main", pushes[0])
+        self.assertIn("https://github.com/me/private.git", pushes[0])
+
+    def test_write_push_conflict_raises_for_retry(self):
+        store = updater.make_store(self._cfg(), "wm-bot")
+        self._prepare(store)
+        with mock.patch.object(updater, "git_cmd",
+                               side_effect=self._fake([], push_ok=False)), \
+             mock.patch.object(updater, "pace_gate"):
+            with self.assertRaises(RuntimeError):
+                store.write("runtime.json", "{}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

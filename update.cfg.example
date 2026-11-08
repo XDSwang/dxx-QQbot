@@ -1,48 +1,39 @@
 # ============================================================
 # 仓库根目录【优先配置】—— 复制成同目录的 update.cfg 再填（update.cfg 不进 git）
 #
-# run.py 启动第一件事就是读这个文件：读不到 / 数据后端没配好，不会启动任何服务。
+# run.py 启动第一件事就是读这个文件：缺文件会直接退出、不启动任何服务；
+# 文件里的数据后端没配好则只在启动自检里告警，服务照常用本地版本继续运行。
 # 公共仓库才是本体（代码 + services.json 服务清单，能放任意服务端跑）；
 # 下面这一段配的是【数据后端】—— 授权信息、配置和运行记录本来该放数据库，
-# 现在没有数据库，用 GitHub 私有仓库的文件代替。以后换成数据库地址 /
+# 现在没有数据库，用私有 GIT 仓库的文件代替（读写都走 git 指令）。以后换成数据库 /
 # 第三方数据接口，只改这一段，服务代码不用动。
 #
 # 服务端只需要一条命令：python run.py
 # ============================================================
 
 # ---------------- ① 数据后端（最先配） ----------------
-# github   = 用私有仓库文件当数据库（当前实现）
+# git      = 纯 GIT 读写私有仓库文件（默认，不需要任何密钥 / API / 第三方接口）
+#          读：git show <版本>:<文件>，只取用到的那几个文件，不落地整个仓库
+#          写：commit-tree + git push；非快进被拒就重拉-重合并（最多 3 轮）
+# github / gitee = 旧的 Contents API 后端（可选，默认不用，见 ⑤ 段）
 # local    = 本地目录当数据后端（离线测试 / 内网挂载）
 # database / http = 以后接数据库 / 第三方数据接口，现在只留位，填了会明确报「未实现」
 # ⚠️ 本文件是【数据后端的装配入口】，不是接口本身，别删：以后接数据库 / 第三方接口，
-#    就是在这里换 UPDATER_BACKEND + 填 UPDATER_DATA_URL / UPDATER_DATA_TOKEN，
-#    再按 Store 接口在 updater.make_store 注册一个适配器，服务与迁移逻辑都不用动。
-UPDATER_BACKEND = github
-
-# 私有仓库：必须是【独立 Private 仓库】，不要复用公开图床仓库。
-# token 用 fine-grained PAT，只给这个仓库的 Contents 读写权限；只轮询不回写可给只读。
-UPDATER_GITHUB_REPO = 你的账号/私有仓库名
-UPDATER_GITHUB_TOKEN = github_pat_xxxxxxxx
+#    就是在这里换 UPDATER_BACKEND，再按 Store 接口在 updater.make_store 注册一个适配器，
+#    服务与迁移逻辑都不用动。当前只需要下面几项仓库地址，别的都不用填。
+UPDATER_BACKEND = git
 # 私有仓库里「所有服务数据」的根目录；每个服务再占一个子目录 <PATH>/<服务名>/
-UPDATER_GITHUB_PATH = services
-UPDATER_GITHUB_BRANCH = main
-# UPDATER_GITHUB_API = https://api.github.com
+UPDATER_GIT_PATH = services
 
-# ---------------- ①-b 数据读写：主库 3 轮失败切 Gitee（可选） ----------------
-# 这是【数据读写层】的兜底（Contents API），不是更新判断：主库连续 3 轮拉取 / 回写失败
-# （单轮超 5 秒也记「窗口过长」并回到第一步重新拉），才切到下面这份 Gitee 备用私有库。
-# ⚠️ 整段都是可选：GITEE_TOKEN 留空就不启用，判断层完全不受影响。
-#    Gitee 私有库务必是 Private；Contents API 写文件需要 token，公开库也写不了。
+# ---------------- ①-b 故障转移：主库 3 轮失败切备用源 ----------------
+# 备用源就是 ①-c 的 UPDATER_DATA_REPO_BACKUP（同一个私有库的另一份镜像），
+# 不需要任何额外配置。主库连续 3 轮拉取 / 回写失败（单轮超 5 秒记
+# 「窗口过长」并回到第一步重新拉）才切过去，再走同样的 3 轮；全失败报「数据拉取异常」。
 UPDATER_FAILOVER = 1
-UPDATER_GITEE_REPO = <你的Gitee账号>/<你的私有库名>
-UPDATER_GITEE_TOKEN =
-UPDATER_GITEE_PATH = services
-UPDATER_GITEE_BRANCH = main
-# UPDATER_GITEE_API = https://gitee.com/api/v5
 
-# ---------------- ①-c 更新判断：GIT 双源拷贝（默认，不需要 token） ----------------
+# ---------------- ①-c 更新判断：GIT 双源拷贝（默认） ----------------
 # ⚠️ 下面两行是【GIT 拷贝用的仓库地址】，不是第三方数据接口：判断层只跑 git fetch，
-#    不碰任何 API、不需要 token。把占位换成你自己的两个私有库地址即可。
+#    不碰任何 API。把占位换成你自己的两个私有库地址即可。
 # 每轮用 GIT 指令把两个私有库都拷贝(fetch)下来：
 #   · 谁的版本新就用谁，数据读写也跟着切到那个源；
 #   · 拷贝下来没有内容变化（HEAD 没变）就是「不用更新」，本轮直接跳过；
@@ -55,7 +46,7 @@ UPDATER_DATA_REPO = https://github.com/<账号>/<私有库>.git
 UPDATER_DATA_REPO_BACKUP = git@gitee.com:<账号>/<私有库>.git
 UPDATER_DATA_BRANCH = main
 # UPDATER_FAILOVER = 0 可关掉备用源（只拷贝主库）
-# 两行都留空时，判断层会用 ① 段的 UPDATER_GITHUB_REPO 拼出主库地址（只剩单源）。
+# 两行都留空时只剩旧配置里的单源兼容路径，正常部署请填上面两行。
 
 # local 后端才生效：目录里按服务名建子目录，各放 config.txt / runtime.json /
 # owner.json（schema.json 在公共仓库，私有库不存结构文件）。更新判断走 ①-c 的 GIT 双源拷贝。
@@ -100,13 +91,14 @@ UPDATER_PUSH_RUNTIME = 1
 # ============================================================
 # 两处职责分开：更新判断走 GIT 双源拷贝，数据才属于私有库
 # ------------------------------------------------------------
-# 【更新判断 · 默认 GIT 双源拷贝 · 不需要 PAT】
+# 【更新判断 · 默认 GIT 双源拷贝】
 # 每轮 fetch 两个私有库接口，比 commit 版本选最新的那份；HEAD 没变就是不用更新。
 # 私有库有新提交就会触发下一轮更新，不需要手工改任何发布标记。
 #
-# 【私有仓库 · 只在真正更新时才访问 · 需要 PAT】
+# 【私有仓库 · 只在真正更新时才读写】
+# 读写都走 GIT 指令：git show 只取用到的文件，回写是 commit + git push。
 # 私有仓库只存「真实值」；字段结构 / 描述 / 迁移规则在公共仓库（方案 A）。
-# services/                      ← UPDATER_GITHUB_PATH
+# services/                      ← UPDATER_GIT_PATH
 #   wm-bot/                     ← 服务名（配了 NAMESPACE 则多一层）
 #     config.txt                机器人真实配置（只存值；模板 + 描述在公共仓库
 #                                wm-bot/python/config.txt，不在这里）
@@ -114,7 +106,7 @@ UPDATER_PUSH_RUNTIME = 1
 #     owner.json                首次更新时自动写入的认领标记（机器维护）
 #   <以后的服务名>/             同样三份文件，互不干扰
 #
-# 【公共仓库本体 · 结构权威 · 随代码同提交 · 进 git · 不需要 PAT】
+# 【公共仓库本体 · 结构权威 · 随代码同提交 · 进 git】
 # wm-bot/python/config.txt      配置模板（字段 + 中文描述 + 空值），reconcile 的结构基准
 # wm-bot/python/schema.json     运行数据迁移规则（改名 / 删除 / 保留），服务端只读
 #   · 服务端以公共模板为基准、私有 config.txt 的真实值为覆盖做「对账（reconcile）」：
@@ -141,10 +133,10 @@ UPDATER_PUSH_RUNTIME = 1
 # · 启动自检会在控制台直接列出：数据后端还是模板占位值、缺 services.json、
 #   不在 git 仓库且没配 UPDATER_CODE_REPO、没有 git 命令、
 #   没配 UPDATER_DATA_REPO / BACKUP、某服务私有目录缺 config。
-# · 首次部署绕不过去：PAT 不能经 git 下发，服务端要手工放一次 update.cfg，
-#   以及各服务自己的真实配置（wm-bot 是 wm-bot/python/data/config.txt）。
-# · 一个 fine-grained PAT 是【仓库级】权限，不是目录级：多台服务端各跑不同服务时，
-#   每台都能读到别的项目的文件。要隔离就得给每个项目单独建私有仓库。
+# · 首次部署只要放一次 update.cfg（启动器自动生成）和各服务真实配置
+#   （wm-bot 是 wm-bot/python/data/config.txt）；不需要任何密钥 / API 凭证。
+# · GIT 凭证同样是仓库级、不是目录级：多台服务端各跑不同服务时，
+#   每台都能读到库里别的项目的文件。要隔离就得给每个项目单独建私有仓库。
 # ============================================================
 # 多台服务端 / 多个授权 / 其他平台
 # ------------------------------------------------------------
@@ -158,7 +150,7 @@ UPDATER_PUSH_RUNTIME = 1
 #   data/config.txt、写同一批 ws_*.json。必须各给一份代码目录副本（含自己的 data/），
 #   services.json 里两项的 data_dir 不能相同 —— 启动自检会直接把这种配置报出来。
 # · 多台服务端：单实例锁是本机文件，跨机不互锁（本来就该各自独立）。
-#   每台各放一份 update.cfg / PAT，用 SERVICES_ENABLED 决定这台跑哪几个服务；
+#   每台各放一份 update.cfg（本机 git 凭证由系统保管），用 SERVICES_ENABLED 决定这台跑哪几个服务；
 #   任一边有新提交，所有机器下一轮 GIT 拷贝都会看到，这是「统一发布」的预期行为。
 # · 其他平台（Termux / QPython / Linux）：代码零第三方依赖，但 git 是外部命令，
 #   Termux 要先 pkg install git；没有 git 时启动自检会提示，GIT 双源拷贝失败会报
@@ -167,9 +159,9 @@ UPDATER_PUSH_RUNTIME = 1
 # ============================================================
 
 # ---------------- ⑤ 以后扩展（当前不生效，别填） ----------------
-# 数据库 / 第三方数据接口是【以后】才接的：那时换 UPDATER_BACKEND + 填下面两项，
-# 再按 Store 接口在 updater.make_store 注册一个适配器即可。
-# 判断层（①-c 的 GIT 双源拷贝）与读写层是分开的两套，换接口不用动判断逻辑。
-# 当前版本读了这两项只会明确报「未实现」，不会假装能连。
-# UPDATER_DATA_URL = postgres://... 或 https://your-api/...
-# UPDATER_DATA_TOKEN =
+# 数据库 / 第三方数据接口是【以后】才接的：那时换 UPDATER_BACKEND，再按 Store 接口
+# 在 updater.make_store 注册一个适配器即可。判断层（①-c 的 GIT 双源拷贝）与读写层
+# 是分开的两套，换后端不用动判断逻辑。当前版本只会明确报「未实现」，不会假装能连。
+#
+# 旧的 Contents API 后端（github / gitee）代码仍保留作兼容，默认不用；
+# 纯 GIT 后端不需要它，别填。
