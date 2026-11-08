@@ -33,8 +33,8 @@ class _Base(unittest.TestCase):
         self.state = self.root / "state"
         for p in (self.remote, self.data, self.state):
             p.mkdir()
-        # 默认信号源是公共仓库本体 signals/；离线测试里指向临时目录，
-        # 放一个 run0 表示「没有待更新」，避免每个用例都被自检刷屏。
+        # 离线测试用临时 signals/ 目录放 run0，供底层 LocalStore 的旧能力测试使用；
+        # 编排层「要不要更新」的判断已不走这些文件。
         self.signals = self.root / "signals"
         (self.signals / "wm-bot").mkdir(parents=True)
         (self.signals / "run0").write_text("0", encoding="utf-8")
@@ -379,9 +379,8 @@ class TestPreflight(_Base):
             problems = run.preflight(cfg, self.store())
         text = " ".join(problems)
         self.assertIn("占位", text)
-        self.assertIn("公共仓库 signals/", text,
-                      "缺信号时该指向公共库发布目录，而不是私有数据后端")
-        self.assertIn("runN", text)
+        self.assertNotIn("runN", text, "runN 判断已停用，自检不该再提示信号文件")
+        self.assertNotIn("公共仓库 signals/", text)
         self.assertIn("config.txt", text)
 
     def test_not_a_git_repo_is_reported(self):
@@ -444,9 +443,18 @@ class TestMainLoop(_Base):
         cfg.update({"UPDATER_BACKEND": "local",
                     "UPDATER_LOCAL_DIR": str(self.remote),
                     "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
-                    "UPDATER_SIGNAL_SOURCE": "data",   # 兼容旧布局：信号也在数据后端
+                    "UPDATER_SIGNAL_SOURCE": "data",   # 旧配置已停用，写了也会被忽略
                     "UPDATER_PUSH_RUNTIME": "0"})
         bot_a, bot_b = FakeBot(), FakeBot()
+
+        def fake_signal_store(cfg, service=None, chain=None):
+            return updater.LocalStore(
+                self.remote / service if service else self.remote)
+
+        p = mock.patch.object(updater, "GitSignalStore",
+                              side_effect=fake_signal_store)
+        p.start()
+        self.addCleanup(p.stop)
         with mock.patch.object(run, "load_cfg", return_value=cfg), \
              mock.patch.object(run, "SERVICES_FILE", manifest), \
              mock.patch.object(run, "BotProcess", side_effect=[bot_a, bot_b]), \
@@ -584,46 +592,43 @@ class TestMultiService(_Base):
 
 
 class TestSignalSeparation(_Base):
-    """runN 是公共库的发布指令，不该跟着私有库 PAT 一起走。"""
+    """判断恒为 GIT 双源拷贝；runN 只是底层旧能力，旧配置盖不回去。"""
 
-    def test_code_signal_source_is_public_repo(self):
+    def test_any_legacy_config_still_uses_git_copy(self):
+        for source in ("code", "data", "ftp", "git", ""):
+            cfg = dict(run.DEFAULTS)
+            cfg.update({"UPDATER_BACKEND": "local",
+                        "UPDATER_LOCAL_DIR": str(self.remote),
+                        "UPDATER_GITHUB_REPO": "me/private",
+                        "UPDATER_GITHUB_TOKEN": "tok",
+                        "UPDATER_SIGNAL_SOURCE": source})
+            self.assertIsInstance(updater.make_signal_store(cfg),
+                                  updater.GitSignalStore,
+                                  "旧配置 %r 不能把判断盖回 runN" % source)
+
+    def test_signal_store_is_per_service(self):
         cfg = dict(run.DEFAULTS)
-        cfg.update({"UPDATER_BACKEND": "local",
-                    "UPDATER_LOCAL_DIR": str(self.remote),
-                    "UPDATER_GITHUB_REPO": "me/private",
-                    "UPDATER_GITHUB_TOKEN": "tok",
-                    "UPDATER_SIGNAL_SOURCE": "code"})
-        signals = updater.make_signal_store(cfg)
-        data = updater.make_store(cfg, "wm-bot")
-        self.assertIsInstance(signals, updater.LocalStore)
-        self.assertEqual(signals.root, self.signals)
-        self.assertEqual(data.root, self.remote / "wm-bot",
-                         "信号后端与数据后端必须是两个不同目录")
-        self.assertFalse(signals.signal().need_update)
+        cfg["UPDATER_LOCAL_DIR"] = str(self.remote)
+        self.assertEqual(
+            updater.make_signal_store(cfg, "wm-bot").state_key, "wm-bot")
 
-    def test_data_source_is_backward_compatible(self):
-        cfg = dict(run.DEFAULTS)
-        cfg.update({"UPDATER_BACKEND": "local",
-                    "UPDATER_LOCAL_DIR": str(self.remote),
-                    "UPDATER_SIGNAL_SOURCE": "data"})
-        self.assertEqual(updater.make_signal_store(cfg, "wm-bot").root,
-                         self.remote / "wm-bot")
-
-    def test_unknown_source_is_rejected(self):
-        with self.assertRaises(ValueError):
-            updater.make_signal_store({"UPDATER_SIGNAL_SOURCE": "ftp"})
-
-    def test_no_pat_needed_to_see_a_release(self):
-        """私有目录里故意什么都不放：信号照样能判出要更新。"""
+    def test_local_run_signal_is_only_a_legacy_capability(self):
+        """底层 LocalStore 仍能读 runN，但编排层不再用它判断要不要更新。"""
         (self.signals / "run1").write_text("1", encoding="utf-8")
-        cfg = dict(run.DEFAULTS)
-        cfg["UPDATER_SIGNAL_SOURCE"] = "code"
-        sig = updater.make_signal_store(cfg).signal()
+        sig = updater.LocalStore(self.signals).signal()
         self.assertTrue(sig.need_update)
         self.assertEqual(sig.name, "run1")
 
+    def test_data_and_signal_backends_are_still_separate(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote)})
+        data = updater.make_store(cfg, "wm-bot")
+        self.assertEqual(data.root, self.remote / "wm-bot",
+                         "数据后端仍按服务落到私有目录，不受判断方式影响")
+
     def test_code_signal_triggers_only_that_service(self):
-        """新布局端到端：公共库 signals/a/run1 只更新 a，b 不受影响。"""
+        """端到端：只触发一个服务（信号源换成按服务隔离的本地目录）。"""
         (self.root / "update.cfg").write_text("UPDATER_BACKEND = local\n",
                                               encoding="utf-8")
         manifest = self.root / "services.json"
@@ -651,6 +656,15 @@ class TestSignalSeparation(_Base):
                     "UPDATER_SIGNAL_SOURCE": "code",
                     "UPDATER_PUSH_RUNTIME": "0"})
         bot_a, bot_b = FakeBot(), FakeBot()
+
+        def fake_signal_store(cfg, service=None, chain=None):
+            return updater.LocalStore(
+                self.signals / service if service else self.signals)
+
+        p = mock.patch.object(updater, "GitSignalStore",
+                              side_effect=fake_signal_store)
+        p.start()
+        self.addCleanup(p.stop)
         with mock.patch.object(run, "load_cfg", return_value=cfg), \
              mock.patch.object(run, "SERVICES_FILE", manifest), \
              mock.patch.object(run, "BotProcess", side_effect=[bot_a, bot_b]), \

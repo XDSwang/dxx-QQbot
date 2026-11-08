@@ -32,8 +32,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # 仓库根：公共仓库本体所在目录
 STATE_DIR = HERE / "data"                       # 更新器自身状态（根 .gitignore 已忽略 data/）
-# runN 属于旧版发布指令，仅 UPDATER_SIGNAL_SOURCE=code 的历史兼容路径会读：
-# 默认判断走 GitSignalStore 的 GIT 双源拷贝，不再依赖这些文件。
+# runN / signals/ 属于旧版发布指令，编排层已不再读取；下面的 pick_signal 与
+# LocalStore.signals() 只保留给离线测试与旧布局读取，不参与「要不要更新」的判断。
+# 判断统一走 GitSignalStore 的 GIT 双源拷贝。
 SIGNAL_DIR = HERE / "signals"
 
 ERROR_LOG = STATE_DIR / "updater_error.log"     # 异常日志：覆盖式，只记异常
@@ -576,22 +577,12 @@ class GitSignalStore(object):
 
 
 def make_signal_store(cfg, service=None, chain=None):
-    """更新判断默认走 GIT 双源拷贝，不再看 runN 信号文件。
+    """更新判断统一走 GIT 双源拷贝：git fetch 两个私有库接口，比版本选最新。
 
-    git  = 用 git 指令把两个私有库接口都拷贝下来，比版本选最新，拷贝无变化就不更新；
-    code = 兼容旧布局：信号在公共仓库本体 signals/runN；
-    data = 兼容更旧布局：信号与数据都在数据后端。
-    chain 传入时，git 同步选中的接口会同步成为数据后端活跃源。
+    UPDATER_SIGNAL_SOURCE 已停用：旧配置里写 code / data / 任意值都不会改变判断方式，
+    runN 信号文件不再参与「要不要更新」。chain 传入时，选中的接口同步成为数据后端活跃源。
     """
-    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "git").strip().lower()
-    if source == "git":
-        return GitSignalStore(cfg, service, chain)
-    if source == "data":
-        return make_store(cfg, service)
-    if source != "code":
-        raise ValueError("未知的 UPDATER_SIGNAL_SOURCE: %s" % source)
-    sub = (service or "").strip().strip("/")
-    return LocalStore(SIGNAL_DIR / sub if sub else SIGNAL_DIR)
+    return GitSignalStore(cfg, service, chain)
 
 
 def claim_owner(store, instance_id, service=None):

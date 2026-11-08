@@ -56,9 +56,7 @@ DEFAULTS = {
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
-    # git = 用 GIT 指令把两个私有库接口都拷贝下来，比版本选最新，拷贝无变化就不更新（默认）；
-    # code / data = 兼容旧的 runN 信号文件布局
-    "UPDATER_SIGNAL_SOURCE": "git",
+    # 判断恒为 GIT 双源拷贝；UPDATER_SIGNAL_SOURCE 已停用，旧配置写了也被忽略
     # 两个私有库接口的 git 地址（SSH 已配好，不需要 token）
     "UPDATER_DATA_REPO": "git@github.com:XDSwang/dxx_private_data.git",
     "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:xdswang/dxx_private_data.git",
@@ -275,23 +273,13 @@ def preflight(cfg, store, services=None, service_stores=None,
                     problems.append("当前不是 git 仓库：启动时会用 UPDATER_CODE_REPO 自动自举")
                 else:
                     problems.append("当前不是 git 仓库且没配 UPDATER_CODE_REPO，自动同步不可用")
-    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "git").strip().lower()
-    if source == "git":
-        signal_place = "GIT 双源同步（GitHub + Gitee 私有库）"
-    elif source == "code":
-        signal_place = "公共仓库 signals/"
-    else:
-        signal_place = "数据后端"
-    if source == "git" and not (cfg.get("UPDATER_DATA_REPO") or "").strip() \
+    if not (cfg.get("UPDATER_DATA_REPO") or "").strip() \
             and not (cfg.get("UPDATER_DATA_REPO_BACKUP") or "").strip():
         problems.append("GIT 双源同步没配 UPDATER_DATA_REPO / BACKUP，无法拷贝私有库")
     try:
-        sig = (root_signals or store).signal()
-        if source != "git" and sig.name == "(missing)":
-            problems.append("%s 里没有全局 runN 信号文件（先放一个 run0）"
-                            % signal_place)
+        (root_signals or store).signal()
     except Exception as e:
-        problems.append("信号读取失败：%s" % e)
+        problems.append("GIT 双源同步自检失败：%s" % e)
     # 两个不同授权的服务共用同一个 data_dir = 共用 data/config.txt 和同一批运行记录，
     # 运行时必然串数据；注册表层先拦住，别等出了事再查。
     if services:
@@ -318,12 +306,9 @@ def preflight(cfg, store, services=None, service_stores=None,
             if st is None:
                 continue
             try:
-                sig = sig_store.signal()
-                if source != "git" and sig.name == "(missing)":
-                    problems.append("[%s] %s 里没有 runN 信号文件（先放 run0）"
-                                    % (s.name, signal_place))
+                sig_store.signal()
             except Exception as e:
-                problems.append("[%s] 信号读取失败：%s" % (s.name, e))
+                problems.append("[%s] GIT 双源同步自检失败：%s" % (s.name, e))
             try:
                 for name in (updater.CONFIG_NAME,):
                     if st.read(name) is None:
@@ -498,7 +483,7 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
     cfg_path = Path(svc.config_file) if svc else BOT_CONFIG
     runtime_files = svc.runtime_files if svc else DEFAULT_RUNTIME_FILES
     service = svc.name if svc else None
-    updater.flog("[%s] 检测到更新信号 %s 指纹=%s"
+    updater.flog("[%s] GIT 双源检测到内容更新 %s 版本=%s"
                  % (service or "default", sig.name, sig.fingerprint))
     backup_dir = None
     succeeded = False       # 不叫 ok：do_update 里 ok 是 git_pull / 写文件的返回值
