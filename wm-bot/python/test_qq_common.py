@@ -172,6 +172,17 @@ def main():
     total += 1
     ok += check("剥 @ 标记同时回传被剥掉的标识",
                 [m["id"] for m in q.strip_mentions("@甲 @乙 D/XX/ 平原")[1]] == ["甲", "乙"])
+    # 7.01) 昵称本身带 D/XX/、用户又不打空格：按昵称长度切开，指令不能被一起吞掉
+    NAME = "自动化服务查询_D/XX/"
+    for raw, want in [("@%s平原" % NAME, "平原"),
+                      ("@%sD/XX/平原" % NAME, "D/XX/平原"),
+                      ("@%s 平原" % NAME, "平原")]:
+        total += 1
+        ok += check("昵称紧贴指令 %r -> %r" % (raw, want),
+                    q.strip_mentions(raw, NAME)[0] == want)
+    total += 1
+    ok += check("配置写简称、实际昵称带后缀时按简称切开",
+                q.strip_mentions("@自动化服务查询_D/XX/平原", "自动化服务查询")[0] == "D/XX/平原")
 
     # 7.05) 「@ 的是不是我」判定：官方机器人占位符带叹号、成员不带；号 / 昵称也能对
     GAT = {"channel": "group", "group_id": "G1"}
@@ -195,6 +206,14 @@ def main():
         total += 1
         ok += check("明文 @别人昵称 仍静默",
                     H("@小明 自检", dict(GAT)) is None)
+    finally:
+        os.environ.pop("WM_QQ_BOT_NAME", None)
+    os.environ["WM_QQ_BOT_NAME"] = NAME
+    try:
+        for raw in ("@%s自检" % NAME, "@%sD/XX/自检" % NAME):
+            total += 1
+            ok += check("全称带 D/XX/ 时 %r 仍能出回复" % raw,
+                        H(raw, dict(GAT)) is not None)
     finally:
         os.environ.pop("WM_QQ_BOT_NAME", None)
 

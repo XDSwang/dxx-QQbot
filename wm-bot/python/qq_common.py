@@ -184,9 +184,11 @@ class ImageReply(str):
 _CQ_AT_ANY = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
 _ANGLE_AT = re.compile(r"<@(!?)([^>\s]{1,64})>")
 _TEXT_AT = re.compile(r"[＠@]([^\s＠@]{1,32})")
+# 昵称和指令之间常见的分隔符（"@机器人_平原" / "@机器人|平原"），剥完顺手去掉
+_AT_SEP = "_-·—|｜:："
 
 
-def strip_mentions(text):
+def strip_mentions(text, bot_name=None):
     """剥掉消息【开头】残留的 @ 标记，返回 (剩余文本, [标记字典])。
 
     每个标记形如 {"kind": "cq"|"angle"|"text", "id": 号/昵称, "bot": 是否机器人形态}：
@@ -197,6 +199,10 @@ def strip_mentions(text):
     剥 <@!openid>），但个别实现会把 @ 标记直接当正文塞进来：此时 "D/XX/" 前缀匹配
     不上，表现出来的就是「@机器人 + 带前缀指令」没反应、裸前缀却有反应。
     只剥开头的连续标记，句子中间的（"我 @某人 打平原"）保持原样，避免误删正文。
+
+    bot_name：机器人完整昵称（WM_QQ_BOT_NAME）。明文 @ 只能靠"到空格为止"猜边界，
+    昵称一长、用户又不打空格（"@自动化服务查询_D/XX/平原"）就会把指令一起吞掉；
+    知道昵称时按昵称长度精确切开，剩下的才是指令。
     """
     t = text or ""
     marks = []
@@ -215,8 +221,13 @@ def strip_mentions(text):
             continue
         m = _TEXT_AT.match(s)
         if m:
-            marks.append({"kind": "text", "id": m.group(1), "bot": False})
-            t = s[m.end():]
+            tag, cut = m.group(1), m.end()
+            # 昵称后面紧贴指令（"@自动化服务查询_D/XX/平原"）：按昵称长度切开，
+            # 不能整段当昵称 —— 否则指令被吞光，表现为「@机器人 没反应」。
+            if bot_name and tag.startswith(bot_name) and len(tag) > len(bot_name):
+                tag, cut = bot_name, 1 + len(bot_name)
+            marks.append({"kind": "text", "id": tag, "bot": False})
+            t = s[cut:].lstrip(_AT_SEP)
             continue
         t = s
         break
@@ -230,6 +241,7 @@ def _mentioned_me(marks, sid, bot_name):
       1. 官方 `<@!机器人>` 形态 —— 叹号是机器人专属，成员占位符没有；
       2. 号对得上事件的 self_id（OneBot 会给自己的 QQ 号）；
       3. 昵称对得上 WM_QQ_BOT_NAME（有的实现干脆把 @ 当正文发，只能靠昵称认）。
+         配置写简称、实际昵称带后缀（"自动化服务查询_D/XX/"）也算 —— 按前缀认。
     两样身份都不知道（既没 self_id 也没配昵称）时，见到 CQ 码或 `<@!x>` 就按「就是我」
     处理 —— 宁可多回一句，也不要把「@机器人 平原」这种明确指令静默吞掉。
     """
@@ -239,7 +251,7 @@ def _mentioned_me(marks, sid, bot_name):
             return True
         if sid and m["id"] == sid:
             return True
-        if bot_name and m["id"] == bot_name:
+        if bot_name and (m["id"] == bot_name or m["id"].startswith(bot_name)):
             return True
         if unknown and m["kind"] == "cq":
             return True
@@ -526,9 +538,9 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 先兜底剥掉开头残留的 @ 标记（CQ 码 / <@!id> / 明文 "@昵称"）：
         # 有的实现不单发 at 段而是把 @ 混进正文，不剥就会让 D/XX/ 前缀匹配失败。
         # 顺带一句：@ 的正是自己的话，也算「对着我说」，等价于 ctx["at_me"]。
-        body, at_marks = strip_mentions(text)
         sid = str(ctx.get("self_id") or "").strip()
         bot_name = (os.environ.get("WM_QQ_BOT_NAME") or "").strip()
+        body, at_marks = strip_mentions(text, bot_name)
         at_me = bool(ctx.get("at_me")) or _mentioned_me(at_marks, sid, bot_name)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
         body, force_img, force_txt = split_style_prefix(body)
