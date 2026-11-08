@@ -171,10 +171,34 @@ def main():
                 q.strip_mentions("D/XX/ 我 @某人 打平原")[0] == "D/XX/ 我 @某人 打平原")
     total += 1
     ok += check("剥 @ 标记同时回传被剥掉的标识",
-                q.strip_mentions("@甲 @乙 D/XX/ 平原")[1] == ["甲", "乙"])
+                [m["id"] for m in q.strip_mentions("@甲 @乙 D/XX/ 平原")[1]] == ["甲", "乙"])
+
+    # 7.05) 「@ 的是不是我」判定：官方机器人占位符带叹号、成员不带；号 / 昵称也能对
+    GAT = {"channel": "group", "group_id": "G1"}
+    total += 1
+    ok += check("<@!机器人> 算 @ 我（官方机器人占位符带叹号）",
+                H("<@!BOTOPENID> 自检", dict(GAT)) is not None)
+    total += 1
+    ok += check("<@成员> 不算 @ 我（成员占位符没有叹号）",
+                H("<@7A3B9C1D> 自检", dict(GAT)) is None)
+    total += 1
+    ok += check("[CQ:at,qq=号] 与 self_id 对得上才算 @ 我",
+                H("[CQ:at,qq=999] 自检", dict(GAT, self_id="999")) is not None)
+    total += 1
+    ok += check("[CQ:at,qq=别人] 不算 @ 我",
+                H("[CQ:at,qq=111] 自检", dict(GAT, self_id="999")) is None)
+    os.environ["WM_QQ_BOT_NAME"] = "自动化服务查询"
+    try:
+        total += 1
+        ok += check("明文 @昵称 与 WM_QQ_BOT_NAME 对得上才算 @ 我",
+                    H("@自动化服务查询 自检", dict(GAT)) is not None)
+        total += 1
+        ok += check("明文 @别人昵称 仍静默",
+                    H("@小明 自检", dict(GAT)) is None)
+    finally:
+        os.environ.pop("WM_QQ_BOT_NAME", None)
 
     # 7.1) 「@机器人 + D/XX/ 指令」必须照常响应（线上故障：旧实现留着 CQ 码，前缀匹配失败）
-    GAT = {"channel": "group", "group_id": "G1"}
     for raw in ("@自动化服务查询 D/XX/自检",
                 "[CQ:at,qq=123]D/XX/自检",
                 "<@!123>D/XX/自检"):

@@ -232,6 +232,31 @@ class TestAtBot(unittest.TestCase):
         # @ 了但说的不是指令：仍然不猜、不接话
         self.assertIsNone(h("今天吃什么", at))
 
+    def test_on_message_at_segment_prefixless(self):
+        """整条链路（数组 at 段 → handler）：@机器人 + 免前缀要有回复，且回复 @ 提问人；
+        @ 的是别人的号则维持静默。"""
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c.handler = qq_bot.make_handler()
+        at_me_msg = {"post_type": "message", "message_type": "group",
+                     "group_id": 77, "user_id": 5, "self_id": 9,
+                     "message": [{"type": "at", "data": {"qq": "9"}},
+                                 {"type": "text", "data": {"text": " 自检"}}]}
+        c._on_message(FakeConn(), at_me_msg)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("[CQ:at,qq=5]", sent[0]["params"]["message"])
+        sent.clear()
+        at_other = dict(at_me_msg, message=[
+            {"type": "at", "data": {"qq": "111"}},
+            {"type": "text", "data": {"text": " 自检"}}])
+        c._on_message(FakeConn(), at_other)
+        self.assertEqual(sent, [], "@ 别人不该回")
+
     def test_monitor_records_at_user(self):
         """@机器人 开监控要记住是谁开的，推送才 @ 得到人；停止监控要连带清掉。"""
         from unittest import mock
@@ -423,7 +448,7 @@ class TestEcho(unittest.TestCase):
                   "message": [{"type": "at", "data": {"qq": "9"}},
                               {"type": "text", "data": {"text": " 今天吃什么"}}]}
         out, sent = self._feed(lambda t, c: None, at_msg)
-        self.assertIn("[recv] 群 77 用户=5 @我=是 文本='今天吃什么'", out)
+        self.assertIn("[recv] 群 77 用户=5 @我=是 at=9 self=9 文本='今天吃什么'", out)
         self.assertIn("[silent]", out)
         self.assertEqual(sent, [])
 
@@ -432,7 +457,7 @@ class TestEcho(unittest.TestCase):
         msg = {"post_type": "message", "message_type": "private", "user_id": 5,
                "self_id": 9, "message": "D/XX/自检"}
         out, sent = self._feed(lambda t, c: "好的", msg)
-        self.assertIn("[recv] 私聊 5 用户=5 @我=否 文本='D/XX/自检'", out)
+        self.assertIn("[recv] 私聊 5 用户=5 @我=否 at=- self=9 文本='D/XX/自检'", out)
         self.assertIn("[reply] 私聊 5", out)
         self.assertEqual(len(sent), 1)
 

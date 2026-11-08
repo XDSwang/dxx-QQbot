@@ -437,6 +437,18 @@ class TestOnEvent(unittest.TestCase):
         self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
 
+    def test_group_full_message_at_bot_allows_prefixless(self):
+        """全量模式里「@机器人 自检」也走这个事件：带叹号的占位符要认成 at_me，
+        否则免前缀的 @ 指令会被当闲聊静默（线上故障：@ 了没反应，带 D/XX/ 才有）。"""
+        self.bot._on_event(None, self._pkt_group_full("<@!bot_openid> 自检"), "TOK")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("出图模式", self.calls[0][2])
+
+    def test_group_full_message_at_member_still_silent(self):
+        """@ 的是普通成员（占位符没有叹号）：不算对着机器人说，免前缀仍静默。"""
+        self.bot._on_event(None, self._pkt_group_full("<@7A3B9C1D> 自检"), "TOK")
+        self.assertEqual(self.calls, [])
+
     def test_image_reply_sends_tail_in_same_message(self):
         """WM 回复：图片 + /w 字符串合成一条图文混排消息，且不带 (wf.m ...) 备注。"""
         calls = []

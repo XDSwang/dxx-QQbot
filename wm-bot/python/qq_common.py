@@ -179,16 +179,20 @@ class ImageReply(str):
 
 # 消息里可能残留的 @ 标记（传输层本该剥干净，这里兜底）：
 #   OneBot 字符串协议  [CQ:at,qq=123,name=…]
-#   官方机器人占位符    <@!A1B2C3>
+#   官方机器人占位符    <@!机器人> / <@成员> / <@all>
 #   被当成普通文字发来的  @昵称
-_CQ_AT_ANY = re.compile(r"\[CQ:at,[^\]]*\]")
-_ANGLE_AT = re.compile(r"<@!?[^>\s]{1,64}>")
+_CQ_AT_ANY = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
+_ANGLE_AT = re.compile(r"<@(!?)([^>\s]{1,64})>")
 _TEXT_AT = re.compile(r"[＠@]([^\s＠@]{1,32})")
 
 
 def strip_mentions(text):
-    """剥掉消息【开头】残留的 @ 标记，返回 (剩余文本, [被剥掉的标识])。
+    """剥掉消息【开头】残留的 @ 标记，返回 (剩余文本, [标记字典])。
 
+    每个标记形如 {"kind": "cq"|"angle"|"text", "id": 号/昵称, "bot": 是否机器人形态}：
+      cq    → OneBot 字符串协议的 [CQ:at,qq=123]，id 是 QQ 号；
+      angle → 官方占位符，带叹号的是【机器人】（<@!bot>），成员是 <@openid>；
+      text  → 被当正文发来的 "@昵称"，id 是昵称。
     两个传输层正常已经剥过（onebot._parse_message 剥 CQ 码、qq_official.strip_mention
     剥 <@!openid>），但个别实现会把 @ 标记直接当正文塞进来：此时 "D/XX/" 前缀匹配
     不上，表现出来的就是「@机器人 + 带前缀指令」没反应、裸前缀却有反应。
@@ -198,19 +202,48 @@ def strip_mentions(text):
     marks = []
     while True:
         s = t.lstrip()
-        m = _CQ_AT_ANY.match(s) or _ANGLE_AT.match(s)
+        m = _CQ_AT_ANY.match(s)
         if m:
-            marks.append(m.group(0))
+            marks.append({"kind": "cq", "id": m.group(1).strip(), "bot": False})
+            t = s[m.end():]
+            continue
+        m = _ANGLE_AT.match(s)
+        if m:
+            # 带叹号 = 官方机器人占位符；成员是 <@openid>，全体是 <@all>
+            marks.append({"kind": "angle", "id": m.group(2), "bot": bool(m.group(1))})
             t = s[m.end():]
             continue
         m = _TEXT_AT.match(s)
         if m:
-            marks.append(m.group(1))
+            marks.append({"kind": "text", "id": m.group(1), "bot": False})
             t = s[m.end():]
             continue
         t = s
         break
     return t.strip(), marks
+
+
+def _mentioned_me(marks, sid, bot_name):
+    """被剥掉的 @ 标记里，有没有「就是我」。
+
+    判断顺序（对上一条就算我，因为群里 @ 机器人通常只有它一个）：
+      1. 官方 `<@!机器人>` 形态 —— 叹号是机器人专属，成员占位符没有；
+      2. 号对得上事件的 self_id（OneBot 会给自己的 QQ 号）；
+      3. 昵称对得上 WM_QQ_BOT_NAME（有的实现干脆把 @ 当正文发，只能靠昵称认）。
+    两样身份都不知道（既没 self_id 也没配昵称）时，见到 CQ 码或 `<@!x>` 就按「就是我」
+    处理 —— 宁可多回一句，也不要把「@机器人 平原」这种明确指令静默吞掉。
+    """
+    unknown = not sid and not bot_name
+    for m in marks:
+        if m["kind"] == "angle" and m["bot"]:
+            return True
+        if sid and m["id"] == sid:
+            return True
+        if bot_name and m["id"] == bot_name:
+            return True
+        if unknown and m["kind"] == "cq":
+            return True
+    return False
 
 
 def split_style_prefix(text):
@@ -495,8 +528,8 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 顺带一句：@ 的正是自己的话，也算「对着我说」，等价于 ctx["at_me"]。
         body, at_marks = strip_mentions(text)
         sid = str(ctx.get("self_id") or "").strip()
-        at_me = bool(ctx.get("at_me")) or bool(sid) and any(
-            sid in mk for mk in at_marks)
+        bot_name = (os.environ.get("WM_QQ_BOT_NAME") or "").strip()
+        at_me = bool(ctx.get("at_me")) or _mentioned_me(at_marks, sid, bot_name)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
         body, force_img, force_txt = split_style_prefix(body)
         # —— 所有「交互指令」必须带 D/XX/ 前缀，防群聊闲聊误触发 ——

@@ -305,6 +305,9 @@ class _ImageSendResult:
 
 # ---------------- 剥离 @ 占位符 ----------------
 _MENTION_RE = re.compile(r"<@!?\w+>")
+# 机器人专属占位符（带叹号）：<@!bot_openid>。成员是 <@openid>、全体是 <@all>，
+# 所以「这条消息 @ 的是不是机器人」只看有没有这个叹号，不用猜。
+_BOT_MENTION_RE = re.compile(r"<@!\w+>")
 
 
 def strip_mention(text):
@@ -665,10 +668,16 @@ class OfficialBot:
                             % (group_openid,
                                (d.get("author") or {}).get("user_openid"),
                                raw, text))
-            # full_message：这条消息没有 @ 机器人，回复也不要「对着某人引用」，
+            # full_message：这条消息不是专门 @ 机器人的，回复也不要「对着某人引用」，
             # 而是单纯往群里发一条普通消息（不 @ 任何人、不带 msg_id 引用）。
             ctx = {"channel": "group", "group_id": group_openid,
                    "full_message": True}
+            # 但「@机器人 平原」在全量模式下也走这个事件：机器人占位符带叹号
+            # （<@!bot_openid>），普通成员是 <@openid>、全体是 <@all>。据此点亮 at_me，
+            # 否则免前缀的 @ 指令会被当成闲聊静默 —— 用户看到的就是「@ 了没反应」。
+            if _BOT_MENTION_RE.search(raw):
+                ctx["at_me"] = True
+                ctx["user_id"] = (d.get("author") or {}).get("user_openid")
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")

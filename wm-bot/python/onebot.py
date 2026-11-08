@@ -67,6 +67,23 @@ def _peer(msg):
     return "私聊 %s" % (msg.get("user_id") or "")
 
 
+def _at_targets(raw):
+    """消息里所有 @ 目标的标识（数组段取 data.qq，字符串取 CQ 码）。
+
+    只用于诊断输出与「认不出自己是谁时」的兜底判断 —— 不参与正常文本拼接。
+    注意与 _at_list() 区分：那个是把 send_active 的 at_user 参数归一成号列表。
+    """
+    if isinstance(raw, list):
+        out = []
+        for seg in raw:
+            if isinstance(seg, dict) and seg.get("type") == "at":
+                qq = str((seg.get("data") or {}).get("qq") or "").strip()
+                if qq:
+                    out.append(qq)
+        return out
+    return [m.group(1).strip() for m in _CQ_AT.finditer(str(raw or ""))]
+
+
 def _parse_message(raw, self_id):
     """把 OneBot 的 message 拆成 (纯文本, 是否 @ 了机器人)。
 
@@ -415,15 +432,23 @@ class OneBotClient:
         # @ 机器人 = 这句话是明确对着我说的：ctx.at_me 亮起来，qq_common 就允许
         # 不带 D/XX/ 前缀；同时把发送者放进 ctx，回复和后续推送都 @ 他。
         text, at_me = _parse_message(msg.get("message", ""), _bot_self_id(msg))
+        ats = _at_targets(msg.get("message", ""))
+        self_id = _bot_self_id(msg)
+        if not at_me and ats and not self_id:
+            # 这个实现连自己的号都不给（事件里没 self_id、也没配 WM_QQ_SELF_ID）：
+            # 没法比对，就按「群里有人 @ 了本机器人」处理 —— 宁可多回一句，
+            # 也不要把「@机器人 平原」静默吞掉。配好 WM_QQ_SELF_ID 即可精确判定。
+            at_me = True
         if self.handler is None:
             return
         ctx = dict(msg)
         ctx["at_me"] = at_me
         ctx["user_id"] = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
         # 收到就打一行：手机上分不清「机器人没收到」还是「收到了但静默」，全靠这行。
-        bot_config.echo("[recv] %s 用户=%s @我=%s 文本=%r"
+        bot_config.echo("[recv] %s 用户=%s @我=%s at=%s self=%s 文本=%r"
                         % (_peer(msg), ctx.get("user_id"),
-                           "是" if at_me else "否", text))
+                           "是" if at_me else "否",
+                           ",".join(ats) or "-", self_id or "-", text))
         try:
             reply = self.handler(text, ctx)
         except Exception as e:
