@@ -276,24 +276,16 @@ class GitHubStore(object):
         return base64.b64decode(obj["content"]).decode("utf-8")
 
     def write(self, name, text):
-        # 多台服务端可能同时回写同一个 runtime.json：409 时重新列目录拿最新 sha，
-        # 最多 3 轮（规范 1.1 静默重试 ≤3 次），仍冲突就如实抛给上层记异常日志。
-        for attempt in range(3):
-            listing = self._dir()
-            body = {"message": "updater: migrated runtime data",
-                    "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
-                    "branch": self.branch}
-            if name in listing:
-                body["sha"] = listing[name]["sha"]
-            try:
-                self._api("PUT", self._url(name), body)
-                self._listing = None
-                return
-            except urllib.error.HTTPError as e:
-                if e.code != 409 or attempt == 2:
-                    raise
-                self._listing = None
-                time.sleep(HOST_GAP_SECONDS)
+        # 并发写同文件时 GitHub 返回 409（sha 已变 = 别人先写了）。这里不自行重试同内容，
+        # 避免用旧快照冲掉别人的更新；交由调用方（push_runtime）重拉-重合并后重试。
+        listing = self._dir()
+        body = {"message": "updater: migrated runtime data",
+                "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                "branch": self.branch}
+        if name in listing:
+            body["sha"] = listing[name]["sha"]
+        self._api("PUT", self._url(name), body)
+        self._listing = None
 
 
 def make_store(cfg, service=None):
@@ -589,11 +581,61 @@ def write_runtime_files(runtime, data_dir, backup=True, backup_base=None):
         return False, str(e)
 
 
-def push_runtime(store, runtime):
-    """把「最新完整 + 旧数据迁移」的结果回写私有地址（用户只读，服务端只写）。"""
+def _rebase_runtime(migrated, schema, cloud):
+    """以本地迁移结果为基准，补回云端独有文件（别的设备刚写的），再统一过一遍 schema。
+
+    用于回写冲突后：本地这份是已迁移的完整结果，云端可能有别的服务端 / 本人刚写的
+    字段，合进来再提交就不会把别人的数据冲掉。
+    """
+    union = dict(cloud)
+    union.update(migrated)                  # 本地优先
+    out, _ = migrate_runtime(union, schema, cloud)
+    return out
+
+
+def push_runtime(store, runtime, schema=None, service=None, max_attempts=3, window=5.0):
+    """把本服务迁移结果回写私有库，带「重拉-重合并」兜底，防并发改写 / 写回卡死丢数据。
+
+    风险：拉私有库与写回云端之间若另一台设备改了私有库（或本次写回卡住 / 失败），
+    直接 PUT 会冲掉别人的数据 / 导致本地与云端不同步。
+    对策：每轮记录耗时；遇到写回异常（含 409 并发改写）或单轮超 window 秒（窗口过长、
+    易踩并发），就重新拉最新云端 runtime，以本地迁移结果为基准再合云端独有文件，最多
+    max_attempts 轮；全失败报「私有库异常」并返回 False。本地数据始终完整，不会因回写
+    失败而丢失。
+    """
+    schema = schema or {}
     text = json.dumps(runtime, ensure_ascii=False, indent=2) + "\n"
-    store.write(RUNTIME_NAME, text)
-    return text
+    last_err = ""
+    for attempt in range(max_attempts):
+        t0 = time.time()
+        try:
+            store.write(RUNTIME_NAME, text)
+            flog("[%s] 运行数据已回写私有库（第 %d 轮）"
+                         % (service or "default", attempt + 1))
+            return True
+        except Exception as e:
+            elapsed = time.time() - t0
+            last_err = str(e)
+            if elapsed > window:
+                flog("[%s] 回写耗时 %.1fs > %ds，疑似窗口过长（第 %d 轮）"
+                             % (service or "default", elapsed, window, attempt + 1))
+            else:
+                flog("[%s] 回写失败（第 %d 轮）：%s"
+                             % (service or "default", attempt + 1, last_err))
+            # 重新拉最新云端 runtime，以本地迁移结果为基准再合云端独有文件后重试
+            try:
+                store.refresh()
+                raw = store.read(RUNTIME_NAME)
+                cloud = json.loads(raw) if raw else {}
+            except Exception as e2:
+                elog("[%s] 重新拉取私有库 runtime 失败"
+                             % (service or "default"), str(e2))
+                cloud = {}
+            runtime = _rebase_runtime(runtime, schema, cloud)
+            text = json.dumps(runtime, ensure_ascii=False, indent=2) + "\n"
+    elog("[%s] 私有库回写 %d 轮均失败，疑似私有库异常或并发改写（本地数据仍完整）"
+         % (service or "default", max_attempts), last_err)
+    return False
 
 
 def push_config(store, text):

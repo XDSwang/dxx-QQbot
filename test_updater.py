@@ -798,26 +798,83 @@ class TestGitHubStore(unittest.TestCase):
                          "第二轮必须重新列目录，不能拿上一轮缓存的旧配置")
         self.assertEqual(len(gets), 2)
 
-    def test_write_retries_409_with_fresh_sha(self):
-        """多台服务端同时回写：409 后重新列目录拿最新 sha，最多 3 轮。"""
+    def test_write_puts_with_current_sha(self):
+        """正常回写：带当前 sha 一次 PUT 成功，不自行重试。"""
         calls = []
-
         def fake(method, url, body=None):
             calls.append((method, url, body))
             if method == "GET":
                 return [{"name": "runtime.json", "sha": "S1",
                          "content": _b64("{}")}]
-            if len([c for c in calls if c[0] == "PUT"]) == 1:
-                raise urllib.error.HTTPError(url, 409, "conflict", {}, None)
             return {"ok": True}
-
         s = updater.GitHubStore("me/private-repo", "tok", "wm-bot")
         s._api = fake
-        with mock.patch.object(updater.time, "sleep"):
+        s.write("runtime.json", '{"x": 1}')
+        puts = [c for c in calls if c[0] == "PUT"]
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][2]["sha"], "S1")
+
+    def test_write_raises_on_409_no_internal_retry(self):
+        """并发改写（409）立即抛出：不自行重试同内容，交由调用方重拉-重合并。"""
+        calls = []
+        def fake(method, url, body=None):
+            calls.append((method, url, body))
+            if method == "GET":
+                return [{"name": "runtime.json", "sha": "S1",
+                         "content": _b64("{}")}]
+            if method == "PUT":
+                raise urllib.error.HTTPError(url, 409, "conflict", {}, None)
+            return None
+        s = updater.GitHubStore("me/private-repo", "tok", "wm-bot")
+        s._api = fake
+        with self.assertRaises(urllib.error.HTTPError):
             s.write("runtime.json", '{"x": 1}')
         puts = [c for c in calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 2)
-        self.assertEqual(puts[1][2]["sha"], "S1")
+        self.assertEqual(len(puts), 1, "409 立即抛出，不浪费同内容重试")
+
+
+class TestPushRuntimeRebase(_Base):
+    """回写冲突 / 失败时的「重拉-重合并」兜底（防并发改写与写回卡死丢数据）。"""
+
+    def test_rebases_on_conflict_then_succeeds(self):
+        # 第一轮回写被并发改写（异常）→ 重新拉最新云端 runtime，以本地迁移结果为基准
+        # 再合云端独有文件后重试，第二轮回写成功，不丢别人的数据。
+        class Store(object):
+            def __init__(self):
+                self.writes = 0
+                self.last = None
+                self.cloud = {"ws_filters.json": {"version": 1, "sessions": {"g|1": ["古纪"]}}}
+            def refresh(self):
+                pass
+            def read(self, name):
+                return json.dumps(self.cloud)
+            def write(self, name, text):
+                self.writes += 1
+                if self.writes == 1:
+                    raise RuntimeError("409 conflict")
+                self.last = text
+        store = Store()
+        local = {"ws_subs.json": {"version": 1, "sessions": {"g|1": {"users": ["alerts"]}}}}
+        ok = updater.push_runtime(store, local, schema={}, service="wm-bot")
+        self.assertTrue(ok)
+        pushed = json.loads(store.last)
+        # 本地字段保留
+        self.assertEqual(pushed["ws_subs.json"]["sessions"]["g|1"]["users"], ["alerts"])
+        # 云端独有文件也保留（别人的数据没被冲掉）
+        self.assertIn("ws_filters.json", pushed)
+        self.assertEqual(pushed["ws_filters.json"]["sessions"]["g|1"], ["古纪"])
+
+    def test_reports_anomaly_after_max_attempts(self):
+        class Store(object):
+            def refresh(self):
+                pass
+            def read(self, name):
+                return json.dumps({"ws_subs.json": {"version": 1}})
+            def write(self, name, text):
+                raise RuntimeError("persistent 409")
+        store = Store()
+        ok = updater.push_runtime(store, {"ws_subs.json": {"version": 1}}, service="wm-bot")
+        self.assertFalse(ok, "持续冲突 / 失败应返回 False 并报「私有库异常」")
 
 
 if __name__ == "__main__":

@@ -502,7 +502,7 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
                                  % (service or "default", owner),
                                  "本实例=%s；给两台服务端各配 UPDATER_DATA_NAMESPACE" % instance)
                 else:
-                    updater.push_runtime(store, migrated)
+                    updater.push_runtime(store, migrated, schema, service)
             except Exception as e:
                 updater.elog("[%s] 运行数据回写失败（服务端本地已迁移完成）"
                              % (service or "default"), str(e))
