@@ -970,6 +970,10 @@ def main():
     saved_a = ws_monitor.load_at_users()
     if saved_a:
         print(f"[official] 已恢复 {saved_a} 个会话的监控发起人", file=sys.stderr)
+    # 恢复成员级订阅：群里「停止监控」只撤自己，「停止全部监控」才清全群
+    saved_s = ws_monitor.load_subs()
+    if saved_s:
+        print(f"[official] 已恢复 {saved_s} 个会话的成员订阅", file=sys.stderr)
     # 可选：对白名单群自动注册「警报 / 活动」主推（默认关，见 WS_AUTO_PRIORITY）
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:

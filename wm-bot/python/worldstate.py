@@ -2311,6 +2311,43 @@ def is_switch_command(text):
 HELP_WORDS = {"世界", "世界状态", "worldstate", "ws"}  # 世界状态专项总览（全部命令见「帮助」/「?」）
 PLAN_WORDS = {"计划", "plan", "schedule", "到期", "刷新计划"}
 
+# 「停止全部监控」的口语写法：出现在停止指令里就表示清理本会话所有人
+STOP_ALL_WORDS = ("所有人", "全部人", "全部成员", "所有成员", "全群", "整群",
+                  "全部", "所有", "全", "all")
+
+
+def _parse_stop(t):
+    """解析停止指令：默认只停「自己」，带「全部 / 所有 / 全群」才停本会话所有人。
+
+    只解析语义，真正的清理由 ws_monitor.stop_monitor 按会话键执行，
+    绝不影响其它群 / 私聊。
+    """
+    s = t
+    for w in ("停止监控", "取消监控", "结束监控", "unmonitor", "stop", "停止", "取消"):
+        if s.startswith(w):
+            s = s[len(w):].strip(" /:：,，")
+            break
+    scope_all = any(w in s for w in STOP_ALL_WORDS)
+    for w in sorted(STOP_ALL_WORDS, key=len, reverse=True):
+        s = s.replace(w, " ")
+    s = s.strip(" /:：,，")
+    for w in ("监控", "monitor"):
+        if s.startswith(w):
+            s = s[len(w):]
+            break
+    s = s.strip(" /:：,，")
+    if not s:
+        return {"action": "stop", "scope": "all" if scope_all else "self"}
+    sub = _parse_monitor(s)
+    if sub.get("action") == "monitor":
+        out = {"action": "stop", "scope": "all" if scope_all else "self",
+               "types": sub["types"]}
+        for k in ("fissure_filter", "bounty_filter"):
+            if sub.get(k):
+                out[k] = sub[k]
+        return out
+    return {"action": "stop_hint"}
+
 
 # ----------------------------- 指令解析 -----------------------------
 def parse_ws_command(text):
@@ -2326,8 +2363,8 @@ def parse_ws_command(text):
         return _parse_monitor(t[2:].strip())
     if first.startswith("monitor"):
         return _parse_monitor(t[7:].strip())
-    if first.startswith("停止监控") or first.startswith("取消监控") or first.startswith("停止"):
-        return {"action": "stop"}
+    if first.startswith(("停止", "取消", "stop", "unmonitor")):
+        return _parse_stop(t)
     if t in HELP_WORDS:
         return {"action": "help"}
     if t in PLAN_WORDS:
@@ -2453,7 +2490,9 @@ HELP_TEXT = (
     "                     多条件 AND；连写也行（后纪中断 = 后纪且中断）。\n"
     "                     ⚠️ 裂缝=普通裂缝，钢铁裂缝=钢铁之路，两栏分开算：\n"
     "                        「监控 裂缝 后纪」只看普通；「监控 钢铁裂缝 后纪」只看钢铁。\n"
-    "  停止监控       停止本会话的推送（同时清掉本会话的开关设置）\n"
+    "  停止监控       只停你自己的推送（群里别人开的、别的群、私聊都不受影响）\n"
+    "  停止监控 警报  只停你监控的某个栏目（可写多个：停止监控 警报 裂缝）\n"
+    "  停止全部监控   停掉本群所有人的监控 + 清除本群的开关设置（只影响本群）\n"
     "  ★ 发消息直接开关主推，不用改配置、不用重启（设置会存盘，重启后自动恢复）：\n"
     "      活动=开启    警报=开启    活动=关闭    警报=关闭\n"
     "      也支持 alerts=on / events=off / 活动 开启 / 关闭 警报 / 活动=开启，警报=开启\n"
@@ -2465,7 +2504,7 @@ HELP_TEXT = (
     "  回复形式：默认一律发白底卡片图；要复制文字就在指令前加「文字」两个字，\n"
     "        例如「文字 D/XX/裂缝」「文字 D/XX/WM Boltor Prime」。\n"
     "  ⚠️ 所有交互指令在群聊都需带 D/XX/ 前缀，避免群友闲聊误触发；例如：\n"
-    "        D/XX/平原  D/XX/警报  D/XX/裂缝  D/XX/计划  D/XX/监控警报  D/XX/停止监控\n"
+    "        D/XX/平原  D/XX/警报  D/XX/裂缝  D/XX/计划  D/XX/监控警报  D/XX/停止全部监控\n"
     "        （@机器人 也能直接用，此时不用打 D/XX/，回复和监控推送都会 @ 你）\n"
     "        ★ 例外：直接发「帮助」两个字就出这份菜单，不用加前缀。\n"
     "        只有「机器人主动推送」的外发监控消息不受此限制（它本来就不是用户指令）。\n"

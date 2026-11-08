@@ -134,7 +134,7 @@ _HELP_QUERY_WORDS = (
 
 _HELP_OTHER_WORDS = (
     # 监控 / 开关 / 辅助指令（长的写全，避免被上面的栏目名抢走）
-    "停止监控", "取消监控", "监控全部", "监控", "主推状态",
+    "停止全部监控", "停止监控", "取消全部监控", "取消监控", "监控全部", "监控", "主推状态",
     "活动=开启", "警报=开启", "活动=关闭", "警报=关闭",
     "全部=开启", "主推=开启",
     "开启", "关闭", "自检", "帮助", "文字", "图片",
@@ -567,7 +567,8 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
         if not parts:
             parts.append("（没有识别到可设置的栏目，试试「活动=开启」）")
         parts.append("💾 设置已保存，重启后自动恢复。\n"
-                     "发「主推状态」看当前开关；发「停止监控」全部停止并清除设置。")
+                     "发「主推状态」看当前开关；"
+                     "「停止监控」只停自己的，「停止全部监控」清本群所有人的设置。")
         return finalize("\n\n".join(parts), ctx,
                         force_image=force_image, force_text=force_text,
                         attach=False, title="星际战甲 · 主推开关")
@@ -575,20 +576,56 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
         return finalize(worldstate.HELP_TEXT + "\n\n" + wm.format_reply({"served": "help"}),
                         ctx, force_image=force_image, force_text=force_text,
                         title="星际战甲 · 世界状态指令", colors=help_colors())
-    if action == "stop":
+    if action in ("stop", "stop_hint"):
         ch, tid = _ctx_ids(ctx)
         if ch is None:
             return finalize("（无法识别会话，停止监控失败）", ctx,
                             force_image=force_image, force_text=force_text,
                             attach=False,
                             title="星际战甲 · 世界状态监控")
-        removed = ws_monitor.stop_monitor(ch, tid)
-        return finalize(
-            ("✅ 已停止本会话的世界状态监控，并清除已保存的开关设置\n"
-             "（想重新开启，发「活动=开启」或「监控 警报」即可）。"
-             if removed else "（本会话没有进行中的监控）"),
-            ctx, force_image=force_image, force_text=force_text, attach=False,
-            title="星际战甲 · 世界状态监控")
+        if action == "stop_hint":
+            return finalize(
+                "⚠️ 没认出要停哪个栏目，什么都没改。\n"
+                "· 停自己的监控：发「停止监控」\n"
+                "· 停本群所有人的监控：发「停止全部监控」\n"
+                "· 只停某个栏目：发「停止监控 警报」",
+                ctx, force_image=force_image, force_text=force_text, attach=False,
+                title="星际战甲 · 世界状态监控")
+        scope = cmd.get("scope") or "self"
+        types = cmd.get("types") or None
+        names = "、".join(worldstate.TYPES[t][0] for t in (types or [])
+                         if t in worldstate.TYPES)
+        user = ((ctx.get("user_id") or ctx.get("sender_id"))
+                if ch == "group" else None)
+        # 会话键已在 ws_monitor 内部按 (channel, target_id) 锁定：
+        # 这里无论停自己还是停全群，都只动当前这个群 / 这个私聊。
+        if scope == "all":
+            stopped = ws_monitor.stop_monitor(ch, tid, types=types, everyone=True)
+            msg = ("✅ 已停止本群所有人的监控%s，并清除本群保存的开关设置\n"
+                   "（只影响本群，其它群和私聊的监控原样保留；"
+                   "想重新开启，发「监控 警报」即可）。"
+                   % ("（%s）" % names if names else ""))
+            if not stopped:
+                msg = "（本群没有进行中的监控）"
+            return finalize(msg, ctx, force_image=force_image, force_text=force_text,
+                            attach=False, title="星际战甲 · 世界状态监控")
+        stopped = ws_monitor.stop_monitor(ch, tid, types=types, user=user)
+        if not stopped:
+            msg = ("（你名下没有进行中的监控）"
+                   if user else "（本会话没有进行中的监控）")
+            if user:
+                msg += "\n要停掉本群所有人的监控，发「停止全部监控」。"
+        else:
+            msg = ("✅ 已停止你在本%s的监控%s\n"
+                   "（本群其他成员、其它群与私聊都不受影响；"
+                   "想重新开启，发「监控 警报」即可）。"
+                   % ("群" if ch == "group" else "私聊",
+                      "（%s）" % names if names else "")
+                   if user else
+                   "✅ 已停止本会话的世界状态监控，并清除已保存的开关设置\n"
+                   "（想重新开启，发「活动=开启」或「监控 警报」即可）。")
+        return finalize(msg, ctx, force_image=force_image, force_text=force_text,
+                        attach=False, title="星际战甲 · 世界状态监控")
     if action == "monitor":
         ch, tid = _ctx_ids(ctx)
         if ch is None:
@@ -627,7 +664,7 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
                     "（%d 秒防抖）；刚开监控先记现状，不补发历史。"
                     % (pn, int(ws_monitor.priority_min_gap())))
         msg += ("\n💡 也可以发「活动=开启」「警报=关闭」单独开关主推（会存盘，重启后仍在）；"
-                "\n发送「停止监控」即可停止。")
+                "\n发送「停止监控」只停你自己的（加「全部」才停本群所有人）。")
         return finalize(msg, ctx, force_image=force_image, force_text=force_text,
                         title="星际战甲 · 世界状态监控")
     if action == "monitor_hint":
@@ -637,7 +674,7 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
             "· 监控全部栏目：发完整的「监控全部」\n"
             "· 监控指定栏目：发「监控 警报」「监控 平原」「监控 裂缝」等\n"
             "· 查看可监控栏目：发「世界」或「帮助」\n"
-            "· 停止监控：发「停止监控」",
+            "· 停止自己的监控：发「停止监控」（只停某个栏目：停止监控 警报）",
             ctx, force_image=force_image, force_text=force_text, attach=False,
             title="星际战甲 · 世界状态监控")
     if action in ("query", "plan"):

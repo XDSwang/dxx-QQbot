@@ -58,9 +58,12 @@ DEFAULT_SWITCH_FILE = HERE / "data" / "ws_switches.json"
 LAST_SENT_FILE = HERE / "data" / "ws_last_sent.json"   # 按栏目去重记录（落盘，防重启重发）
 DEFAULT_FILTER_FILE = HERE / "data" / "ws_filters.json"  # 裂缝维度过滤（落盘，重启后恢复）
 DEFAULT_AT_FILE = HERE / "data" / "ws_at_users.json"     # 谁发的监控指令（推送时 @ 他）
+DEFAULT_SUB_FILE = HERE / "data" / "ws_subs.json"        # 成员级订阅：谁开了哪些栏目
 
 _sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text[, at_user]) -> bool
 _monitors = {}                       # (channel, target_id) -> set(types)
+_subs = {}                           # (channel, target_id) -> {type: set(uid)}  成员级订阅
+                                     # uid 为空串 = 会话级订阅（开关恢复 / 自动主推，不属于某个人）
 _at_users = {}                       # (channel, target_id) -> 发起监控的用户号（推送时 @ 他）
 _fissure_filters = {}                # (channel, target_id) -> {栏目键: [token...]}
                                      # 栏目维度过滤：裂缝(纪/星球/任务) 与 赏金(集团/地区) 共用
@@ -306,9 +309,20 @@ def set_switch(channel, target_id, types, on):
                 _monitors[key] = set(todo)
             else:
                 mon.update(todo)
+            # 主推开关是会话级设置，不属于某个成员：记成空 uid 的会话级订阅，
+            # 个人「停止监控」不会把它清掉，只有「停止全部监控」才清。
+            cols = _subs.setdefault(key, {})
+            for t in todo:
+                cols.setdefault(t, set()).add("")
         elif mon is not None:
             for t in todo:
                 mon.discard(t)
+            cols = _subs.get(key)
+            if cols:
+                for t in todo:
+                    cols.pop(t, None)
+                if not cols:
+                    _subs.pop(key, None)
         seen = _seen_priority.get(key)
         if seen:
             for t in todo:
@@ -322,6 +336,7 @@ def set_switch(channel, target_id, types, on):
                 if not ff:
                     _fissure_filters.pop(key, None)
         _save_switches()
+        _save_subs()
         if not on and _fissure_filters:
             _save_filters()
     if on:
@@ -378,7 +393,8 @@ def load_filters():
                 if ch not in ("group", "private") or not tid:
                     continue
                 f = {c: list(toks) for c, toks in v.items()
-                     if c in ("fissures", "steel") and isinstance(toks, list)}
+                     if c in ("fissures", "steel", "bounty")
+                     and isinstance(toks, list)}
                 if f:
                     data[(ch, tid)] = f
     except Exception:
@@ -439,6 +455,99 @@ def at_user_of(channel, target_id):
     """本会话最近一次开监控的人；没记录就返回 None（推送时不 @ 任何人）。"""
     with _lock:
         return _at_users.get((channel, str(target_id)))
+
+
+def sub_file():
+    raw = os.environ.get("WS_SUB_FILE")
+    return Path(raw) if raw else DEFAULT_SUB_FILE
+
+
+def _save_subs():
+    """原子写盘成员级订阅；磁盘不可写时静默降级为本次运行有效。
+
+    只写「谁订阅了哪个栏目」，键带 channel，天然按会话隔离：
+    一个群 / 一个私聊的清理动作永远只碰自己那一行。
+    """
+    p = sub_file()
+    tmp = p.with_name(p.name + ".tmp")
+    payload = {"version": 1,
+               "sessions": {"%s|%s" % (ch, tid):
+                            {t: sorted(u for u in us if u)
+                             for t, us in sorted(cols.items()) if us}
+                            for (ch, tid), cols in _subs.items() if cols}}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def load_subs():
+    """启动时恢复成员级订阅；坏文件当空。
+
+    老版本没有 ws_subs.json：用已经恢复出来的 _monitors 补成「会话级订阅」，
+    这样「停止全部监控」清得掉、个人「停止监控」也不会误清别人的设置。
+    反过来文件里有、开关里没有的栏目也补回监控，避免两处记录不同步。
+    """
+    p = sub_file()
+    data = {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8-sig"))
+        for k, cols in ((obj or {}).get("sessions") or {}).items():
+            if not isinstance(k, str) or "|" not in k or not isinstance(cols, dict):
+                continue
+            ch, tid = k.split("|", 1)
+            if ch not in ("group", "private") or not tid:
+                continue
+            got = {}
+            for t, us in cols.items():
+                if t in ws.TYPES and isinstance(us, list):
+                    uids = {str(u) for u in us if u}
+                    if uids:
+                        got[t] = uids
+            if got:
+                data[(ch, tid)] = got
+    except Exception:
+        data = {}
+    with _lock:
+        _subs.clear()
+        _subs.update(data)
+        for key, types in _monitors.items():
+            if not types:
+                continue
+            cols = _subs.setdefault(key, {})
+            for t in types:
+                cols.setdefault(t, {""})
+        for key, cols in _subs.items():
+            if cols:
+                _monitors.setdefault(key, set()).update(cols)
+    return len(data)
+
+
+def subscribers_of(channel, target_id):
+    """本会话每个栏目分别被谁订阅（调试 / 测试用，返回深拷贝）。"""
+    with _lock:
+        cols = _subs.get((channel, str(target_id))) or {}
+        return {t: set(us) for t, us in cols.items()}
+
+
+def my_types(channel, target_id, user):
+    """这个人在本会话还订阅着哪些栏目（返回按 TYPES 顺序排列的键列表）。"""
+    if not user:
+        return []
+    uid = str(user)
+    with _lock:
+        cols = _subs.get((channel, str(target_id))) or {}
+        have = {t for t, us in cols.items() if uid in us}
+    return [t for t in ws.TYPES if t in have]
+
 
 
 _sender_at = [None]      # 缓存的探测结果：sender 是否收第四参 at_user
@@ -625,8 +734,15 @@ def start_monitor(channel, target_id, types, filters=None, at_user=None):
              让「@机器人 监控 警报」开出来的推送找得到是谁开的。
     """
     key = (channel, str(target_id))
+    uid = str(at_user) if at_user else ""
     with _lock:
-        _monitors[key] = set(types)
+        # 会话里可能不止一个人开过监控：这里只合并，不覆盖别人的栏目，
+        # 否则群里 A 开了警报、B 再开裂缝，A 的警报就被顶掉了。
+        _monitors.setdefault(key, set()).update(types)
+        cols = _subs.setdefault(key, {})
+        for t in types:
+            cols.setdefault(t, set()).add(uid)
+        _save_subs()
         # 本次指令点到的栏目以本次为准：带条件就设条件，不带条件就清掉旧条件
         # （否则「监控 裂缝」会静默沿用上次的「后纪中断」，看起来像没生效）
         ff = _fissure_filters.setdefault(key, {})
@@ -653,33 +769,100 @@ def start_monitor(channel, target_id, types, filters=None, at_user=None):
     _ensure_push_thread()
 
 
-def stop_monitor(channel, target_id):
+def stop_monitor(channel, target_id, types=None, user=None, everyone=False):
     """停止某会话的监控；返回是否确实停掉了什么。
 
-    「停止监控」是明确的全停意图，所以连本会话存盘的开关一起清掉，
-    否则下次启动 load_switches 又会自动恢复，看起来像指令没生效。
+    三种粒度，**都只作用于本条 (channel, target_id)**，绝不跨群、不跨私聊：
+      everyone=True            「停止全部监控」：清本会话所有成员、所有栏目与开关；
+      user + types             「停止监控 警报」：只撤这个人对这些栏目的订阅；
+      user 不给 types          「停止监控」：只撤这个人名下的全部订阅；
+      user 也不给（私聊 / 认不出人）：退回整会话清理。
+    某个栏目撤到没人订阅才算真停（清过滤条件与去重记录），别人还在看就留着。
     """
     key = (channel, str(target_id))
+    uid = str(user) if user else ""
+    if everyone or not uid:
+        with _lock:
+            _pending.pop(key, None)
+            _attached_at.pop(key, None)
+            _last_sent.pop(key, None)
+            _seen_priority.pop(key, None)
+            _priority_sent_at.pop(key, None)
+            had_switch = bool(_switches.pop(key, None))
+            had_filter = bool(_fissure_filters.pop(key, None))
+            had_at = _at_users.pop(key, None) is not None
+            had_sub = bool(_subs.pop(key, None))
+            removed = _monitors.pop(key, None) is not None
+            if had_switch:
+                _save_switches()
+            if had_filter:
+                _save_filters()
+            if had_at:
+                _save_at_users()
+            if had_sub:
+                _save_subs()
+            changed = removed or had_switch or had_filter or had_at or had_sub
+        if changed:
+            _save_last_sent()        # 把「已移除该会话」的去重记录落盘
+        return changed
+
     with _lock:
-        _pending.pop(key, None)
-        _attached_at.pop(key, None)
-        _last_sent.pop(key, None)
-        _seen_priority.pop(key, None)
-        _priority_sent_at.pop(key, None)
-        had_switch = bool(_switches.pop(key, None))
-        had_filter = bool(_fissure_filters.pop(key, None))
-        had_at = _at_users.pop(key, None) is not None
-        if had_switch:
-            _save_switches()
-        if had_filter:
-            _save_filters()
-        if had_at:
+        cols = _subs.get(key)
+        if not cols:
+            return False
+        target = [t for t in (types or cols.keys()) if t in cols]
+        touched, gone = False, []
+        for t in target:
+            us = cols.get(t)
+            if not us or uid not in us:
+                continue
+            us.discard(uid)
+            touched = True
+            if not us:               # 最后一个人撤了 → 这个栏目才真停
+                cols.pop(t, None)
+                gone.append(t)
+        if not touched:
+            return False
+        if gone:
+            mon = _monitors.get(key)
+            if mon is not None:
+                mon -= set(gone)
+                if mon:
+                    _monitors[key] = mon
+                else:
+                    _monitors.pop(key, None)
+            _pending.pop(key, None)
+            ff = _fissure_filters.get(key)
+            if ff:
+                for t in gone:
+                    ff.pop(t, None)
+                if not ff:
+                    _fissure_filters.pop(key, None)
+                _save_filters()
+            ls = _last_sent.get(key)
+            if ls:
+                for t in gone:
+                    ls.pop(t, None)
+                if not ls:
+                    _last_sent.pop(key, None)
+            sp = _seen_priority.get(key)
+            if sp:
+                for t in gone:
+                    sp.pop(t, None)
+        if not cols:
+            _subs.pop(key, None)
+        # 推送 @ 的人走了：还有别人订阅就换成别人，没人了就清掉
+        if _at_users.get(key) == uid:
+            left = sorted({u for us in cols.values() for u in us if u})
+            if left:
+                _at_users[key] = left[0]
+            else:
+                _at_users.pop(key, None)
             _save_at_users()
-        removed = _monitors.pop(key, None) is not None
-        changed = removed or had_switch or had_filter or had_at
-    if changed:
-        _save_last_sent()            # 把「已移除该会话」的去重记录落盘
-    return changed
+        _save_subs()
+    if gone:
+        _save_last_sent()
+    return True
 
 
 def list_monitors():
@@ -718,13 +901,22 @@ def auto_start_priority(groups):
         for gid in groups:
             key = ("group", str(gid))
             cur = _monitors.get(key)
+            hit = False
             if cur is None:
                 _monitors[key] = set(prio)
-                changed += 1
+                hit = True
             elif not set(prio) <= cur:
                 cur.update(prio)
-                changed += 1
+                hit = True
+            if not hit:
+                continue
+            changed += 1
+            # 自动注册属于会话级（没有具体发起人），记成空 uid 订阅
+            cols = _subs.setdefault(key, {})
+            for t in prio:
+                cols.setdefault(t, set()).add("")
     if changed:
+        _save_subs()
         ws.ensure_active()
         _ensure_push_thread()
     return changed

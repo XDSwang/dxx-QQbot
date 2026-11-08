@@ -68,6 +68,10 @@ def _run_onebot():
     saved_a = ws_monitor.load_at_users()
     if saved_a:
         print(f"[qq_bot] 已恢复 {saved_a} 个会话的监控发起人", file=sys.stderr)
+    # 恢复成员级订阅（谁开了哪个栏目）：群里「停止监控」只撤自己，「停止全部监控」才清全群
+    saved_s = ws_monitor.load_subs()
+    if saved_s:
+        print(f"[qq_bot] 已恢复 {saved_s} 个会话的成员订阅", file=sys.stderr)
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:
         print(f"[qq_bot] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "
