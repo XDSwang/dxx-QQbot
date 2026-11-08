@@ -1418,6 +1418,55 @@ def _job_text(j):
     return f"{obj}{lv}" + (f" · {st} 阶段" if st else "")
 
 
+def _job_short(j):
+    """一行内的短名：奖励型给「目标 LvX-Y」，挑战型给「节点 · 任务」。"""
+    if j.get("node"):
+        return "%s · %s" % (j.get("node") or "?", j.get("mission") or "?")
+    lo, hi = j.get("minLevel"), j.get("maxLevel")
+    obj = j.get("objective") or "?"
+    if obj in ("?", "$undefined"):
+        obj = "目标未给"
+    return obj + (f" Lv{lo}-{hi}" if lo is not None and hi is not None else "")
+
+
+def _disp_w(s):
+    """卡片按等宽网格排版：中文 / 全角标点占 2，其余占 1。"""
+    return sum(2 if ("\u4e00" <= ch <= "\u9fff" or ch in "（）·，、：；！？") else 1
+               for ch in (s or ""))
+
+
+def _wrap_chars(text, width=44, indent="       "):
+    """按显示宽度硬切折行（没有可断点时用），续行用 indent 对齐。"""
+    out, line = [], ""
+    for ch in text:
+        if line and _disp_w(line) + _disp_w(ch) > width:
+            out.append(line.rstrip())
+            line = indent + ch
+        else:
+            line += ch
+    if line.strip():
+        out.append(line.rstrip())
+    return out
+
+
+def _wrap_prefix(text, width=44, indent="       "):
+    """按「、」打包折行：只在分隔符处断开，别把「隔离库 Lv30-40」从中间劈开。"""
+    segs = text.split("、")
+    lines, cur = [], segs[0]
+    for seg in segs[1:]:
+        add = "、" + seg
+        if _disp_w(cur) + _disp_w(add) > width:
+            lines.append(cur)
+            cur = indent + seg
+        else:
+            cur += add
+    lines.append(cur)
+    out = []
+    for ln in lines:
+        out += (_wrap_chars(ln, width, indent) if _disp_w(ln) > width else [ln.rstrip()])
+    return out
+
+
 def _bounty_lines(groups, limit):
     out = []
     for b in groups:
@@ -1427,9 +1476,18 @@ def _bounty_lines(groups, limit):
                    f"{_bounty_board_rot(b)}）")
         for j in jobs[:limit]:
             out.append(f"     - {_bounty_job_line(j)}")
-        more = len(jobs) - min(len(jobs), limit)
-        if more > 0:
-            out.append(f"     …… 还有 {more} 个（发「赏金」看全部）")
+        rest = jobs[min(len(jobs), limit):]
+        if rest:
+            # 别只写「还有 N 个」：火卫二的隔离库三档正好排在后面，
+            # 一句省略号会让人以为机器人没抓到（用户原话：「怎么就没有？」）。
+            names = "、".join(_job_short(j) for j in rest)
+            lines = _wrap_prefix("     …… 还有 %d 个：%s" % (len(rest), names))
+            tail = "（发「赏金」看奖励）"
+            if _disp_w(lines[-1] + tail) <= 44:
+                lines[-1] += tail
+            else:
+                lines.append("       " + tail)
+            out += lines
     return out
 
 
@@ -1443,6 +1501,16 @@ def _plain_with_bounty(s, key, head):
         # 双衍王境是独立周期（恐惧/喜悦等），没有任务板；其余区域两种来源都查过了，
         # 真没有才写这句，不再把扎里曼这种「只有集团赏金」的误判成「没有赏金」。
         out.append("    （该区域没有独立赏金任务板）")
+    if key == "cambion":
+        # 深层科研就在圣所（火卫二），顺手给一行指路；只有 weekly 已缓存时才加，
+        # 不为了这一行去发请求（weekly.short_hint 只读盘）。
+        try:
+            import weekly
+            hint = weekly.short_hint()
+        except Exception:
+            hint = ""
+        if hint:
+            out.append(hint)
     return "\n".join(out)
 
 
@@ -2577,6 +2645,10 @@ HELP_TEXT = (
     "        掉落 布里斯提卡Prime蓝图   它出自哪些遗物（含稀有度与概率）\n"
     "        掉落 布莱顿                制作材料与信用点/工时\n"
     "        （数据来自 DE 官方中文导出，首次建索引约 30 秒，之后秒回）\n"
+    "  每周：每周 / 科研 / 执刑官 / 沉沦之地 / 钢铁商店 / 回廊预告 / 日历\n"
+    "        科研 = 深层科研 + 时光科研（关卡 · 派系 · 偏差与变量说明）；\n"
+    "        执刑官 = 本周 Boss · 源力石 · 三个节点；沉沦之地 = 楼层与全部挑战\n"
+    "        （数据来自社区中文站 todo.wf.wiki，缓存 30 分钟）\n"
     "  其它：新闻 / 全部\n"
     "  监控 <词>     在本会话开启推送（如 监控 警报 / 监控 裂缝 / 监控 平原）\n"
     "                  ⚠️ 裸「监控」或「监控 不认识的词」不会全开，会提示你怎样用；\n"

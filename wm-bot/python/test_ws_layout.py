@@ -299,9 +299,23 @@ def test_bounty_layout():
         ws._COMPACT = True
         brief = ws._fmt_cetus(s)
         check("精简模式每处赏金 2 条", brief.count("     - ") == 2)
-        check("精简模式提示看全部", "发「赏金」看全部" in brief)
+        check("精简模式提示看全部", "发「赏金」看奖励" in brief)
     finally:
         ws._COMPACT = old
+
+    # 火卫二：赏金超过 5 条被截断时，剩下的要逐个点名
+    # （隔离库三档正好排在最后，写成一句「还有 4 个」会被当成没抓到）
+    ent = dict(s)
+    ent["bountyBoard"] = [{"name": "英择谛", "tag": "EntratiSyndicate", "jobs": [
+        {"objective": o, "minLevel": lo, "maxLevel": hi, "stages": 3}
+        for o, lo, hi in (("生存", 5, 15), ("防御", 15, 25), ("挖掘", 25, 30),
+                          ("净化", 30, 40), ("挖掘", 40, 60), ("生存", 100, 100),
+                          ("隔离库", 30, 40), ("隔离库", 40, 50), ("隔离库", 50, 60))
+    ]}]
+    cb = ws._fmt_cambion(ent)
+    check("截断的赏金逐个点名而不是只写个数", "还有 4 个：生存 Lv100-100" in cb)
+    check("隔离库三档都出现在平原块里", cb.count("隔离库") >= 3)
+    check("折行不把等级从中间劈开", "Lv\n" not in cb and "隔离库 Lv30-40" in cb)
 
     # 独立「赏金」栏目不受影响
     check("独立赏金栏目仍列三个集团",

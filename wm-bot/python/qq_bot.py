@@ -36,6 +36,7 @@ import sys
 import config as bot_config
 import qq_common
 import drops
+import weekly
 import wm
 
 
@@ -79,6 +80,8 @@ def _run_onebot():
               f"{ws_monitor.priority_types()}（新条目即时推送）", file=sys.stderr)
     # 遗物 / 掉落索引：后台预抓一次（首次约 30 秒），之后查询只读本地索引秒回
     drops.ensure_async()
+    # 每周轮换（科研 / 执刑官 / 沉沦之地…）：后台预抓一次，30 分钟内复用同一份
+    weekly.ensure_async()
     print(f"[qq_bot] WM→QQ（OneBot {mode}）启动，URL={url}",
           file=sys.stderr)
     if allow_all:

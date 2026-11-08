@@ -20,6 +20,7 @@ import wm
 import worldstate
 import ws_monitor
 import drops
+import weekly
 
 HERE = Path(__file__).resolve().parent
 # 群白名单文件：每行一个群号 / 群 OpenID（# 开头为注释，行内 # 后为备注）。
@@ -112,10 +113,10 @@ def build_diagnostic():
 
 
 def build_full_help():
-    """合并全部指令一览：WM 查价/紫卡/翻译 + 世界状态查询/监控/计划。"""
+    """合并全部指令一览：WM 查价/紫卡/翻译 + 世界状态查询/监控/计划 + 每周轮换。"""
     wm_part = wm.format_reply({"served": "help"})
     return ("📖 全部指令一览（随时发「帮助」或「?」可再看）\n\n"
-            + wm_part + "\n\n" + worldstate.HELP_TEXT)
+            + wm_part + "\n\n" + worldstate.HELP_TEXT + "\n" + weekly.HELP_TEXT)
 
 
 # ---------------- 帮助菜单配色：查询指令红、其它指令蓝 ----------------
@@ -134,6 +135,8 @@ _HELP_QUERY_WORDS = (
     "赏金轮换", "赏金", "信条", "终幕", "新闻", "全部", "计划",
     # 遗物 / 掉落来源（官方中文导出）
     "遗物", "掉落", "获取",
+    # 每周轮换（社区中文站）
+    "每周", "科研", "执刑官", "沉沦之地", "钢铁商店", "日历", "回廊预告",
 )
 
 _HELP_OTHER_WORDS = (
@@ -580,6 +583,10 @@ def make_handler(allowed_groups=None, allow_all=False):
         if drops.is_drop_command(q):
             return handle_drop(q, ctx, force_image=force_img,
                                force_text=force_txt)
+        # 每周轮换（科研 / 执刑官 / 沉沦之地 / 钢铁商店 / 回廊预告 / 日历）
+        if weekly.is_weekly_command(q):
+            return handle_weekly(q, ctx, force_image=force_img,
+                                 force_text=force_txt)
         # WM 查询（wm / zk / 紫卡 / 翻译）：带前缀才触发
         if not is_wm_command(q):
             # 完整指令才算数：一条都没精确命中就当闲聊，静默（不猜、不提示）。
@@ -795,6 +802,16 @@ def handle_drop(text, ctx=None, force_image=False, force_text=False):
                     force_image=force_image, force_text=force_text,
                     title="星际战甲 · 遗物 / 掉落",
                     foot="「遗物 后纪B10」看某遗物奖励；「掉落 名称」反查出自哪些遗物。")
+
+
+def handle_weekly(text, ctx=None, force_image=False, force_text=False):
+    """每周轮换的统一入口（数据源与缓存都在 weekly 模块里）。"""
+    cmd = weekly.parse_command(text)
+    return finalize(weekly.format_reply(cmd), ctx,
+                    force_image=force_image, force_text=force_text,
+                    title="星际战甲 · 每周轮换",
+                    foot="每周：全部总览；科研 / 执刑官 / 沉沦之地 / 钢铁商店 / "
+                         "回廊预告 / 日历 看单项。")
 
 
 def _ctx_ids(ctx):

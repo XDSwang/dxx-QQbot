@@ -205,6 +205,20 @@ print(format_reply(res))
   1474 条配方），查询只读本地零请求；`WS_DROPS_DAYS`（默认 7 天）过期后台重抓，
   重抓失败沿用旧索引并在回复里标「N 天前」，不假装是新数据。首次构建顺序抓 8 个文件、
   守同域名 3~5 秒节流（约 30 秒），启动时 `drops.ensure_async()` 后台预抓。
+- **每周轮换（社区中文数据）**：`每周` 给七项总览，`科研` 给深层 / 时光科研的关卡、
+  派系、偏差与变量（带说明），`执刑官` 给 Boss / 源力石 / 三个节点，`沉沦之地` 给楼层
+  与全部挑战，`钢铁商店` 给 Teshin 的 8 周循环，`回廊预告` 给本周与下周，`日历` 给
+  1999 当季挑战与增益。数据来自社区中文站 `todo.wf.wiki/weekly`（**不是官方**；官方
+  Wiki 是 `wiki.warframe.com`，但上面没有科研与执刑官的实时轮换）。页面是 Next.js
+  服务端渲染，HTML 里内嵌 React Server Components 的 `initialData` 整页 JSON，程序
+  直接反解这段、不抓 DOM、不依赖 CSS 类名，站点改版只要还走 `initialData` 就不受影响。
+  缓存落 `data/weekly.json`（约 22 KB），全世界一份、所有群共用，请求数不随群数增长；
+  `WS_WEEKLY_MINUTES`（默认 30 分钟）过期后台重抓，重抓失败沿用旧数据并标「N 分钟前」。
+  平原卡片的魔胎之境下面另附一行科研提示，只读已有缓存、不为这行发请求。
+- **赏金被截断时逐个点名**：平原块只列前 5 档，剩下的不再写成「还有 N 个」，而是把
+  名称列出来（`…… 还有 4 个：生存 Lv100-100、隔离库 Lv30-40、…`）——火卫二的
+  隔离库三档正好排在第 7～9 位，只写个数会被当成没抓到。折行只在「、」处断开，
+  不会把 `Lv30-40` 从中间劈开。
 - **监控推送按栏目 @ 到人**：同一条内容被多人订阅 → 一条消息里一起 @（`@甲 @乙 📢 警报`）；
   各人要的栏目不同 → 本来就是按栏目拆开的两条消息，各 @ 各的人。会话级订阅
   （`活动=开启` 这类全群开关）没有具体人，不 @。发送在推送线程里**串行排队**，
@@ -268,12 +282,13 @@ python test_onebot.py         # OneBot 8 项（含出图段数组 / 纯文本回
 python test_ws_attach.py      # 监控暂存 / 附带 / 限频 / 截断 / 退避 45 项
 python test_ws_priority.py    # 警报/活动主推：基线 / 立即推 / 防抖 / 失败重试 / 捎带 / 稳定签名 69 项
 python test_ws_switch.py      # 「活动=开启」聊天开关：解析 / 会话覆盖 / 存盘重启 / 白名单 83 项
-python test_ws_layout.py      # 裂缝分组排序 + 平原带赏金 + 状态标签隔离 107 项
+python test_ws_layout.py      # 裂缝分组排序 + 平原带赏金 + 状态标签隔离 122 项
 python test_ssl_compat.py     # 手机 CA 证书：探测 / 降级重试 / 请求签名 / 取 token 恢复 34 项
 python test_qq_markdown.py    # Markdown 消息：覆盖式固定公网图 / 素材三步上传 / 八键模板 / 图下不重复正文只留 /w / 无图不退化 / 3 张滚动清理 / probe 123 项
 python md_probe.py           # Markdown 真机自检：一张图 + 一个内容字符串（默认 dry-run，不联网）
 python test_card.py           # 卡片渲染 35 项
 python test_drops.py          # 遗物/掉落：指令解析 / 索引构建 / 奖励概率 / 反查 / 缓存过期 48 项
+python test_weekly.py         # 每周轮换：initialData 反解 / 七板块渲染 / 指令匹配 / 缓存兜底 23 项
 python test_ws_scope.py       # 监控会话隔离：成员级订阅 / 停止全部 / 分栏目 @ 人 52 项
 python test_pace_guard.py     # 硬时间规则锁死（3~5s 节流 / 1/3/7min 重试 / 1h）
 ```

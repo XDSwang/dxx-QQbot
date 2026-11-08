@@ -207,6 +207,16 @@ WM_QQ_TOKEN =
 # WM_WS_WFWIKI_URL = https://worldstate.wf.wiki
 # WM_WS_OFFICIAL_URL = https://api.warframe.com/cdn/worldState.php
 #
+# ---- 每周轮换（科研 / 执刑官 / 沉沦之地 / 钢铁商店 / 回廊预告 / 1999 日历）----
+# 数据源是社区中文站 todo.wf.wiki/weekly（与上面的 wf.wiki 同家族，不是官方；
+# 官方 Wiki 是 wiki.warframe.com，但上面没有科研与执刑官的实时轮换数据）。
+# 页面是 Next.js 服务端渲染，内嵌 initialData 整页 JSON，程序直接取这份、不抓 DOM，
+# 所以站点只要还走 initialData 就不怕改版；换镜像改 WM_WEEKLY_URL。
+# 缓存落盘 data/weekly.json，全世界一份、所有群共用，请求数不随群数增长；
+# 新鲜度单位分钟，默认 30。
+# WM_WEEKLY_URL = https://todo.wf.wiki/weekly
+# WM_WEEKLY_MINUTES = 30
+#
 # ---- 仲裁（arbi.wf.wiki 轮换表）----
 # 仲裁每小时整点换图。arbi.wf.wiki 把轮换固化成了两张静态 JSON：
 #   /data/arbys.schedule.v2.json  {startTs, stepSec(3600), nodes[节点码], seq[序号->下标]}
