@@ -55,6 +55,33 @@ class TestStripMention(unittest.TestCase):
         self.assertEqual(qq_official.strip_mention("<@!1><@!2> wm x"), "wm x")
 
 
+class TestReplyAtTag(unittest.TestCase):
+    """@ 了机器人才 @ 回去：群聊用 member_openid 生成官方标签，其余一律不带。
+
+    官方文档：群聊 @ 用户只支持 markdown 消息，标签 `<qqbot-at-user id="..." />`
+    的 id 填【群成员 member_openid】（不是 user_openid）。
+    """
+
+    def test_group_at_me_gets_tag(self):
+        self.assertEqual(
+            qq_official.reply_at_tag({"at_me": True, "member_openid": "MO1"}, "group"),
+            '<qqbot-at-user id="MO1" />')
+
+    def test_plain_prefix_command_no_tag(self):
+        # 带 D/XX/ 的普通指令（没人 @ 机器人）：不 @，与原来一致
+        self.assertEqual(
+            qq_official.reply_at_tag({"member_openid": "MO1"}, "group"), "")
+
+    def test_no_member_openid_no_tag(self):
+        # 取不到 member_openid 就别乱发标签，否则服务端会拒绝整条消息
+        self.assertEqual(qq_official.reply_at_tag({"at_me": True}, "group"), "")
+        self.assertEqual(qq_official.reply_at_tag(None, "group"), "")
+
+    def test_private_no_tag(self):
+        self.assertEqual(
+            qq_official.reply_at_tag({"at_me": True, "member_openid": "MO1"}, "user"), "")
+
+
 class TestTokenManager(unittest.TestCase):
     def _fake_urlopen(self, token, expires_in=7200):
         def fake(req, timeout=10):
@@ -436,6 +463,23 @@ class TestOnEvent(unittest.TestCase):
     def test_group_full_message_not_whitelisted_silent(self):
         self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
+
+    def test_group_at_ctx_keeps_member_openid(self):
+        """群@消息把 member_openid 记进 ctx：回复要靠它 @ 回去，监控推送也靠它 @ 人。
+
+        官方群聊 author 的 user_openid 是空的（那是单聊字段），以前取错字段 → 一直是
+        None，表现出来就是「回复没有 @ 对方、监控也 @ 不到发起人」。
+        """
+        seen = {}
+        self.bot.handler = lambda text, ctx: seen.update(ctx) or None
+        pkt = {"op": 0, "t": "GROUP_AT_MESSAGE_CREATE",
+               "d": {"group_openid": "G1", "content": "<@!bot> 你好", "id": "M1",
+                     "author": {"member_openid": "MO9", "user_openid": "",
+                                "username": "阿明"}}}
+        self.bot._on_event(None, pkt, "TOK")
+        self.assertEqual(seen.get("member_openid"), "MO9")
+        self.assertEqual(seen.get("user_id"), "MO9")
+        self.assertTrue(seen.get("at_me"))
 
     def test_group_full_message_at_bot_allows_prefixless(self):
         """全量模式里「@机器人 自检」也走这个事件：带叹号的占位符要认成 at_me，

@@ -85,6 +85,23 @@ def _at_targets(raw):
     return [m.group(1).strip() for m in _CQ_AT.finditer(str(raw or ""))]
 
 
+def _text_at_me(text, self_id, nickname):
+    """明文「@昵称 指令」也算 @ 了本机（有的实现把 @ 当正文发，不带 at 段）。
+
+    判定口径直接复用 qq_common 那一份 —— 入口认了、发送层不认的话，就会出现
+    「@了机器人，回复却不 @ 对方」。qq_common 依赖较重、独立握手自检用不上，
+    所以按需导入。
+    """
+    if not nickname and not self_id:
+        return False
+    try:
+        import qq_common
+    except ImportError:
+        return False
+    _body, marks = qq_common.strip_mentions(text, nickname)
+    return qq_common.mentioned_me(marks, self_id, nickname)
+
+
 def _parse_message(raw, self_id):
     """把 OneBot 的 message 拆成 (纯文本, 是否 @ 了机器人)。
 
@@ -481,6 +498,10 @@ class OneBotClient:
             # 没法比对，就按「群里有人 @ 了本机器人」处理 —— 宁可多回一句，
             # 也不要把「@机器人 平原」静默吞掉。配好 WM_QQ_SELF_ID 即可精确判定。
             at_me = True
+        if not at_me:
+            # 明文「@昵称 指令」：handler 用同一份判定认得出，发送层也得认，
+            # 否则回复不会 @ 回去（用户看到的就是「@了我却没 @ 我」）。
+            at_me = _text_at_me(text, self_id, self.nickname)
         if self.handler is None:
             return
         ctx = dict(msg)
@@ -501,17 +522,19 @@ class OneBotClient:
             bot_config.echo("[reply] %s 文本=%r 图片=%d 张"
                             % (_peer(msg), text,
                                len(getattr(reply, "pngs", None) or [])))
-            self._send_reply(conn, msg, reply)
+            self._send_reply(conn, msg, reply, at_me=at_me)
         else:
             bot_config.echo("[silent] %s 文本=%r 没命中指令或群不在白名单，不回复"
                             % (_peer(msg), text))
 
-    def _send_reply(self, conn, msg, reply):
+    def _send_reply(self, conn, msg, reply, at_me=False):
         message_type = msg.get("message_type")
         pngs = list(getattr(reply, "pngs", None) or [])
         tail = str(getattr(reply, "tail", "") or "").strip()
-        # 群聊回复一律 @ 提问的人（谁问的就回给谁）；私聊没有 @ 概念，不加
-        at_qq = str(msg.get("user_id") or "") if message_type == "group" else ""
+        # 这条消息 @ 了机器人，回复就 @ 回去（谁 @ 我我回谁）；带 D/XX/ 的普通指令
+        # 不 @ 人 —— 两种入口走的是同一套处理，只在发送时多这一行。私聊没有 @ 概念。
+        at_qq = (str(msg.get("user_id") or "")
+                 if (message_type == "group" and at_me) else "")
         head = [{"type": "at", "data": {"qq": at_qq}}] if at_qq else []
         img_segs = []
         for png in pngs[:4]:

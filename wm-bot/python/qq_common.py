@@ -237,7 +237,7 @@ def strip_mentions(text, bot_name=None):
     return t.strip(), marks
 
 
-def _mentioned_me(marks, sid, bot_name):
+def mentioned_me(marks, sid, bot_name):
     """被剥掉的 @ 标记里，有没有「就是我」。
 
     判断顺序（对上一条就算我，因为群里 @ 机器人通常只有它一个）：
@@ -247,6 +247,9 @@ def _mentioned_me(marks, sid, bot_name):
          配置写简称、实际昵称带后缀（"自动化服务查询_D/XX/"）也算 —— 按前缀认。
     两样身份都不知道（既没 self_id 也没配昵称）时，见到 CQ 码或 `<@!x>` 就按「就是我」
     处理 —— 宁可多回一句，也不要把「@机器人 平原」这种明确指令静默吞掉。
+
+    传输层（onebot._text_at_me）也调这一份：入口判定与发送层「要不要 @ 回去」必须
+    同一口径，否则会出现「handler 认了、发送层不认，回复就不 @ 人」。
     """
     unknown = not sid and not bot_name
     for m in marks:
@@ -545,7 +548,7 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 昵称优先用传输层自动问到的（OneBot get_login_info），再退回配置兜底
         bot_name = (ctx.get("bot_name") or os.environ.get("WM_QQ_BOT_NAME") or "").strip()
         body, at_marks = strip_mentions(text, bot_name)
-        at_me = bool(ctx.get("at_me")) or _mentioned_me(at_marks, sid, bot_name)
+        at_me = bool(ctx.get("at_me")) or mentioned_me(at_marks, sid, bot_name)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
         body, force_img, force_txt = split_style_prefix(body)
         # —— 所有「交互指令」必须带 D/XX/ 前缀，防群聊闲聊误触发 ——

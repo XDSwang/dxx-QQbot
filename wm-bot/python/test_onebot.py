@@ -327,7 +327,7 @@ class TestAtBot(unittest.TestCase):
         ws_monitor.set_sender(None)
 
     def test_reply_mentions_sender(self):
-        """群回复带 @ 发送者（文本用 CQ 码前缀，老客户端也认）；私聊不加。"""
+        """@ 了机器人才 @ 回去（文本用 CQ 码前缀，老客户端也认）；前缀指令与私聊不加。"""
         sent = []
 
         class FakeConn:
@@ -335,11 +335,16 @@ class TestAtBot(unittest.TestCase):
                 sent.append(json.loads(s))
 
         c = onebot.OneBotClient(mode="client")
-        c._send_reply(FakeConn(), {"message_type": "group", "group_id": 777,
-                                   "user_id": 12345}, "你好")
+        msg = {"message_type": "group", "group_id": 777, "user_id": 12345}
+        c._send_reply(FakeConn(), msg, "你好", at_me=True)
         self.assertEqual(sent[-1]["params"]["message"], "[CQ:at,qq=12345] 你好")
         sent.clear()
-        c._send_reply(FakeConn(), {"message_type": "private", "user_id": 1}, "你好")
+        # 带 D/XX/ 前缀的普通指令：不 @ 人，避免群里刷屏
+        c._send_reply(FakeConn(), msg, "你好")
+        self.assertEqual(sent[-1]["params"]["message"], "你好")
+        sent.clear()
+        c._send_reply(FakeConn(), {"message_type": "private", "user_id": 1},
+                      "你好", at_me=True)
         self.assertEqual(sent[-1]["params"]["message"], "你好")
 
     def test_send_active_mentions(self):

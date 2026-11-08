@@ -149,9 +149,17 @@ print(format_reply(res))
 > 免 @ 消息的回复是**单纯一条普通群消息**（`WM_FULLMSG_ACTIVE=1`：不带 `msg_id`、不 @ 人、
 > 不显示引用）；@ 消息才走被动引用回复，两条通道失败互相回退。因为每条群消息都能回，
 > 暂存的监控内容也能借任意一条聊天消息带出，效果等同主动推送（20 秒限频）。
+> **@ 了机器人才 @ 回去**：群 @ 消息（`GROUP_AT_MESSAGE_CREATE`）+ 全量消息里认出
+> 「@机器人」的那条，回复会在最前面加官方 @ 用户标签
+> `<qqbot-at-user id="member_openid" />`；带 `D/XX/` 的普通指令不 @ 人。
+> 两种入口走的是同一条 handler，区别只有这一行标签。标签只对 Markdown 消息生效
+> （`WM_QQ_MARKDOWN = native`）；模板模式、富媒体（`msg_type=7`）与纯文本回退
+> 都不支持 @ 标签，这些通道回复时不 @。OneBot 同理：`at_me` 为真才加 `[CQ:at,qq=…]`
+> （明文「@昵称 指令」也算，判定与 handler 共用 `qq_common.mentioned_me`）。
 > 私聊不受白名单限制，直接发 `WM <名称>` 即可；单聊的主动消息开关在机器人资料卡。
 > 全程写覆盖式日志 `data/bot_flow.log`（每次启动清空重写，不含 secret）。
-> 控制台另有收发三行：`[recv]`（会话 + 是否 @ 我 + 原文）/ `[reply]` / `[silent]`（静默原因），
+> 控制台另有收发三行：`[recv]`（会话 + 是否 @ 我 + 原文；官方端带发送者昵称）/
+> `[reply]` / `[silent]`（静默原因），
 > 「发了指令没反应」先看这三行，就能分清是没收到、被静默还是发失败；`WM_QQ_ECHO = 0` 关掉。
 > OneBot 连上时会自动 `get_login_info` 问出自身号与昵称，控制台打一行
 > `[onebot] 自身信息：昵称=… 号=…`；官方机器人启动时走 `GET /users/@me`，
@@ -277,14 +285,14 @@ print(format_reply(res))
 python test_config.py          # data/config.txt 解析 / 开关 / 路径 / 无启动脚本
 python test_cache_policy.py   # 超间隔先刷新、90 天旧缓存不发、失败不假死、真等 3~5s
 python test_slug_resolution.py  # 名称→slug 候选、确定性 404、候选间真等 3~5s
-python test_official.py       # 官方对接 35 项（含 msg_id / 图文混排请求体校验）
-python test_onebot.py         # OneBot 8 项（含出图段数组 / 纯文本回退）
+python test_official.py       # 官方对接 50 项（含 msg_id / 图文混排请求体 / @ 回去标签）
+python test_onebot.py         # OneBot 22 项（含出图段数组 / 纯文本回退 / @ 回去 / 自动昵称）
 python test_ws_attach.py      # 监控暂存 / 附带 / 限频 / 截断 / 退避 45 项
 python test_ws_priority.py    # 警报/活动主推：基线 / 立即推 / 防抖 / 失败重试 / 捎带 / 稳定签名 69 项
 python test_ws_switch.py      # 「活动=开启」聊天开关：解析 / 会话覆盖 / 存盘重启 / 白名单 83 项
 python test_ws_layout.py      # 裂缝分组排序 + 平原带赏金 + 状态标签隔离 122 项
 python test_ssl_compat.py     # 手机 CA 证书：探测 / 降级重试 / 请求签名 / 取 token 恢复 34 项
-python test_qq_markdown.py    # Markdown 消息：覆盖式固定公网图 / 素材三步上传 / 八键模板 / 图下不重复正文只留 /w / 无图不退化 / 3 张滚动清理 / probe 123 项
+python test_qq_markdown.py    # Markdown 消息：覆盖式固定公网图 / 素材三步上传 / 八键模板 / 图下不重复正文只留 /w / 无图不退化 / 3 张滚动清理 / @ 回去标签 132 项
 python md_probe.py           # Markdown 真机自检：一张图 + 一个内容字符串（默认 dry-run，不联网）
 python test_card.py           # 卡片渲染 35 项
 python test_drops.py          # 遗物/掉落：指令解析 / 索引构建 / 奖励概率 / 反查 / 缓存过期 48 项

@@ -358,6 +358,34 @@ def _text_mentions_bot(raw, bot_name):
     return t.startswith("@" + bot_name) or t.startswith("＠" + bot_name)
 
 
+def _sender_ids(author):
+    """发送者身份，返回 (user_openid, member_openid, 昵称)。
+
+    群聊事件里 member_openid 才有值（user_openid 是单聊场景用的），而官方
+    @ 用户标签的 id 只认 member_openid —— 取错字段就会 @ 不出去。
+    昵称（username）只用来打日志，拿不到就是空串。
+    """
+    a = author or {}
+    return (str(a.get("user_openid") or "").strip(),
+            str(a.get("member_openid") or "").strip(),
+            str(a.get("username") or "").strip())
+
+
+def reply_at_tag(ctx, kind):
+    """回复要不要 @ 回去：只在「这条消息 @ 了机器人」时给标签，其余一律不 @。
+
+    官方 @ 用户标签形如 `<qqbot-at-user id="member_openid" />`，文档明确它
+    只支持 markdown 消息（文本 / 富媒体消息塞进去会原样显示成文字），所以
+    标签只在 Markdown 通道用；id 必须是群成员 member_openid。
+    群聊 @ 消息（GROUP_AT_MESSAGE_CREATE）天然算「@了我」；全量消息
+    （GROUP_MESSAGE_CREATE）由入站时判定 at_me 决定 —— 两者共用同一条判定线。
+    """
+    if kind != "group" or not (ctx or {}).get("at_me"):
+        return ""
+    mid = str((ctx or {}).get("member_openid") or "").strip()
+    return ('<qqbot-at-user id="%s" />' % mid) if mid else ""
+
+
 # ---------------- 官方机器人主类 ----------------
 class OfficialBot:
     def __init__(self, appid, secret, handler, api_base=DEFAULT_API_BASE,
@@ -704,16 +732,16 @@ class OfficialBot:
             raw = d.get("content", "")
             text = strip_mention(raw)
             group_openid = d.get("group_openid")
+            uo, mo, name = _sender_ids(d.get("author"))
             flog(f"群@消息 group_openid={group_openid} 原始内容={raw!r} 剥离后={text!r}")
-            bot_config.echo("[recv] 群@ %s 用户=%s 原文=%r 剥离=%r"
-                            % (group_openid,
-                               (d.get("author") or {}).get("user_openid"),
-                               raw, text))
+            bot_config.echo("[recv] 群@ %s 用户=%s 昵称=%s 原文=%r 剥离=%r"
+                            % (group_openid, mo or uo, name or "-", raw, text))
             ctx = {"channel": "group", "group_id": group_openid,
                    # 群 @ 事件：明确对着机器人说的，允许不带 D/XX/ 前缀；
-                   # user_openid 记下来，之后本会话的监控推送 @ 他
+                   # member_openid 记下来，回复时用它 @ 回去、之后的监控推送也 @ 他
                    "at_me": True,
-                   "user_id": (d.get("author") or {}).get("user_openid")}
+                   "user_id": mo or uo,
+                   "member_openid": mo}
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "GROUP_MESSAGE_CREATE":
             # 群消息「全量模式」：机器人在 q.qq.com 开了「接收所有消息」后，
@@ -722,34 +750,35 @@ class OfficialBot:
             raw = d.get("content", "")
             text = strip_mention(raw)
             group_openid = d.get("group_openid")
+            uo, mo, name = _sender_ids(d.get("author"))
             flog(f"群消息(全量) group_openid={group_openid} 原始内容={raw!r} 剥离后={text!r}")
-            bot_config.echo("[recv] 群 %s 用户=%s 原文=%r 剥离=%r"
-                            % (group_openid,
-                               (d.get("author") or {}).get("user_openid"),
-                               raw, text))
+            bot_config.echo("[recv] 群 %s 用户=%s 昵称=%s 原文=%r 剥离=%r"
+                            % (group_openid, mo or uo, name or "-", raw, text))
             # full_message：这条消息不是专门 @ 机器人的，回复也不要「对着某人引用」，
             # 而是单纯往群里发一条普通消息（不 @ 任何人、不带 msg_id 引用）。
             ctx = {"channel": "group", "group_id": group_openid,
-                   "full_message": True}
+                   "full_message": True,
+                   "user_id": mo or uo,
+                   "member_openid": mo}
             # 但「@机器人 平原」在全量模式下也走这个事件：机器人占位符带叹号
             # （<@!bot_openid>），普通成员是 <@openid>、全体是 <@all>。据此点亮 at_me，
             # 否则免前缀的 @ 指令会被当成闲聊静默 —— 用户看到的就是「@ 了没反应」。
+            # at_me 一旦点亮，回复就和群@事件一样走「@ 回对方」。
             if _BOT_MENTION_RE.search(raw):
                 ctx["at_me"] = True
-                ctx["user_id"] = (d.get("author") or {}).get("user_openid")
             elif _text_mentions_bot(raw, self.bot_name):
                 # 有的客户端 / 全量模式下「@机器人」是明文「@昵称」，没有叹号占位符。
                 # 认出来才算 @ 我；认出来就按 @ 消息处理（可以引用回复，不用普通群消息）。
                 ctx["at_me"] = True
-                ctx["user_id"] = (d.get("author") or {}).get("user_openid")
                 ctx.pop("full_message", None)
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")
             text = strip_mention(raw)
-            openid = (d.get("author") or {}).get("user_openid")
+            openid, _mo, name = _sender_ids(d.get("author"))
             flog(f"单聊消息 user_openid={openid} 原始内容={raw!r} 剥离后={text!r}")
-            bot_config.echo("[recv] 单聊 %s 原文=%r 剥离=%r" % (openid, raw, text))
+            bot_config.echo("[recv] 单聊 %s 昵称=%s 原文=%r 剥离=%r"
+                            % (openid, name or "-", raw, text))
             ctx = {"channel": "private", "group_id": openid}
             self._dispatch_reply(token, "user", openid, text, ctx, msg_id)
         else:
@@ -904,6 +933,8 @@ class OfficialBot:
         # 卡片 PNG + 可复制的 /w 指令字符串
         pngs = list(getattr(reply, "pngs", None) or [])
         tail = str(getattr(reply, "tail", "") or "").strip()
+        # 这条消息 @ 了机器人 → 回复也 @ 回去（与 D/XX/ 指令同一套处理，只多这一行）
+        at_tag = reply_at_tag(ctx, kind)
 
         # ① 默认 Markdown 消息（msg_type=2）：图片 + 图下两条 /w（图里已有正文，不重复）
         #    config.txt: WM_QQ_MARKDOWN = native；设为 0 可关。
@@ -911,14 +942,16 @@ class OfficialBot:
         if qq_markdown is not None and qq_markdown.enabled():
             ok_md, info_md, md_mode = qq_markdown.send_reply(
                 token, self.appid, self.api_base, kind, target_id, reply,
-                msg_id=mid_try, pngs=pngs, tail=tail, post=_api_post)
+                msg_id=mid_try, pngs=pngs, tail=tail, post=_api_post,
+                at_tag=at_tag)
             # 图片没上传成功时换 msg_id 重试毫无意义（还是没图），直接回退发图通道
             no_image = str(info_md).startswith(qq_markdown.NO_IMAGE)
             if not ok_md and _can_retry() and not no_image:
                 flog(f"markdown 首选通道失败({info_md})，换另一条消息通道重试")
                 ok_md, info_md, md_mode = qq_markdown.send_reply(
                     token, self.appid, self.api_base, kind, target_id, reply,
-                    msg_id=mid_fallback, pngs=pngs, tail=tail, post=_api_post)
+                    msg_id=mid_fallback, pngs=pngs, tail=tail, post=_api_post,
+                    at_tag=at_tag)
             if ok_md:
                 print(f"[official] 已回复 Markdown（{md_mode}）{kind} {target_id}",
                       file=sys.stderr)

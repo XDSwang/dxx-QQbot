@@ -593,17 +593,22 @@ def _esc(s):
     return re.sub(r"([\\`*_\[\]])", r"\\\1", s or "")
 
 
-def build_native(title, body, whisper, source="", image="", size="#618px #900px"):
+def build_native(title, body, whisper, source="", image="", size="#618px #900px",
+                 at_tag=""):
     """有图 = 卡片图 + 图下两条 /w；图里已有全文，不再重复任何正文。
 
     没图（纯文字回退）才输出完整标题 + 正文 + /w + 来源链接。
+    at_tag：官方 @ 用户标签（`<qqbot-at-user id="member_openid" />`），只在
+    「这条消息 @ 了机器人」时由上层传入，放在消息最前面 —— @ 了我，就 @ 回去。
+    模板 markdown 的变量是纯文本，塞不进标签，因此只在原生模式下生效。
     """
     tail_md = "\n\n" + whisper.strip() if whisper else ""
+    head_at = (at_tag.strip() + "\n") if at_tag and at_tag.strip() else ""
 
     if image:
         # 卡片图自带标题 / 统计 / 排序 / 订单 / 来源，文字部分只保留可复制指令。
         # 多一个字都会跟图里的内容重复 —— 这是用户看真机截图后的明确要求。
-        return f"![img {size}]({image})" + tail_md
+        return head_at + f"![img {size}]({image})" + tail_md
 
     head = ["# " + _esc(title), ""]
     for ln in body:
@@ -615,7 +620,7 @@ def build_native(title, body, whisper, source="", image="", size="#618px #900px"
     budget = max(120, max_chars() - len(tail_md) - len(link_md) - 2)
     if len(text) > budget:
         text = text[:budget] + "\n…（内容过长已截断，发「文字 + 指令」看全文）"
-    return text + tail_md + link_md
+    return head_at + text + tail_md + link_md
 
 
 def build_template(title, body, whisper, source="", image=""):
@@ -662,8 +667,11 @@ def build_template(title, body, whisper, source="", image=""):
 
 
 def build_markdown(reply, pngs=None, tail=None, image=None,
-                   token=None, appid=None, api_base=None):
-    """构造请求体的 markdown 对象，返回 (mode, obj, size)。"""
+                   token=None, appid=None, api_base=None, at_tag=""):
+    """构造请求体的 markdown 对象，返回 (mode, obj, size)。
+
+    at_tag：@ 用户标签，只有原生 markdown 能带；模板模式忽略（变量是纯文本）。
+    """
     m = resolved_mode()
     if m == "off":
         return "off", {}, ""
@@ -673,7 +681,7 @@ def build_markdown(reply, pngs=None, tail=None, image=None,
     size = image_markup_size(pngs[0]) if pngs else "#618px #900px"
     if m == "native":
         return m, {"content": build_native(title, body, whisper, source,
-                                           image, size)}, size
+                                           image, size, at_tag=at_tag)}, size
     return m, {"custom_template_id": template_id(),
                "params": build_template(title, body, whisper, source, image)}, size
 
@@ -695,10 +703,11 @@ def send(token, appid, api_base, kind, target_id, markdown_obj,
 
 
 def send_reply(token, appid, api_base, kind, target_id, reply,
-               msg_id=None, pngs=None, tail=None, post=None):
+               msg_id=None, pngs=None, tail=None, post=None, at_tag=""):
     """一步到位：把 handler 回复尝试发成 markdown 消息。
 
     返回 (ok, info, mode)。图片的二进制上传在这里完成（走官方素材管理）。
+    at_tag：只在「@ 了机器人」时由上层传入，写进原生 markdown 最前面。
     失败由上层回退，不吞异常、不阻塞主通道。
     """
     m = resolved_mode()
@@ -715,7 +724,8 @@ def send_reply(token, appid, api_base, kind, target_id, reply,
                 return False, (NO_IMAGE + ": 卡片图未取到素材引用，"
                                "回退富媒体图片通道"), m
         m, md, _ = build_markdown(reply, pngs=pngs, tail=tail, image=image,
-                                  token=token, appid=appid, api_base=api_base)
+                                  token=token, appid=appid, api_base=api_base,
+                                  at_tag=at_tag)
         ok, info = send(token, appid, api_base, kind, target_id, md,
                         msg_id=msg_id, post=post)
         return bool(ok), info, m

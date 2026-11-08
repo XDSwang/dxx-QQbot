@@ -216,6 +216,14 @@ with patch.dict(os.environ, {"WM_QQ_MARKDOWN": "native",
     check("超长时截断", "已截断" in long)
     check("截断仍保留 /w", WHISPER in long)
 
+    # @ 了机器人才 @ 回去：标签写在消息最前面，正文 / 图 / /w 一格不动
+    at_md = M.build_native("T", ["X"], WHISPER, "", "https://x/y.png",
+                           "#618px #900px", at_tag='<qqbot-at-user id="MO1" />')
+    at_lines = at_md.splitlines()
+    check("@ 标签在消息最前面", at_lines[0] == '<qqbot-at-user id="MO1" />')
+    check("@ 标签下一行才是图片", "![img" in at_lines[1])
+    check("不传 at_tag 时没有 @ 标签", "<qqbot-at-user" not in md)
+
     w, h = M._png_size(PNG)
     check("PNG 宽高解析", (w, h) == (1024, 2048))
     check("图片尺寸按比例换算", M.image_markup_size(PNG) == "#618px #1236px")
@@ -242,6 +250,13 @@ with patch.dict(os.environ, {"WM_QQ_MARKDOWN": "template",
     check("★ 模板 para/desc 留空不重复正文",
           v["para1"] == "" and v["para2"] == "" and v["desc"] == "")
     check("link 填来源网址", v["link"].startswith("https://warframe.market/"))
+    # 模板变量是纯文本，@ 标签塞不进去：宁可这条通道不 @，也不要显示成一段标签原文
+    mode_t, obj_t, _ = M.build_markdown(
+        image_reply(), pngs=[PNG], tail=WHISPER,
+        image="qqbot-media://image/v1/TOKEN123",
+        at_tag='<qqbot-at-user id="MO1" />')
+    check("模板模式忽略 @ 标签",
+          "qqbot-at-user" not in json.dumps(obj_t, ensure_ascii=False))
     check("link_introduction 是域名", v["link_introduction"] == "warframe.market")
 
 # ---------------------------------------------------------------- 5
@@ -405,6 +420,21 @@ with patch.dict(os.environ, {"WM_QQ_MARKDOWN": "native",
           and "🔗" not in body["markdown"]["content"])
     check("不带 @ 占位符", "<@" not in body["markdown"]["content"])
 
+    # @ 了机器人：同一条 markdown 最前面多一行官方 @ 用户标签（member_openid）
+    clean_cache()
+    calls_at, fake_at = fake_http(media_handler)
+    with patch.object(M.bot_config, "urlopen", fake_at):
+        ok_at, _, _ = M.send_reply(
+            "TOK", "APP", "https://api.bot.qq.com", "group", "G1",
+            image_reply(), msg_id="M1", pngs=[PNG], tail=WHISPER,
+            at_tag='<qqbot-at-user id="MO1" />')
+    at_msg = [r for r in calls_at if r.full_url.endswith("/messages")]
+    at_content = json.loads(at_msg[0].data.decode("utf-8"))["markdown"]["content"]
+    check("at_tag 透传到 markdown 最前面",
+          ok_at and at_content.startswith('<qqbot-at-user id="MO1" />\n'))
+    check("@ 之后仍是图片 + /w",
+          "![img" in at_content and "/w -Ar.Luna-" in at_content)
+
     # 失败不抛异常
     clean_cache()
     def fail_handler(req):
@@ -429,6 +459,22 @@ with patch.dict(os.environ, {"WM_QQ_MARKDOWN": "native",
         check("markdown 成功时不发富媒体图", send_img.call_count == 0)
     md_msgs = [r for r in calls2 if r.full_url.endswith("/messages")]
     check("接入链路只产生一条消息", len(md_msgs) == 1)
+
+    # @ 了机器人：同一条链路，markdown 首行多一个官方 @ 用户标签
+    clean_cache()
+    calls3, fake3 = fake_http(media_handler)
+    with patch.object(M.bot_config, "urlopen", fake3), \
+         patch.object(qq_official, "send_message") as send_text3, \
+         patch.object(qq_official.OfficialBot, "_reply_images") as send_img3:
+        bot._dispatch_reply("TOK", "group", "G1", "平原",
+                            {"at_me": True, "member_openid": "MO1"}, "M1")
+        check("@ 消息仍只走一条 markdown",
+              send_text3.call_count == 0 and send_img3.call_count == 0)
+    md3 = [r for r in calls3 if r.full_url.endswith("/messages")]
+    c3 = json.loads(md3[0].data.decode("utf-8"))["markdown"]["content"]
+    check("@ 了机器人：回复首行 @ 回去",
+          c3.startswith('<qqbot-at-user id="MO1" />'))
+    check("@ 回去不影响卡片图与 /w", "![img" in c3 and "/w -Ar.Luna-" in c3)
 
     # markdown 失败 → 回退原富媒体图
     clean_cache()
