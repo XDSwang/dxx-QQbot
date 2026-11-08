@@ -39,6 +39,16 @@ class _Base(unittest.TestCase):
         (self.signals / "wm-bot").mkdir(parents=True)
         (self.signals / "run0").write_text("0", encoding="utf-8")
         (self.signals / "wm-bot" / "run0").write_text("0", encoding="utf-8")
+        # 公共仓库本体的「模板 + 迁移规则」在测试里指向临时小文件，让 reconcile
+        # 行为可预测（不会把真实 346 行模板 / 真实 schema 混进来）。
+        self.template_file = self.root / "public_config.txt"
+        self.template_file.write_text(
+            "# 公共配置模板（测试用）\nWM_QQ_APPID = \nWM_QQ_SECRET = \nNEW_FLAG = 1\n",
+            encoding="utf-8")
+        self.schema_file = self.root / "public_schema.json"
+        self.schema_file.write_text(
+            json.dumps({"version": 2, "rename": {"users": "members"}}),
+            encoding="utf-8")
         p1 = mock.patch.multiple(
             updater, SIGNAL_DIR=self.signals, STATE_DIR=self.state,
             ERROR_LOG=self.state / "updater_error.log",
@@ -46,7 +56,9 @@ class _Base(unittest.TestCase):
             PACE_FILE=self.state / "pace.json",
             STATE_FILE=self.state / "state.json",
             BACKUP_ROOT=self.state / "backup",
-            LOCK_FILE=self.state / "updater.lock")
+            LOCK_FILE=self.state / "updater.lock",
+            TEMPLATE_PATH=self.template_file,
+            SCHEMA_PATH=self.schema_file)
         p2 = mock.patch.multiple(
             run, BOT_DATA_DIR=self.data, BOT_CONFIG=self.data / "config.txt",
             CFG_FILE=self.root / "update.cfg", HERE=self.root)
@@ -91,29 +103,39 @@ class TestSignal(_Base):
         self.assertEqual(updater.pick_signal(pairs).name, "run3")
 
 
-class TestMergeConfig(_Base):
-    LOCAL = ("# 本地注释\nWM_QQ_APPID = REAL_APPID\n"
-             "WM_QQ_SECRET = REAL_SECRET\nOLD_FIELD = local-only\n")
-    CLOUD = ("# 云端模板注释\nWM_QQ_APPID = \nWM_QQ_SECRET = \n"
-             "NEW_FLAG = 1\n")
+class TestReconcileConfig(_Base):
+    TEMPLATE = ("# 模板注释\nWM_QQ_APPID = \nWM_QQ_SECRET = \n"
+                "NEW_FLAG = 1\n")
+    VALUES = ("# 本地注释\nWM_QQ_APPID = REAL_APPID\n"
+              "WM_QQ_SECRET = REAL_SECRET\nOLD_FIELD = local-only\n")
 
-    def test_structure_keeps_secret_and_syncs_fields(self):
-        text, rep = updater.merge_config(self.LOCAL, self.CLOUD)
-        self.assertIn("WM_QQ_SECRET = REAL_SECRET", text, "密钥绝不能被云端空值冲掉")
-        self.assertIn("NEW_FLAG = 1", text)
-        self.assertNotIn("OLD_FIELD", text, "云端删掉的字段不再写入")
-        self.assertIn("# 云端模板注释", text)
+    def test_template_is_base_and_secrets_kept(self):
+        text, rep = updater.reconcile_config(self.TEMPLATE, self.VALUES)
+        self.assertIn("WM_QQ_SECRET = REAL_SECRET", text, "密钥绝能被模板空值冲掉")
+        self.assertIn("NEW_FLAG = 1", text, "模板里的新字段要出现")
+        self.assertIn("WM_QQ_APPID = REAL_APPID", text)
         self.assertIn("NEW_FLAG", rep["added"])
-        self.assertIn("OLD_FIELD", rep["removed"])
         self.assertIn("WM_QQ_SECRET", rep["kept"])
+        self.assertEqual(rep["removed"], [], "方案 A 不再删除任何字段")
 
-    def test_overwrite_is_literal_copy(self):
-        text, _ = updater.merge_config(self.LOCAL, self.CLOUD, "overwrite")
-        self.assertEqual(text, self.CLOUD)
+    def test_unknown_field_is_kept_not_dropped(self):
+        text, rep = updater.reconcile_config(self.TEMPLATE, self.VALUES)
+        self.assertIn("OLD_FIELD = local-only", text, "私有有、模板没有的字段必须保留")
+        self.assertIn("OLD_FIELD", rep["extra_kept"])
 
-    def test_no_cloud_config_is_noop(self):
-        text, rep = updater.merge_config(self.LOCAL, None)
-        self.assertEqual(text, self.LOCAL)
+    def test_new_fields_reported_for_push(self):
+        # 模板有、私有没有 → 这些是新字段，需要回写私有库把空位补上
+        text, rep = updater.reconcile_config(self.TEMPLATE, "WM_QQ_APPID = X\n")
+        self.assertEqual(rep["new_fields"], ["NEW_FLAG", "WM_QQ_SECRET"])
+        self.assertIn("NEW_FLAG = 1", text)
+
+    def test_overwrite_returns_values_verbatim(self):
+        text, _ = updater.reconcile_config(self.TEMPLATE, self.VALUES, "overwrite")
+        self.assertEqual(text, self.VALUES, "overwrite 模式原样返回私有值")
+
+    def test_no_values_uses_template(self):
+        text, rep = updater.reconcile_config(self.TEMPLATE, None)
+        self.assertEqual(text, self.TEMPLATE, "私有没有值时给模板（全空）等本人填")
         self.assertTrue(rep["skipped"])
 
     def test_load_cfg_merges_defaults(self):
@@ -185,13 +207,19 @@ class TestWriteAndBundle(_Base):
             encoding="utf-8")), {"new": 2})
         self.assertTrue((Path(detail) / "ws_subs.json").exists())
 
-    def test_fetch_bundle_and_push_runtime(self):
+    def test_fetch_bundle_reads_local_schema_and_private_values(self):
         (self.remote / "config.txt").write_text("A = 1", encoding="utf-8")
-        (self.remote / "schema.json").write_text('{"version": 5}', encoding="utf-8")
         (self.remote / "runtime.json").write_text('{"ws_subs.json": {}}', encoding="utf-8")
-        b = updater.fetch_bundle(self.store())
-        self.assertEqual(b["config"], "A = 1")
-        self.assertEqual(b["schema"]["version"], 5)
+        schema_file = self.root / "schema.json"
+        schema_file.write_text('{"version": 5}', encoding="utf-8")
+        old_path = updater.SCHEMA_PATH
+        updater.SCHEMA_PATH = schema_file
+        try:
+            b = updater.fetch_bundle(self.store())
+            self.assertEqual(b["config"], "A = 1")
+            self.assertEqual(b["schema"]["version"], 5, "规则改从公共仓库本地读")
+        finally:
+            updater.SCHEMA_PATH = old_path
         updater.push_runtime(self.store(), {"ws_subs.json": {"x": 1}})
         self.assertEqual(json.loads((self.remote / "runtime.json").read_text(
             encoding="utf-8")), {"ws_subs.json": {"x": 1}})
@@ -218,14 +246,14 @@ class FakeBot(object):
 class TestDoUpdate(_Base):
     def _prepare(self):
         (self.remote / "run1").write_text("1", encoding="utf-8")
+        # 方案 A：真实值（密钥）存在私有库（remote）的 config.txt，模板在公共仓库；
+        # 本地 data/config.txt 只是上一轮合并结果，会被覆盖，不提供值。
         (self.remote / "config.txt").write_text(
-            "# cloud\nWM_QQ_APPID = \nWM_QQ_SECRET = \nNEW_FLAG = 1\n", encoding="utf-8")
-        (self.remote / "schema.json").write_text(json.dumps(
-            {"version": 2, "rename": {"users": "members"}}), encoding="utf-8")
+            "# 私有真实值\nWM_QQ_APPID = REAL\nWM_QQ_SECRET = SECRET\nNEW_FLAG = 1\n",
+            encoding="utf-8")
         (self.remote / "runtime.json").write_text(json.dumps(
             {"ws_subs.json": {"version": 1, "sessions": {}}}), encoding="utf-8")
-        (self.data / "config.txt").write_text(
-            "WM_QQ_APPID = REAL\nWM_QQ_SECRET = SECRET\nOLD_FIELD = x\n", encoding="utf-8")
+        (self.data / "config.txt").write_text("", encoding="utf-8")
         (self.data / "ws_subs.json").write_text(json.dumps({
             "version": 1,
             "sessions": {"g|1": {"users": ["alerts"]}},
@@ -349,7 +377,6 @@ class TestPreflight(_Base):
                       "缺信号时该指向公共库发布目录，而不是私有数据后端")
         self.assertIn("runN", text)
         self.assertIn("config.txt", text)
-        self.assertIn("schema.json", text)
 
     def test_not_a_git_repo_is_reported(self):
         cfg = dict(run.DEFAULTS)
@@ -515,8 +542,8 @@ class TestMultiService(_Base):
     def _remote_service(self, name="wm-bot"):
         remote = self.remote / name
         remote.mkdir(parents=True, exist_ok=True)
-        for n, t in (("config.txt", "WM_QQ_APPID = \n"),
-                     ("schema.json", "{}"), ("runtime.json", "{}"), ("run1", "1")):
+        for n, t in (("config.txt", "WM_QQ_APPID = REAL\n"),
+                     ("runtime.json", "{}"), ("run1", "1")):
             (remote / n).write_text(t, encoding="utf-8")
         return updater.LocalStore(remote)
 
@@ -635,8 +662,9 @@ class TestOwner(_Base):
     def _remote_with(self, name="wm-bot"):
         remote = self.remote / name
         remote.mkdir(parents=True, exist_ok=True)
-        for n, t in (("config.txt", "WM_QQ_APPID = \n"),
-                     ("schema.json", "{}"), ("runtime.json", "{}"), ("run1", "1")):
+        # 方案 A：真实值进私有库 config.txt；schema 已改从公共仓库读，私有库不再放
+        for n, t in (("config.txt", "WM_QQ_APPID = REAL\n"),
+                     ("runtime.json", "{}"), ("run1", "1")):
             (remote / n).write_text(t, encoding="utf-8")
         return updater.LocalStore(remote)
 
@@ -748,24 +776,25 @@ class TestGitHubStore(unittest.TestCase):
         self.assertEqual(base64.b64decode(puts[0][2]["content"]).decode("utf-8"),
                          '{"x": 1}')
 
-    def test_fetch_bundle_never_uses_stale_listing(self):
-        """信号不再每 10 秒碰私有库，列目录缓存必须由 fetch_bundle 主动失效。"""
+    def test_fetch_bundle_refreshes_private_listing(self):
+        """私有库列目录缓存必须由 fetch_bundle 主动失效，否则读不到刚改的 config。"""
         gets = []
 
         def fake(method, url, body=None):
             if method == "GET" and "contents/wm-bot?" in url:
                 gets.append(url)
                 v = len(gets)
-                return [{"name": "schema.json", "sha": "S%d" % v,
-                         "content": _b64('{"version": %d}' % v)},
-                        {"name": "config.txt", "sha": "C",
-                         "content": _b64("K = \n")}]
+                return [{"name": "config.txt", "sha": "C%d" % v,
+                         "content": _b64("K = %d" % v)}]
+            if method == "GET" and "config.txt" in url:
+                return {"name": "config.txt", "sha": "C%d" % len(gets),
+                        "content": _b64("K = %d" % len(gets))}
             return None
 
         s = updater.GitHubStore("me/private-repo", "tok", "wm-bot")
         s._api = fake
-        self.assertEqual(updater.fetch_bundle(s)["schema"]["version"], 1)
-        self.assertEqual(updater.fetch_bundle(s)["schema"]["version"], 2,
+        self.assertEqual(updater.fetch_bundle(s)["config"], "K = 1")
+        self.assertEqual(updater.fetch_bundle(s)["config"], "K = 2",
                          "第二轮必须重新列目录，不能拿上一轮缓存的旧配置")
         self.assertEqual(len(gets), 2)
 

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "_doc": "运行数据迁移规则，随公共仓库代码同仓同提交，永远和引擎同步。私有库不再存放规则。字段说明见 updater.migrate_runtime：rename=旧名→新名，drop=删除字段，files.<name>.keep=该文件允许保留的顶层字段，files.<name>.defaults=新增字段默认值。目前暂无字段变更，留空结构占位。",
+  "rename": {},
+  "drop": [],
+  "files": {}
+}

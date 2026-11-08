@@ -159,8 +159,10 @@ WM_QQ_TOKEN =
 # off           ：只发文字（想复制文字的场景，图里的字选不中）
 # 临时强压：发「图 裂缝」强制出图，发「文字 裂缝」强制只发文字，前缀优先于这里。
 #           「文字」对 WM 也生效：文字 WM Boltor Prime 会回纯文本，方便复制 /w 指令。
-# WM_WS_CARD = always
-# WM_WS_CARD_MIN = 800
+# WM_WS_CARD：always（默认）/ auto / off，回复形式（见上方说明）
+WM_WS_CARD =
+# WM_WS_CARD_MIN：auto 模式阈值（字节），默认 800
+WM_WS_CARD_MIN =
 #   字体：默认自动找 微软雅黑 / 思源黑体 / Noto / 文泉驿；都找不到就自动退回纯文字。
 #   要指定字体（例如 Linux 服务器）：
 # WM_CARD_FONT = /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
@@ -175,7 +177,8 @@ WM_QQ_TOKEN =
 # 1（默认）：一条消息，图上是价格列表、图下就是 /w 指令
 # 0        ：退回两条（图一条 + 文本一条）；若发现客户端不显示混排文字，改成 0
 # 混排被服务端拒绝时会自动回退成两条，无需手动干预。
-# WM_QQ_MIX_MESSAGE = 1
+# WM_QQ_MIX_MESSAGE：1（默认）/ 0，官方通道 WM 回复图文是否合成一条消息
+WM_QQ_MIX_MESSAGE =
 
 # ---- 监控推送：主动 + 随消息附带（两手准备） ----
 # 主动消息要在【群资料页 → 机器人设置】打开「机器人主动在群聊内发言」，

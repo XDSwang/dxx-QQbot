@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """updater.py — 自动更新的远程读取 / 配置合并 / 运行数据迁移（零第三方依赖）。
 
-私有地址上的文件（名字写死为常量，由本模块统一提供）：
-  run0 / run1     信号。文件名改成 run1 = 需要更新，run0 = 不需要；也认 run2、run3…
-                  （递增版本号）。配合「指纹」做幂等，不会每 10 秒重复更新一次。
-  config.txt      机器人配置（全字段模板；服务端本地的密钥 / 路径 / 白名单值默认保留）
-  schema.json     最新字段结构 + 改名 / 删除规则（用户维护，服务端只读）
+私有地址（GitHub 私有仓库）只存【真实值】，结构权威在公共仓库本体：
+  run0 / run1     信号（放公共仓库 signals/，10 秒轮询零网络零 PAT；见 SIGNAL_DIR）
+  config.txt      机器人真实配置（只存值；模板 + 描述在公共仓库 wm-bot/python/config.txt）
   runtime.json    服务端回写的「最新完整 + 旧数据迁移」结果（机器维护，用户只读）
+
+公共仓库本体（随代码同仓同提交，永远和引擎同步）持有：
+  wm-bot/python/config.txt   配置模板（字段 + 描述 + 空值），reconcile 的结构基准
+  wm-bot/python/schema.json  运行数据迁移规则（改名 / 删除 / 保留 / 默认）
 
 迁移一律【拉到服务端本地】完成：云端没有字段级读写能力，直接在那边改会留下
 半迁移状态。流程 = 备份 → 校验 → 改名/删字段/补默认 → 原子替换 → 回写云端 → 记指纹。
@@ -38,10 +40,13 @@ STATE_FILE = STATE_DIR / "update_state.json"    # 全局指纹（无服务归属
 BACKUP_ROOT = STATE_DIR / "backup"
 LOCK_FILE = STATE_DIR / "updater.lock"
 
-CONFIG_NAME = "config.txt"
-SCHEMA_NAME = "schema.json"
-RUNTIME_NAME = "runtime.json"
+CONFIG_NAME = "config.txt"                      # 私有地址：机器人真实配置（只存值）
+RUNTIME_NAME = "runtime.json"                   # 私有地址：服务端回写的迁移结果
 OWNER_NAME = "owner.json"                       # 数据目录归属：防两个不同授权互写同一份数据
+# 方案 A：结构权威在公共仓库本体（随代码同提交），私有库只存真实值。
+# 模板 + 迁移规则从本地已 checkout 的公共仓库读，绝不读私有库的规则文件。
+TEMPLATE_PATH = HERE / "wm-bot" / "python" / "config.txt"
+SCHEMA_PATH = HERE / "wm-bot" / "python" / "schema.json"
 SIGNAL_RE = re.compile(r"^run(\d+)$")
 POLL_SECONDS = 10
 HOST_GAP_SECONDS = 3.5                           # 写死：落在规范的 3~5 秒区间内
@@ -363,68 +368,102 @@ def claim_owner(store, instance_id, service=None):
 
 
 def fetch_bundle(store):
-    """一次拿到私有地址上的配置 / 结构规则 / 云端运行数据。
+    """拿到私有地址上的【真实值】(config/runtime)；模板 + 迁移规则从公共仓库本地读。
 
-    refresh 先行：私有库【只在真有更新时】被访问，不能拿上一轮缓存的目录内容，
-    否则云端改了 schema.json 也不会生效。
+    方案 A：结构权威在公共仓库（模板 + 规则随代码同提交），私有库只存真实值。
+    私有库改了，服务端拉下来就知道；服务端把结构 + 空字段同步回去。
+    refresh 先行：私有库【只在真有更新时】被访问，不能拿上一轮缓存。
     """
     store.refresh()
-    schema = {}
+    schema = load_local_schema()      # 规则在公共仓库本体，随代码演进，不在私有库
     runtime = {}
-    raw_schema = store.read(SCHEMA_NAME)
     raw_runtime = store.read(RUNTIME_NAME)
-    if raw_schema:
-        schema = json.loads(raw_schema)
     if raw_runtime:
         runtime = json.loads(raw_runtime)
     return {"config": store.read(CONFIG_NAME),
             "schema": schema, "runtime": runtime}
 
 
-# ------------------------------ 配置合并 ------------------------------
-def merge_config(local_text, remote_text, mode="structure"):
-    """以私有地址的配置为【结构基准】，同步字段增删，但保留服务端本地的值。
+# ------------------------------ 配置对账（方案 A） ------------------------------
+def load_local_template():
+    """读公共仓库本地的配置模板（结构 + 描述 + 空值）；这是 reconcile 的结构基准。"""
+    try:
+        if TEMPLATE_PATH.exists():
+            return TEMPLATE_PATH.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return ""
 
-    structure（默认）：remote 有这个键 → 用 local 的值（local 非空时）；
-                      remote 新增键 → 补 remote 默认值；remote 删掉的键 → 不再写入。
-    overwrite       ：整份照抄 remote（只有私有地址放的是含密钥的完整副本时才用）。
 
-    为什么默认不是整份覆盖：仓库里的 python/config.txt 是公开模板，WM_QQ_APPID /
-    WM_QQ_SECRET 是空的；覆盖过去服务端立刻连不上机器人。
+def load_local_schema():
+    """读公共仓库本体的迁移规则；随代码同提交，永远和引擎同步。"""
+    try:
+        if SCHEMA_PATH.exists():
+            return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def reconcile_config(template_text, values_text, mode="structure"):
+    """以【公共仓库模板】为结构基准，私有库真实值为覆盖，安全合并。
+
+    - 模板有、私有值非空 → 用私有值（保留真实值，绝不被空值冲掉）
+    - 模板有、私有值为空 → 保留模板行（空 / 默认），即「新字段先留空」
+    - 私有有、模板没有 → 保留（绝不静默删除；方案 A 的兼容兜底）
+    模板的注释 / 描述行原样保留，保证私有库里也能看到每个字段的说明。
+
+    返回 (合并文本, 报告)。报告里的 new_fields 是「模板有、私有没有」的真·新字段，
+    只有这些出现时才需要把结构回写私有库；removed 永远为空。
     """
-    if not remote_text:
-        return local_text, {"mode": mode, "added": [], "removed": [], "kept": [],
-                            "skipped": "私有地址没有 config.txt"}
-    if mode == "overwrite" or not local_text:
-        return remote_text, {"mode": mode, "added": [], "removed": [], "kept": [],
-                             "skipped": ""}
-    local_vals = {}
-    for line in (local_text or "").splitlines():
+    if mode == "overwrite":
+        # 全量覆盖：按私有值原样写回，不参与模板对账（保留注释/字段全交给调用方）
+        return (values_text or ""), {"mode": mode, "added": [], "removed": [],
+                                     "kept": [], "new_fields": [], "extra_kept": [],
+                                     "skipped": "全量覆盖：按私有值原样写回"}
+    if not template_text:
+        return (values_text or ""), {"mode": mode, "added": [], "removed": [],
+                                     "kept": [], "new_fields": [], "extra_kept": [],
+                                     "skipped": "公共仓库没有配置模板"}
+    if not values_text:
+        # 私有库没有任何真实值：直接给一份模板（全空），等私有库自己填
+        return template_text, {"mode": mode, "added": [], "removed": [],
+                               "kept": [], "new_fields": [], "extra_kept": [],
+                               "skipped": "私有地址没有 config.txt，先用模板"}
+    tmpl_keys = {}
+    for line in template_text.splitlines():
         m = CONFIG_KV.match(line)
         if m:
-            local_vals[m.group(1)] = m.group(2)
-    remote_keys = set()
-    added, kept = [], []
+            tmpl_keys[m.group(1)] = m.group(2)
+    val_vals = {}
+    for line in values_text.splitlines():
+        m = CONFIG_KV.match(line)
+        if m:
+            val_vals[m.group(1)] = m.group(2)
     out = []
-    for line in remote_text.splitlines():
+    added, kept = [], []
+    for line in template_text.splitlines():
         m = CONFIG_KV.match(line)
         if not m:
-            out.append(line)
+            out.append(line)                      # 注释 / 描述原样保留
             continue
-        key, val = m.group(1), m.group(2)
-        remote_keys.add(key)
-        if key in local_vals and local_vals[key].strip():
-            out.append("%s = %s" % (key, local_vals[key].rstrip()))
+        key = m.group(1)
+        if key in val_vals and val_vals[key].strip():
+            out.append("%s = %s" % (key, val_vals[key].rstrip()))
             kept.append(key)
         else:
-            out.append(line)
+            out.append(line)                      # 模板空 / 默认：新字段先留空
             added.append(key)
-    removed = sorted(set(local_vals) - remote_keys)
+    # 私有有、模板没有：保留，绝不删除（方案 A 兼容兜底）
+    extra = sorted(set(val_vals) - set(tmpl_keys))
+    for key in extra:
+        out.append("%s = %s" % (key, val_vals[key].rstrip()))
     text = "\n".join(out)
-    if remote_text.endswith("\n"):
+    if template_text.endswith("\n"):
         text += "\n"
-    return text, {"mode": mode, "added": added, "removed": removed,
-                  "kept": kept, "skipped": ""}
+    new_fields = sorted(set(tmpl_keys) - set(val_vals))
+    return text, {"mode": mode, "added": added, "removed": [], "kept": kept,
+                  "new_fields": new_fields, "extra_kept": extra, "skipped": ""}
 
 
 # ------------------------------ 运行数据迁移 ------------------------------
@@ -554,4 +593,13 @@ def push_runtime(store, runtime):
     """把「最新完整 + 旧数据迁移」的结果回写私有地址（用户只读，服务端只写）。"""
     text = json.dumps(runtime, ensure_ascii=False, indent=2) + "\n"
     store.write(RUNTIME_NAME, text)
+    return text
+
+
+def push_config(store, text):
+    """把合并后的配置（真实值 + 新字段空位）回写私有地址，让私有库结构与模板同步。
+
+    只在新字段出现时才调用（见 do_update / sync_config），避免每轮空提交。
+    """
+    store.write(CONFIG_NAME, text)
     return text

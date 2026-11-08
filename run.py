@@ -14,6 +14,7 @@
 指纹、备份、进程按服务隔离，单实例锁全局一份。
 """
 import atexit
+import hashlib
 import json
 import os
 import subprocess
@@ -55,6 +56,10 @@ DEFAULTS = {
     "UPDATER_POLL_SECONDS": "10",
     "UPDATER_GIT_PULL": "1",
     "UPDATER_CONFIG_MERGE": "structure",
+    # 方案 A：按公共模板对账后，只有出现新字段才把结构回写私有库（避免每轮空提交）
+    "UPDATER_PUSH_CONFIG": "1",
+    # 每 10 秒检测私有库 config 是否被账号本人改过，改过就按模板迁移并热重载
+    "UPDATER_SYNC_PRIVATE_CONFIG": "1",
     "UPDATER_PUSH_RUNTIME": "1",
 }
 
@@ -280,7 +285,7 @@ def preflight(cfg, store, services=None, service_stores=None,
                 seen[key] = s.name
     if not services:
         # 兼容没有服务清单的离线自检：单后端时也检查根目录下的配置 / 规则文件
-        for name in (updater.CONFIG_NAME, updater.SCHEMA_NAME):
+        for name in (updater.CONFIG_NAME,):
             try:
                 if store.read(name) is None:
                     problems.append("私有地址缺少 %s" % name)
@@ -300,7 +305,7 @@ def preflight(cfg, store, services=None, service_stores=None,
             except Exception as e:
                 problems.append("[%s] 信号读取失败：%s" % (s.name, e))
             try:
-                for name in (updater.CONFIG_NAME, updater.SCHEMA_NAME):
+                for name in (updater.CONFIG_NAME,):
                     if st.read(name) is None:
                         problems.append("[%s] 私有目录缺少 %s" % (s.name, name))
             except Exception as e:
@@ -462,13 +467,22 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
         cloud = bundle["runtime"]
         names = set(runtime_files) | set(cloud) | set(schema.get("files") or {})
         _backup_files(backup_dir, sorted(names), data_dir, cfg_path.name)
-        # ① 配置：结构同步（增删字段）+ 服务端本地值保留
+        # ① 配置：以公共仓库模板为结构基准，私有库真实值为覆盖，安全对账
+        #    （新字段留空、未知字段保留、密钥绝不被空值冲掉）
         config_report = {"skipped": "数据后端没有 config.txt"}
-        if bundle["config"]:
-            local_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
-            merged, config_report = updater.merge_config(
-                local_cfg, bundle["config"], cfg.get("UPDATER_CONFIG_MERGE", "structure"))
-            updater._atomic_write(cfg_path, merged)
+        template_text = updater.load_local_template()
+        values_text = bundle["config"] or ""
+        merged, config_report = updater.reconcile_config(
+            template_text, values_text, cfg.get("UPDATER_CONFIG_MERGE", "structure"))
+        updater._atomic_write(cfg_path, merged)
+        # 只有出现模板里没有的新字段时才把结构回写私有库（把空位同步回去让本人填）
+        if (not _off(cfg.get("UPDATER_PUSH_CONFIG", "1"))
+                and config_report.get("new_fields")):
+            try:
+                updater.push_config(store, merged)
+            except Exception as e:
+                updater.elog("[%s] 配置结构回写私有库失败（服务端本地已更新）"
+                             % (service or "default"), str(e))
         # ② 运行数据：按最新结构迁移（改名 / 删字段 / 补默认）
         local, bad = updater.collect_runtime(data_dir, sorted(names))
         migrated, report = updater.migrate_runtime(local, schema, cloud)
@@ -524,6 +538,37 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
         bot.start()
 
 
+def sync_config(cfg, store, svc, bot):
+    """配置专用同步：拉私有库真实值 → 按公共模板对账 → 写本地 → 重启机器人。
+
+    用于「账号本人在网站 / git 改了私有库配置」后的热更新：不碰代码、不迁移运行数据。
+    只有出现模板新字段才回写私有库（把空位同步回去让本人填）。返回是否应用成功。
+    """
+    cfg_path = Path(svc.config_file) if svc else BOT_CONFIG
+    try:
+        raw = store.read(updater.CONFIG_NAME)
+    except Exception as e:
+        updater.elog("[%s] 读私有配置失败" % (svc.name if svc else "default"), str(e))
+        return False
+    if raw is None:
+        return False
+    template_text = updater.load_local_template()
+    merged, rep = updater.reconcile_config(
+        template_text, raw, cfg.get("UPDATER_CONFIG_MERGE", "structure"))
+    updater._atomic_write(cfg_path, merged)
+    if (not _off(cfg.get("UPDATER_PUSH_CONFIG", "1")) and rep.get("new_fields")):
+        try:
+            updater.push_config(store, merged)
+        except Exception as e:
+            updater.elog("[%s] 配置结构回写失败" % (svc.name if svc else "default"), str(e))
+    if bot.alive():
+        bot.stop()
+    bot.start()
+    updater.flog("[%s] 私有库配置变更已按模板迁移并热重载"
+                 % (svc.name if svc else "default"))
+    return True
+
+
 def main():
     """统一 RUN：装配 → 自检 → 启动先同步 → 拉起所有服务 → 每 10 秒查信号。"""
     cfg = load_cfg()
@@ -568,6 +613,7 @@ def main():
         b.start()
     self_fp = self_fingerprint()
     crashes = {s.name: 0 for s in services}
+    applied_cfg_hash = {}        # 各服务私有库 config 的上次哈希；变了就热更新
     try:
         while True:
             time.sleep(poll)
@@ -622,6 +668,37 @@ def main():
                 plan.append((s, service_stores[s.name], bots[s.name], sig, True))
             for s, store, bot, sig, pull in plan:
                 do_update(cfg, store, bot, sig, svc=s, pull=pull)
+            # 私有库配置热更新（账号本人在网站 / git 改了 config）：只处理本轮没被
+            # 代码更新碰过的服务，避免重复重启；检测哈希变化即按模板迁移 + 热重载。
+            if not _off(cfg.get("UPDATER_SYNC_PRIVATE_CONFIG", "1")):
+                for s in services:
+                    if s.name in planned:
+                        continue
+                    st_store = service_stores[s.name]
+                    try:
+                        raw = st_store.read(updater.CONFIG_NAME)
+                    except Exception as e:
+                        updater.elog("[%s] 读私有配置失败" % s.name, str(e))
+                        continue
+                    if raw is None:
+                        continue
+                    h = hashlib.md5(raw.encode("utf-8")).hexdigest()
+                    prev = applied_cfg_hash.get(s.name)
+                    if prev is None:
+                        # 首次观测：只记哈希，不触发重启，避免把「初始状态」当成变更
+                        applied_cfg_hash[s.name] = h
+                    elif h != prev:
+                        applied_cfg_hash[s.name] = h
+                        updater.flog("[%s] 检测到私有库配置变更，按模板迁移并重载" % s.name)
+                        if sync_config(cfg, st_store, s, bots[s.name]):
+                            # 重新读私有库，把「服务端刚回写的结构」也记下来，避免自触发
+                            try:
+                                raw2 = st_store.read(updater.CONFIG_NAME)
+                                if raw2 is not None:
+                                    applied_cfg_hash[s.name] = hashlib.md5(
+                                        raw2.encode("utf-8")).hexdigest()
+                            except Exception:
+                                pass
             if self_fingerprint() != self_fp:
                 # 代码已 pull 到磁盘，进程必须换成新版；无论重启成败都刷新指纹，
                 # 避免失败时每 10 秒反复尝试重启。

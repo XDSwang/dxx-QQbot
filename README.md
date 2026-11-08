@@ -15,7 +15,8 @@
 - `services.json`（进 git）：服务清单，以后加服务只加一项，不改 `run.py`。
 - **信号与数据分开**：`runN` 只说明公共库该不该更新，放在公共仓库本体
   `signals/{runN, <服务名>/runN}`（进 git，随代码 push，**不需要 PAT**）；
-  私有库只放数据 `services/<服务名>/{config.txt, schema.json, runtime.json, owner.json}`。
+  私有库只放数据 `services/<服务名>/{config.txt, runtime.json, owner.json}`；结构权威
+  （配置模板 + 迁移规则）在公共仓库 `wm-bot/python/`，随代码同提交，不在私有库。
   10 秒轮询只读本地信号，真有更新时才访问私有库，服务变多也不会拖慢轮询。
 - 配置模板见 `update.cfg.example`；`update.cfg`、`data/`、`remote/` 都不进 git。
 - 首次部署仍要手工放一次 `update.cfg` 和各服务自己的真实配置
@@ -38,8 +39,9 @@
   用 `SERVICES_ENABLED` 决定本台跑哪些服务；全局 `run1` 所有机器一起更新，属于预期的统一发布。
   配 `UPDATER_DATA_NAMESPACE` + `UPDATER_INSTANCE_ID` 让同代码不同授权的数据各占一层目录。
 - **权限边界**：fine-grained PAT 是仓库级、不是目录级，每台服务端都能读到私有库里别的项目的
-  文件；要按项目隔离只能一项目一私有仓库，或以后换真数据库做行级权限。密钥不进私有库
-  （云端 `config.txt` 保持空模板，`structure` 模式保留服务端本地真实值）。
+  文件；要按项目隔离只能一项目一私有仓库，或以后换真数据库做行级权限。私有库 `config.txt`
+  存的是真实密钥值（这正是它必须永久 Private 的原因）；结构权威（空模板 + 迁移规则）在公共仓库，
+  服务端按模板对账时绝不会用空模板冲掉私有库里的真实值。
 - **其他平台**：代码零第三方依赖，但 `git` 是外部命令（Termux 需 `pkg install git`）；
   没有 git 时启动自检会明确报出来，服务照常跑、只是不会自动同步。
 
