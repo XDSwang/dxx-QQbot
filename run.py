@@ -425,6 +425,37 @@ def _as_list(bots):
     return [bots]
 
 
+def _cfg_hash(text):
+    """配置内容哈希：CRLF / LF 差异不算内容变化。"""
+    return hashlib.md5(text.replace("\r\n", "\n").encode("utf-8")).hexdigest()
+
+
+def sync_update_cfg(base, prev_hash, bots):
+    """私有库根目录的 update.cfg 变了就同步到本机并重启重新装配。
+
+    参数进、返回值出：返回新的哈希给下一轮比对；读不到 / 首次观测都不会误重启。
+    读的是本轮已拷贝的 commit 版本，不额外发 GIT 网络请求。
+    """
+    try:
+        raw = updater.read_root_file(base, updater.UPDATE_CFG_NAME)
+    except Exception as e:
+        updater.elog("读取私有库 update.cfg 失败", str(e))
+        return prev_hash
+    if raw is None:
+        return prev_hash
+    h = _cfg_hash(raw)
+    if prev_hash is None:
+        # 首次观测只记哈希、不触发重启：跟 config.txt 热更新一致，避免启动时
+        # 因为本机 / 远端的历史差异或读不到的文件就空重启一次。
+        return h
+    if h == prev_hash:
+        return h
+    updater.flog("检测到私有库 update.cfg 变更，同步到本机并重启重新装配")
+    updater._atomic_write(CFG_FILE, raw)
+    restart_self(bots)
+    return h
+
+
 def restart_self(bots):
     """git pull 改到 run.py / updater.py 时重启本进程，让新逻辑真正生效。
 
@@ -734,6 +765,7 @@ def main():
     crashes = {s.name: 0 for s in services}
     crash_since = {s.name: time.time() for s in services}
     applied_cfg_hash = {}        # 各服务私有库 config 的上次哈希；变了就热更新
+    applied_update_cfg_hash = None   # 私有库根 update.cfg 的哈希；变了就重载装配
     tick = 0
     code_updated = False
     try:
@@ -765,6 +797,12 @@ def main():
             except Exception as e:
                 updater.elog("检查全局信号失败，本轮跳过", str(e))
                 gbase, gsig = None, None
+            # 私有库根目录的 update.cfg 也是数据：改了要同步到本机并重新装配，
+            # 跟 services/wm-bot/config.txt 的热更新一个待遇。复用本轮拷贝结果，
+            # 只降频检查，不额外发 GIT 网络请求。
+            if gbase is not None and (tick == 1 or tick % CODE_CHECK_EVERY == 0):
+                applied_update_cfg_hash = sync_update_cfg(
+                    gbase, applied_update_cfg_hash, bots)
             gst = updater.load_state("__global__")
             global_hit = (gsig is not None and gsig.need_update
                           and gsig.fingerprint != gst.get("last_signal")

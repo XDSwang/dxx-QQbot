@@ -1617,5 +1617,149 @@ class TestUnattended(_Base):
         self.assertEqual(slp.call_count, 1, "第二次同域名访问被补齐间隔")
 
 
+
+
+class TestPrivateUpdateCfg(_Base):
+    """update.cfg 属于私有库数据：真实值进私有库、启动器只拷、改了自动生效。"""
+
+    def _bootstrap(self, root=None):
+        import importlib.util
+        bs_path = (Path(__file__).resolve().parent.parent
+                   / "dxx_private_data" / "bootstrap.py")
+        spec = importlib.util.spec_from_file_location("bs_cfg_test", str(bs_path))
+        bs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bs)
+        if root is not None:
+            bs.DATA_CFG_FILE = root / "update.cfg"
+            bs.CONFIG_FILE = root / "bootstrap.cfg"
+        return bs
+
+    def test_private_repo_has_real_update_cfg_tracked(self):
+        """私有库根目录的 update.cfg 是真实数据，四个地址一处权威、无密钥。"""
+        import re
+        root = Path(__file__).resolve().parent.parent / "dxx_private_data"
+        f = root / "update.cfg"
+        self.assertTrue(f.exists(), "私有库根目录必须有真实 update.cfg")
+        text = f.read_text(encoding="utf-8")
+        for key in ("UPDATER_CODE_REPO", "UPDATER_CODE_REPO_BACKUP",
+                    "UPDATER_DATA_REPO", "UPDATER_DATA_REPO_BACKUP"):
+            self.assertIn(key + " = ", text)
+        self.assertIn("UPDATER_BACKEND = git", text)
+        self.assertFalse(re.search(r"TOKEN|SECRET|github_pat_|ghp_", text, re.I),
+                         "配置里不能有任何凭证")
+        ignored = (root / ".gitignore").read_text(encoding="utf-8")
+        self.assertFalse(
+            any(line.strip() == "update.cfg" for line in ignored.splitlines()),
+            "真实配置必须允许进私有库 git，不能被忽略")
+
+    def test_bootstrap_cfg_only_has_local_items(self):
+        """bootstrap.cfg 不再重复仓库地址，只留本机部署项。"""
+        root = Path(__file__).resolve().parent.parent / "dxx_private_data"
+        text = (root / "bootstrap.cfg.example").read_text(encoding="utf-8")
+        for key in ("PUBLIC_REPO", "DATA_REPO", "GITEE_REPO"):
+            self.assertNotIn(key + " =", text, "地址只能有一处权威")
+        self.assertIn("DEPLOY_DIR", text)
+
+    def test_load_cfg_reads_addresses_from_update_cfg_without_bootstrap_cfg(self):
+        """地址只认 update.cfg；bootstrap.cfg 整个不存在也能启动（手机零手填）。"""
+        bs = self._bootstrap(self.root)
+        (self.root / "update.cfg").write_text(
+            "UPDATER_CODE_REPO = https://example.com/o/pub.git\n"
+            "UPDATER_CODE_REPO_BACKUP = git@example.com:o/pub.git\n"
+            "UPDATER_CODE_BRANCH = dev\n"
+            "UPDATER_DATA_REPO = https://example.com/o/priv.git\n"
+            "UPDATER_DATA_REPO_BACKUP = git@example.com:o/priv.git\n"
+            "UPDATER_GIT_PATH = services\n", encoding="utf-8")
+        with mock.patch.object(bs, "log"):
+            cfg = bs.load_cfg()
+        self.assertIsInstance(cfg, dict)
+        self.assertEqual(cfg["PUBLIC_REPO"], "https://example.com/o/pub.git")
+        self.assertEqual(cfg["PUBLIC_BRANCH"], "dev")
+        self.assertEqual(cfg["DATA_REPO"], "https://example.com/o/priv.git")
+        self.assertEqual(cfg["DEPLOY_DIR"], "", "本机项缺省为空")
+
+    def test_load_cfg_ignores_addresses_written_in_bootstrap_cfg(self):
+        """就算 bootstrap.cfg 里还残留旧地址，也不得覆盖唯一权威。"""
+        bs = self._bootstrap(self.root)
+        (self.root / "update.cfg").write_text(
+            "UPDATER_CODE_REPO = https://example.com/o/pub.git\n",
+            encoding="utf-8")
+        (self.root / "bootstrap.cfg").write_text(
+            "PUBLIC_REPO = https://evil.example.com/wrong.git\n"
+            "DEPLOY_DIR = ../my-public\n", encoding="utf-8")
+        with mock.patch.object(bs, "log"):
+            cfg = bs.load_cfg()
+        self.assertEqual(cfg["PUBLIC_REPO"], "https://example.com/o/pub.git")
+        self.assertEqual(cfg["DEPLOY_DIR"], "../my-public")
+
+    def test_load_cfg_missing_update_cfg_fails_loudly(self):
+        bs = self._bootstrap(self.root)
+        with mock.patch.object(bs, "log"):
+            rc = bs.load_cfg()
+        self.assertEqual(rc, 1, "缺真实配置必须拦下，不能继续 execv")
+
+    def test_copy_update_cfg_is_byte_identical_not_generated(self):
+        """启动器只原样拷贝，不再拼字符串生成。"""
+        bs = self._bootstrap(self.root)
+        src = self.root / "update.cfg"
+        src.write_bytes(b"UPDATER_BACKEND = git\r\nKEEP = \xe4\xb8\xad\xe6\x96\x87\r\n")
+        dest = self.root / "public"
+        dest.mkdir()
+        with mock.patch.object(bs, "log"):
+            rc = bs.copy_update_cfg(dest)
+        self.assertIs(rc, True)
+        self.assertEqual((dest / "update.cfg").read_bytes(), src.read_bytes(),
+                         "必须逐字节一致，不能改写 / 补字段")
+        self.assertFalse(hasattr(bs, "write_update_cfg"),
+                         "生成函数应已删除")
+
+    def test_read_root_file_uses_copied_sha_without_extra_fetch(self):
+        """读根目录配置复用本轮拷贝结果，只发 git show，不额外 fetch。"""
+        calls = []
+
+        def fake(args, cwd=None, timeout=60, env=None, strip=True):
+            calls.append(list(args))
+            return (0, "UPDATER_BACKEND = git\n", "")
+
+        self._git_cmd_patch.stop()
+        try:
+            with mock.patch.object(updater, "git_cmd", side_effect=fake):
+                raw = updater.read_root_file(
+                    {"sha": "AAA111"}, updater.UPDATE_CFG_NAME)
+        finally:
+            self._git_cmd_patch.start()
+        self.assertEqual(raw, "UPDATER_BACKEND = git\n")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "show")
+        self.assertIn("AAA111:update.cfg", calls[0])
+        self.assertNotIn("fetch", [c[0] for c in calls])
+
+    def test_sync_update_cfg_reloads_only_on_real_change(self):
+        """改了私有库 update.cfg 才重启；首次观测 / 无变化 / 读不到都不误重启。"""
+        cfg_file = self.root / "update.cfg"
+        cfg_file.write_text("UPDATER_BACKEND = git\n", encoding="utf-8")
+        base = {"sha": "AAA111"}
+        with mock.patch.object(updater, "read_root_file",
+                               return_value="UPDATER_BACKEND = git\r\n"), \
+             mock.patch.object(run, "restart_self") as rs:
+            h = run.sync_update_cfg(base, None, {})
+            self.assertEqual(rs.call_count, 0, "首次观测不能空重启")
+            self.assertEqual(run.sync_update_cfg(base, h, {}), h,
+                             "内容没变不能重复重启")
+        with mock.patch.object(updater, "read_root_file",
+                               return_value="UPDATER_BACKEND = local\n"), \
+             mock.patch.object(run, "restart_self") as rs:
+            h2 = run.sync_update_cfg(base, h, {})
+            self.assertEqual(rs.call_count, 1, "真变更必须重启重新装配")
+            self.assertNotEqual(h2, h)
+        self.assertEqual(cfg_file.read_text(encoding="utf-8"),
+                         "UPDATER_BACKEND = local\n",
+                         "新版配置必须落到本机")
+        with mock.patch.object(updater, "read_root_file", return_value=None), \
+             mock.patch.object(run, "restart_self") as rs:
+            self.assertEqual(run.sync_update_cfg(base, h2, {}), h2)
+            self.assertEqual(rs.call_count, 0, "读不到就保持现状")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

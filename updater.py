@@ -55,6 +55,7 @@ POLL_SECONDS = 10
 HOST_GAP_SECONDS = 3.5                           # 写死：落在规范的 3~5 秒区间内
 PACE_EXEMPT_HOSTS = ("localhost", "127.0.0.1", "::1")   # 规范 1.8：只有自己的地址豁免
 GIT_NET_COMMANDS = ("fetch", "push", "clone", "ls-remote", "pull")
+UPDATE_CFG_NAME = "update.cfg"          # 私有库根目录里的真实配置（共享命名，统一入口）
 GITHUB_API = "https://api.github.com"
 GITEE_API = "https://gitee.com/api/v5"
 DATA_ANOMALY = "数据拉取异常"           # 主库与备用库全失败的统一报告用语
@@ -797,6 +798,20 @@ class GitSignalStore(object):
 
     def refresh(self):
         return self.sync()
+
+
+def read_root_file(base, name, state_key="__global__"):
+    """从本轮已拷贝的结果里读私有库【根目录】文件，不再发任何网络请求。
+
+    update.cfg 这类全局配置放在私有库根目录、不在 services/ 下，所以不走
+    Store 的 path 拼接，直接用本轮选定的 commit 版本在镜像里取文件。
+    """
+    if not base or not base.get("sha"):
+        return None
+    mirror = STATE_DIR / "gitsync" / state_key
+    code, out, _ = git_cmd(
+        ["show", "%s:%s" % (base["sha"], name)], cwd=mirror, strip=False)
+    return out if code == 0 else None
 
 
 def make_signal_store(cfg, service=None, chain=None):

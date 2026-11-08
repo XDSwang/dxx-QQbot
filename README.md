@@ -6,10 +6,11 @@
 > 跑完就 `execv` 成 `run.py`，之后不再常驻。
 >
 > 路径一律按**项目根目录相对书写**，本文不写任何盘符，需要绝对路径时自己拼：
-> 私有库根 → `bootstrap.py`、`bootstrap.cfg`、`services/wm-bot/config.txt`；
+> 私有库根 → `bootstrap.py`、`update.cfg`（真实配置，进私有库 git）、
+>   `bootstrap.cfg`（本机部署项，可选）、`services/wm-bot/config.txt`；
 > 公共库根（启动器默认克隆到私有库目录下的 `dxx-QQbot/`）→ `run.py`、`update.cfg`、
 > `services.json`、`wm-bot/python/data/config.txt`。
-> **所有仓库地址都是 `bootstrap.cfg` / `update.cfg` 里的参数**，代码与模板里不写死账号或仓库名。
+> **四个仓库地址只有一处权威：私有库根目录的 `update.cfg`（接口文件，一切接口地址都在这里对接）**，代码与模板里不写死账号或仓库名。
 > 术语：GIT 语境里说的「源」指**仓库地址**，不是第三方数据接口；
 > 后者是以后扩展、当前不生效。**判断和读写都走 GIT 指令，不需要任何密钥 / API / 第三方接口**。
 
@@ -19,7 +20,8 @@
 
 - Python 3 与 git 可用；本机对两个私有库地址能免密 `git fetch` / `git push`
   （已保存 HTTPS 凭证，或已配好 SSH key，两种都行）。
-- 本仓库根目录有 `update.cfg`（由启动器生成，不进 git），里面只有数据后端与仓库地址。
+- 本仓库根目录有 `update.cfg`（启动器从私有库**原样拷来**的一份，不进公共库 git），
+  里面只有数据后端与仓库地址；权威那份在私有库根目录，随私有库 git 同步。
 - `wm-bot/python/data/config.txt` 里有真实值（首次部署由私有库带过来，之后由服务端对账维护）。
 
 ### 启动
@@ -96,12 +98,14 @@ python run.py
    就重新拉最新、以本地迁移结果为基准重合并，最多 3 轮（单轮超 5 秒也重来），
    再切备用源同样 3 轮；全失败报「数据拉取异常」，本地最新监控记录不会丢。
    备用源就是另一个私有库地址，不需要任何额外配置。
-3. **`update.cfg` 是数据后端装配入口，别删**：当前装的是纯 GIT 读写。
+3. **`update.cfg` 是私有库里的接口文件：一切接口地址都在这里对接，别删**：
+   真实值放私有库根目录并进私有库 git，公共库只留 `update.cfg.example` 模板；接口地址只在此一处。
+   启动器只拷不生成。改了私有库那份，手机下一轮自动同步并重启重新装配。当前装的是纯 GIT 读写。
    数据库 / 第三方数据接口是**以后扩展的方向，现在不用填任何配置**
    （当前填了只会明确报「未实现」）。
    判断层与读写层是分开的两套：将来真接接口只换数据后端 Store
    （在 `updater.make_store` 注册适配器），GIT 双源拷贝的逻辑一行都不用动。
-   `update.cfg`、`data/`、`bootstrap.cfg` 都不进 git。
+   公共库根的 `update.cfg`（本地拷贝）、`data/`、`bootstrap.cfg` 都不进公共库 git。
 4. **同域名访问间隔一体适用**：GIT 的 fetch / push / clone / pull 都是地址访问，
    统一过闸门、按域名归一、状态落盘跨进程共享；判断层、代码同步、数据读写、
    启动器首跑都不会绕过。
@@ -116,7 +120,8 @@ python run.py
   两端是同一个库的两份镜像，不要求同一种方式，谁通就用谁。
 - **不需要任何密钥 / API / 第三方接口**：读文件、上传回写全用 git 指令，
   凭据由本机 git 自己保管，程序不读也不存。
-- 把 `bootstrap.cfg` 里标【必填】的仓库地址占位换成自己的；换账号 / 换库只改这几行。
+- **不用填任何仓库地址**：私有库根目录的 `update.cfg` 就是真实配置，clone 下来自带。
+  `bootstrap.cfg` 只管本机把公共库放哪，可有可无。
 
 ### 步骤
 
@@ -125,16 +130,7 @@ python run.py
 git clone <你的私有库地址> bot
 cd bot
 
-# 2. 生成启动器配置（bootstrap.cfg 已被 .gitignore 忽略，不会进仓库）
-cp bootstrap.cfg.example bootstrap.cfg
-#    编辑 bootstrap.cfg，只改仓库地址：
-#      PUBLIC_REPO / PUBLIC_REPO_BACKUP  = 两个公共库地址
-#      DATA_REPO / DATA_REPO_BACKUP      = 两个私有库地址
-#      DEPLOY_DIR = 留空则把公共库克隆到 bot/dxx-QQbot/；
-#                   本机已有公共库副本时填它的路径，避免两套 data 目录
-#      其余项用默认即可，没有任何凭证要填
-
-# 3. 一键启动
+# 2. 一键启动（真实配置 update.cfg 已经随私有库带过来，零手填）
 python bootstrap.py
 ```
 
@@ -142,7 +138,7 @@ python bootstrap.py
 
 1. 克隆 / 更新公共库：主库失败自动改从备用公共库拷，两个都失败才报错；
    目标已有公共库（含 `.git`）时对两个源依次 `pull --ff-only`。
-2. 写出公共库根目录 `update.cfg`（纯 GIT 数据后端，指向私有库）。
+2. 把私有库根目录的 `update.cfg` **原样拷**到公共库根目录（不生成、不改写）。
 3. 本地没有 `wm-bot/python/data/config.txt` 时，从私有库
    `services/wm-bot/config.txt` 拷一份过来（含真实密钥，不用手工填）。
 4. `execv` 成 `python run.py`，进入上面的「运行流程」。
@@ -153,13 +149,14 @@ python bootstrap.py
 - 群白名单 `wm-bot/python/data/groups.txt` 是本地文件、不进 git，也不在私有库里：
   换设备要自己拷过去或新建（每行一个 `group_openid`），不建＝默认不监控任何群。
 - 之后重新登录 / 换天开机，只需在公共库目录运行 `python run.py`；
-  也可以再跑一次 `python bootstrap.py`（重新 pull + 生成 `update.cfg`），效果相同。
+  也可以再跑一次 `python bootstrap.py`（重新 pull + 重拷 `update.cfg`），效果相同。
   手机长期挂机见上面「无人值守」一节里的一次性开机自启做法。
 
 ### 安全
 
 - 私有库**永久 Private**：别改 Public、别加陌生合作者，git 历史里存过的密钥不可逆。
-- 仓库地址与真实配置不进公共库；`bootstrap.cfg` / `update.cfg` 绝不提交。
+- 仓库地址与真实配置**只进私有库**、不进公共库；公共库根的 `update.cfg` 是本地拷贝，
+  和 `bootstrap.cfg` 一样绝不提交到公共库。
 - 本机 git 凭证由系统保管，程序不读取、不落盘、不写进任何配置。
 - 换设备时凭证与群 openid 跟着机器人 AppID 走、不用改值；
   但同一 AppID 只能有一条长连接，换手机跑之前先关掉电脑上那个 `run.py`。

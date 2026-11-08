@@ -4,7 +4,8 @@
 # pace.json、slug.json、bot_flow.log、后台刷新锁全部不会被提交。
 data/
 
-# 自动更新服务的私有地址凭证（PAT / 仓库名），只放服务端本地
+# 公共库根目录的 update.cfg 是【从私有库拷来的本地副本】，含仓库地址，不进公开库 git。
+# 真实值在私有库根目录的 update.cfg（进私有库 git）；公共库只留 update.cfg.example 模板。
 update.cfg
 remote/
 
