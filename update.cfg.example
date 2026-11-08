@@ -29,7 +29,8 @@ UPDATER_GITHUB_BRANCH = main
 # UPDATER_DATA_URL = postgres://... 或 https://your-api/...
 # UPDATER_DATA_TOKEN =
 
-# local 后端才生效：目录里按服务名建子目录，各放 run0 / config.txt / schema.json / runtime.json
+# local 后端才生效：目录里按服务名建子目录，各放 config.txt / schema.json /
+# runtime.json / owner.json。信号不在这里，在公共仓库的 signals/。
 UPDATER_LOCAL_DIR = remote
 
 # ---------------- ② 公共仓库本体（代码同步） ----------------
@@ -40,32 +41,51 @@ UPDATER_CODE_BRANCH = main
 # 启动时先自动同步一次（把「拷贝来的旧版」拉到最新，必要时自动重启 RUN）
 UPDATER_SYNC_ON_START = 1
 
-# ---------------- ③ 本机跑哪些服务 ----------------
+# ---------------- ③ 本机跑哪些服务 / 本实例是谁 ----------------
 # 留空 = services.json 里全部；填名字（逗号分隔）= 这台服务端只跑这几个。
 # 同一个公共仓库能放任意服务端跑，各自用自己这份 update.cfg。
 SERVICES_ENABLED =
 
+# 同一套代码、不同授权，分别部署到两台服务端时，两个都填上【不同】的值：
+# 数据落在 <PATH>/<NAMESPACE>/<服务名>/，不会共用同一份 runtime.json。
+# 单服务端 / 单授权保持留空即可（路径与旧版一致）。
+UPDATER_DATA_NAMESPACE =
+# 认领标记 owner.json 里写谁；检测到目录已被别的实例认领会跳过回写并报异常日志。
+UPDATER_INSTANCE_ID = default
+
 # ---------------- ④ 更新行为 ----------------
+# code = 信号放公共仓库本体 signals/（默认）：10 秒轮询零网络、零 PAT。
+# data = 兼容旧布局：信号仍放私有库（每轮都要打 API，服务多时不推荐）。
+UPDATER_SIGNAL_SOURCE = code
 UPDATER_POLL_SECONDS = 10
 UPDATER_GIT_PULL = 1
 # structure = 按云端结构增删字段但保留服务端本地的值（默认，安全）
 # overwrite = 整份照抄云端（只有云端放的是含密钥的完整副本时才用）
 UPDATER_CONFIG_MERGE = structure
 # 迁移完成后把「最新完整 + 旧数据迁移」结果回写数据后端。
-# 多台服务端同时跑同一个服务时建议设 0，避免互相覆盖同一份 runtime.json。
+# 同一个授权只有一个网关连接（第二个会把第一个顶掉），正常部署不存在两台机器
+# 同时写同一份数据。只有「主备双机故意用同一授权」或「测试机误指生产目录」时
+# 才需要设 0；后者现在还有 owner.json 认领兜底，会跳过回写并留下异常日志。
 UPDATER_PUSH_RUNTIME = 1
 
 # ============================================================
-# 数据后端（私有仓库）里的目录布局
+# 两处文件，职责分开：信号属于公共库发布，数据才属于私有库
 # ------------------------------------------------------------
+# 【公共仓库本体 · 进 git · 不需要任何授权】
+# signals/
+#   run0 / run1                 全局信号：改 run1 = 所有服务端的所有服务一起更新
+#   wm-bot/run0 / run1          本服务信号：只更新这一个服务，不惊动别人
+#   <以后的服务名>/             同样一份，服务名取 services.json 的 remote_path
+# 改完跟代码一起 push；服务端 git pull 后 10 秒内看到，轮询不打私有库。
+#
+# 【私有仓库 · 只在真正更新时才访问 · 需要 PAT】
 # services/                      ← UPDATER_GITHUB_PATH
-#   run0 / run1                 全局信号：改 run1 = 所有服务一起更新
-#   wm-bot/                     ← 服务名（services.json 里的 remote_path）
-#     run0 / run1               本服务信号：只更新这一个服务，不惊动别人
+#   wm-bot/                     ← 服务名（配了 NAMESPACE 则多一层）
 #     config.txt                配置模板（密钥留空，服务端本地真实值会保留）
 #     schema.json               最新字段结构 + 改名/删除规则（用户维护，服务端只读）
 #     runtime.json              服务端回写的迁移结果（机器维护，用户只读）
-#   <以后的服务名>/             同样的四个文件，互不干扰
+#     owner.json                首次更新时自动写入的认领标记（机器维护）
+#   <以后的服务名>/             同样四个文件，互不干扰
 #
 # schema.json 示例：
 #   {"version": 3, "rename": {"users": "members"},
@@ -79,15 +99,35 @@ UPDATER_PUSH_RUNTIME = 1
 # 启动流程与几个前提
 # ------------------------------------------------------------
 # · 读 update.cfg → 装配数据后端 → 启动先同步代码 → 需要时自动重启 RUN
-#   → 按 services.json 逐个拉起服务 → 每 10 秒查各服务信号。
+#   → 按 services.json 逐个拉起服务 → 每 10 秒读公共仓库 signals/（本地读，
+#   不打私有库）；只有真检测到 run1 才会访问私有库拉配置、迁数据、回写。
 # · git pull 是整仓库一次，但只停 / 迁 / 启【被触发的那个服务】；
 #   指纹、备份、进程按服务隔离，单实例锁全局一份。
 # · 一轮更新失败：整次回滚、照常用旧数据启动，该信号指纹记入 failed_signal，
 #   不会每 10 秒自动重试；修好后改一下 runN 内容或换 run2/run3 再触发。
 # · 启动自检会在控制台直接列出：数据后端还是模板占位值、缺 services.json、
-#   不在 git 仓库且没配 UPDATER_CODE_REPO、某服务私有目录缺 runN / config / schema。
+#   不在 git 仓库且没配 UPDATER_CODE_REPO、没有 git 命令、
+#   公共仓库 signals/ 缺 runN、某服务私有目录缺 config / schema。
 # · 首次部署绕不过去：PAT 不能经 git 下发，服务端要手工放一次 update.cfg，
 #   以及各服务自己的真实配置（wm-bot 是 wm-bot/python/data/config.txt）。
 # · 一个 fine-grained PAT 是【仓库级】权限，不是目录级：多台服务端各跑不同服务时，
 #   每台都能读到别的项目的文件。要隔离就得给每个项目单独建私有仓库。
+# ============================================================
+# 多台服务端 / 多个授权 / 其他平台
+# ------------------------------------------------------------
+# · 一个 AppID 只能维持一条网关连接（官方文档 gateway 的 max_concurrency=1，
+#   本项目 identify 写死 shard [0,1]）：同授权开第二个会把第一个顶掉，
+#   所以「两台机器同时写同一份 runtime.json」正常部署下不会发生。
+#   真遇到（主备双机 / 测试机误指生产目录）：owner.json 认领会跳过回写并报异常；
+#   也可以直接把 UPDATER_PUSH_RUNTIME 设 0。
+# · 同一台服务端跑两个【不同授权】的同类机器人：机器人代码里 data/ 路径是写死的
+#   （config.py / wm.py / ws_monitor.py 等都基于 __file__），两个进程会读同一份
+#   data/config.txt、写同一批 ws_*.json。必须各给一份代码目录副本（含自己的 data/），
+#   services.json 里两项的 data_dir 不能相同 —— 启动自检会直接把这种配置报出来。
+# · 多台服务端：单实例锁是本机文件，跨机不互锁（本来就该各自独立）。
+#   每台各放一份 update.cfg / PAT，用 SERVICES_ENABLED 决定这台跑哪几个服务；
+#   全局 run1 会让所有机器一起更新，这是「统一发布」的预期行为。
+# · 其他平台（Termux / QPython / Linux）：代码零第三方依赖，但 git 是外部命令，
+#   Termux 要先 pkg install git；没有 git 时启动自检会明确提示，服务照常跑、
+#   只是不会自动同步。os.execv 自重启、Path 路径、CRLF 都在这些平台上可用。
 # ============================================================

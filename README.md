@@ -13,14 +13,35 @@
 一次 `git pull` 是整仓库的，但只停 / 迁 / 启【被触发的那个服务】；指纹、备份、进程按服务隔离。
 
 - `services.json`（进 git）：服务清单，以后加服务只加一项，不改 `run.py`。
-- 数据后端布局：`services/<服务名>/{runN, config.txt, schema.json, runtime.json}`；
-  根目录再放一个 `runN` 可作全局信号（所有服务一起更新）。
+- **信号与数据分开**：`runN` 只说明公共库该不该更新，放在公共仓库本体
+  `signals/{runN, <服务名>/runN}`（进 git，随代码 push，**不需要 PAT**）；
+  私有库只放数据 `services/<服务名>/{config.txt, schema.json, runtime.json, owner.json}`。
+  10 秒轮询只读本地信号，真有更新时才访问私有库，服务变多也不会拖慢轮询。
 - 配置模板见 `update.cfg.example`；`update.cfg`、`data/`、`remote/` 都不进 git。
 - 首次部署仍要手工放一次 `update.cfg` 和各服务自己的真实配置
   （wm-bot 是 `wm-bot/python/data/config.txt`）：PAT 不能经 git 下发。
 
 ⚠️ **代码必须先 push 到公共仓库**：本地提交没推上去，服务端 `git pull` 拉不到新代码；
 即使把新版本整个拷过去，自举后本地领先远端，`--ff-only` 会拒绝非快进（不会回退，但也更新不了）。
+
+### 多台服务端 / 多个授权 / 其他平台
+
+- **同授权不会并发**：官方网关 `max_concurrency=1`，本项目 `identify` 写死 `shard [0,1]`，
+  一个 AppID 只能有一条网关连接，第二个会把第一个顶掉；OneBot 同一个 QQ 号同协议端同理。
+  单机再有一份 `updater.lock` 挡住第二个 RUN。所以「两台机器同时写同一份 `runtime.json`」
+  正常部署不会发生；误配时有 `owner.json` 认领兜底（跳过回写 + 异常日志），
+  也可用 `UPDATER_PUSH_RUNTIME = 0`。
+- **不同授权同机跑两个**：机器人代码的 `data/` 路径是按 `__file__` 写死的，两个进程共用会
+  读同一份 `data/config.txt`、写同一批 `ws_*.json`。要么各放一份代码目录副本（各自 `data/`），
+  要么先给机器人补数据目录注入；`services.json` 里两项 `data_dir` 相同会被启动自检拦下。
+- **多台服务端**：单实例锁只在单机有效（本来就该各自独立）。每台一份 `update.cfg` / PAT，
+  用 `SERVICES_ENABLED` 决定本台跑哪些服务；全局 `run1` 所有机器一起更新，属于预期的统一发布。
+  配 `UPDATER_DATA_NAMESPACE` + `UPDATER_INSTANCE_ID` 让同代码不同授权的数据各占一层目录。
+- **权限边界**：fine-grained PAT 是仓库级、不是目录级，每台服务端都能读到私有库里别的项目的
+  文件；要按项目隔离只能一项目一私有仓库，或以后换真数据库做行级权限。密钥不进私有库
+  （云端 `config.txt` 保持空模板，`structure` 模式保留服务端本地真实值）。
+- **其他平台**：代码零第三方依赖，但 `git` 是外部命令（Termux 需 `pkg install git`）；
+  没有 git 时启动自检会明确报出来，服务照常跑、只是不会自动同步。
 
 > ⚠️ 本项目**只维护 Python 端**（零依赖，仅标准库）。Node 端已删除。
 > 整个文件夹可拷到电脑 / 手机（Termux / QPython）**任意位置**：路径全部基于 Python 文件自身目录

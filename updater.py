@@ -27,6 +27,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent          # 仓库根：公共仓库本体所在目录
 STATE_DIR = HERE / "data"                       # 更新器自身状态（根 .gitignore 已忽略 data/）
+# runN 只说明「公共库该不该更新」，属于代码发布，随 git pull 到每台服务端：
+# 放公共仓库本体里，10 秒轮询零网络、零 PAT，私有库挂了也不影响判断要不要更新。
+SIGNAL_DIR = HERE / "signals"
 
 ERROR_LOG = STATE_DIR / "updater_error.log"     # 异常日志：覆盖式，只记异常
 FLOW_LOG = STATE_DIR / "updater_flow.log"       # 流程日志：追加式，正常操作也记
@@ -38,6 +41,7 @@ LOCK_FILE = STATE_DIR / "updater.lock"
 CONFIG_NAME = "config.txt"
 SCHEMA_NAME = "schema.json"
 RUNTIME_NAME = "runtime.json"
+OWNER_NAME = "owner.json"                       # 数据目录归属：防两个不同授权互写同一份数据
 SIGNAL_RE = re.compile(r"^run(\d+)$")
 POLL_SECONDS = 10
 HOST_GAP_SECONDS = 3.5                           # 写死：落在规范的 3~5 秒区间内
@@ -187,6 +191,10 @@ class LocalStore(object):
         self.root.mkdir(parents=True, exist_ok=True)
         _atomic_write(self.root / name, text)
 
+    def refresh(self):
+        """本地文件每次都现读，无需失效缓存（统一 Store 接口）。"""
+        return None
+
 
 class GitHubStore(object):
     """GitHub 私有仓库（推荐）：Contents API 一次列目录就能拿到全部小文件内容。
@@ -239,8 +247,16 @@ class GitHubStore(object):
         return [(n, "%s:%s" % (n, listing[n].get("sha", "")))
                 for n in sorted(listing) if SIGNAL_RE.match(n)]
 
+    def refresh(self):
+        """列目录结果有缓存；一轮更新开始前必须失效，否则读的是上一次的旧配置。
+
+        以前靠每 10 秒 signal() 顺带刷新，信号移到公共仓库后这条路径消失了，
+        所以由 fetch_bundle 显式调用，接口对 LocalStore 同样成立。
+        """
+        self._listing = None
+
     def signal(self):
-        self._listing = None          # 每轮重新列目录，否则永远看不到新的 runN
+        self.refresh()                # 每轮重新列目录，否则永远看不到新的 runN
         return pick_signal(self.signals())
 
     def read(self, name):
@@ -278,16 +294,18 @@ class GitHubStore(object):
 def make_store(cfg, service=None):
     """按配置造【数据后端】；service 给定时自动切到该服务在私有仓库里的子目录。
 
-    这层是可替换的：现在用 GitHub 私有仓库文件代替数据库，以后换成数据库地址 /
-    第三方数据接口，只要按 Store 接口（signals / signal / read / write）加一个
-    适配器并在这里注册，服务与迁移逻辑都不用动。
+    UPDATER_DATA_NAMESPACE 再插一层：同一套代码、不同授权的两台服务端各配一个，
+    数据就不会落到同一份 runtime.json 上。这层是可替换的：现在用 GitHub 私有仓库
+    文件代替数据库，以后换成数据库地址 / 第三方数据接口，只要按 Store 接口
+    （signals / signal / read / write）加适配器并在这里注册，服务与迁移逻辑都不用动。
     """
     kind = (cfg.get("UPDATER_BACKEND") or "local").strip().lower()
-    sub = (service or "").strip().strip("/")
+    parts = [p for p in ((cfg.get("UPDATER_DATA_NAMESPACE") or "").strip().strip("/"),
+                         (service or "").strip().strip("/")) if p]
     if kind == "github":
         path = (cfg.get("UPDATER_GITHUB_PATH") or "").strip().strip("/")
-        if sub:
-            path = (path + "/" + sub) if path else sub
+        for part in parts:
+            path = (path + "/" + part) if path else part
         return GitHubStore(cfg.get("UPDATER_GITHUB_REPO"),
                            cfg.get("UPDATER_GITHUB_TOKEN"),
                            path,
@@ -295,7 +313,9 @@ def make_store(cfg, service=None):
                            cfg.get("UPDATER_GITHUB_API", GITHUB_API))
     if kind == "local":
         root = Path(cfg.get("UPDATER_LOCAL_DIR") or str(HERE / "remote"))
-        return LocalStore(root / sub if sub else root)
+        for part in parts:
+            root = root / part
+        return LocalStore(root)
     if kind in ("database", "http", "api"):
         raise NotImplementedError(
             "数据后端 %s 尚未实现：请按 Store 接口加适配器，"
@@ -303,8 +323,52 @@ def make_store(cfg, service=None):
     raise ValueError("未知的 UPDATER_BACKEND: %s" % kind)
 
 
+def make_signal_store(cfg, service=None):
+    """信号与数据分离：默认读公共仓库本体 signals/，不需要 PAT、不产生 API 调用。
+
+    全局信号在 signals/runN，每服务信号在 signals/<remote_path>/runN；随代码一起
+    git pull 到每台服务端，所以所有服务端看到的是同一份发布指令。
+    UPDATER_SIGNAL_SOURCE = data 时退回旧布局（信号也放数据后端），便于平滑迁移。
+    """
+    source = (cfg.get("UPDATER_SIGNAL_SOURCE") or "code").strip().lower()
+    if source == "data":
+        return make_store(cfg, service)
+    if source != "code":
+        raise ValueError("未知的 UPDATER_SIGNAL_SOURCE: %s" % source)
+    sub = (service or "").strip().strip("/")
+    return LocalStore(SIGNAL_DIR / sub if sub else SIGNAL_DIR)
+
+
+def claim_owner(store, instance_id, service=None):
+    """认领数据目录；已被别的实例认领就拒绝回写，返回 (ok, 已有实例名)。
+
+    「服务端一样、授权不一样」时最怕两个实例误指同一份 runtime.json：数据会静默串。
+    这里不阻断本地迁移，只让调用方跳过云端回写并留下异常日志，把误配暴露出来。
+    """
+    raw = store.read(OWNER_NAME)
+    if raw:
+        try:
+            owner = (json.loads(raw).get("instance") or "").strip()
+        except Exception:
+            owner = ""
+        if owner and owner == instance_id:
+            return True, owner
+        return False, owner or "(未知)"
+    store.write(OWNER_NAME, json.dumps({
+        "instance": instance_id,
+        "service": service or "",
+        "claimed_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+        ensure_ascii=False) + "\n")
+    return True, instance_id
+
+
 def fetch_bundle(store):
-    """一次拿到私有地址上的配置 / 结构规则 / 云端运行数据。"""
+    """一次拿到私有地址上的配置 / 结构规则 / 云端运行数据。
+
+    refresh 先行：私有库【只在真有更新时】被访问，不能拿上一轮缓存的目录内容，
+    否则云端改了 schema.json 也不会生效。
+    """
+    store.refresh()
     schema = {}
     runtime = {}
     raw_schema = store.read(SCHEMA_NAME)

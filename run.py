@@ -47,6 +47,11 @@ DEFAULTS = {
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
+    # code = 信号在公共仓库本体 signals/（默认）；data = 兼容旧的「信号放私有库」布局
+    "UPDATER_SIGNAL_SOURCE": "code",
+    # 同一套代码、不同授权的多台服务端各配一个，数据目录就不会撞在一起
+    "UPDATER_DATA_NAMESPACE": "",
+    "UPDATER_INSTANCE_ID": "default",
     "UPDATER_POLL_SECONDS": "10",
     "UPDATER_GIT_PULL": "1",
     "UPDATER_CONFIG_MERGE": "structure",
@@ -221,8 +226,9 @@ def _git(args, timeout=GIT_TIMEOUT_SECONDS):
         return 1, "", str(e)
 
 
-def preflight(cfg, store, services=None, service_stores=None):
-    """启动自检：把「数据后端没配 / 没有 git / 某服务私有目录缺文件」打到控制台。
+def preflight(cfg, store, services=None, service_stores=None,
+              root_signals=None, signal_stores=None):
+    """启动自检：把「数据后端没配 / 没有 git / 信号或私有目录缺文件」打到控制台。
 
     只提示不退出：网络抖动时服务照常运行，只是暂时不会自动更新。
     返回问题列表，便于离线测试断言。
@@ -239,19 +245,39 @@ def preflight(cfg, store, services=None, service_stores=None):
     if not SERVICES_FILE.exists():
         problems.append("缺少 services.json 服务清单（属于公共仓库本体）")
     if not _off(cfg.get("UPDATER_GIT_PULL", "1")):
-        code, _, _ = _git(["rev-parse", "--show-toplevel"])
+        # 手机 Termux / QPython 默认没有 git 二进制：不检查的话会「看起来在跑、
+        # 自动更新其实一步都走不了」。git --version 失败要先于仓库检查。
+        code, _, _ = _git(["--version"])
         if code != 0:
-            if (cfg.get("UPDATER_CODE_REPO") or "").strip():
-                problems.append("当前不是 git 仓库：启动时会用 UPDATER_CODE_REPO 自动自举")
-            else:
-                problems.append("当前不是 git 仓库且没配 UPDATER_CODE_REPO，自动同步不可用")
+            problems.append("当前平台没有 git 命令（Termux 需 pkg install git），自动同步不可用")
+        else:
+            code, _, _ = _git(["rev-parse", "--show-toplevel"])
+            if code != 0:
+                if (cfg.get("UPDATER_CODE_REPO") or "").strip():
+                    problems.append("当前不是 git 仓库：启动时会用 UPDATER_CODE_REPO 自动自举")
+                else:
+                    problems.append("当前不是 git 仓库且没配 UPDATER_CODE_REPO，自动同步不可用")
+    signal_place = ("公共仓库 signals/" if
+                    (cfg.get("UPDATER_SIGNAL_SOURCE") or "code").strip().lower() == "code"
+                    else "数据后端")
     try:
-        sig = store.signal()
+        sig = (root_signals or store).signal()
         if sig.name == "(missing)":
-            path = (cfg.get("UPDATER_GITHUB_PATH") or "").strip() or "数据后端根目录"
-            problems.append("数据后端 %s 里没有全局 runN 信号文件（先放一个 run0）" % path)
+            problems.append("%s 里没有全局 runN 信号文件（先放一个 run0）"
+                            % signal_place)
     except Exception as e:
-        problems.append("数据后端读取失败：%s" % e)
+        problems.append("信号读取失败：%s" % e)
+    # 两个不同授权的服务共用同一个 data_dir = 共用 data/config.txt 和同一批运行记录，
+    # 运行时必然串数据；注册表层先拦住，别等出了事再查。
+    if services:
+        seen = {}
+        for s in services:
+            key = str(s.data_dir)
+            if key in seen and seen[key] != s.name:
+                problems.append("[%s] 与 [%s] 共用 data_dir=%s：不同授权必须各给一份数据目录"
+                                % (seen[key], s.name, key))
+            else:
+                seen[key] = s.name
     if not services:
         # 兼容没有服务清单的离线自检：单后端时也检查根目录下的配置 / 规则文件
         for name in (updater.CONFIG_NAME, updater.SCHEMA_NAME):
@@ -263,13 +289,17 @@ def preflight(cfg, store, services=None, service_stores=None):
     else:
         for s in services:
             st = (service_stores or {}).get(s.name)
+            sig_store = (signal_stores or {}).get(s.name) or st
             if st is None:
                 continue
             try:
-                sig = st.signal()
+                sig = sig_store.signal()
                 if sig.name == "(missing)":
-                    problems.append("[%s] 私有目录里没有 runN 信号文件（先放 run0）"
-                                    % s.name)
+                    problems.append("[%s] %s 里没有 runN 信号文件（先放 run0）"
+                                    % (s.name, signal_place))
+            except Exception as e:
+                problems.append("[%s] 信号读取失败：%s" % (s.name, e))
+            try:
                 for name in (updater.CONFIG_NAME, updater.SCHEMA_NAME):
                     if st.read(name) is None:
                         problems.append("[%s] 私有目录缺少 %s" % (s.name, name))
@@ -447,10 +477,18 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
         ok, detail = updater.write_runtime_files(migrated, data_dir, backup=False)
         if not ok:
             raise RuntimeError(detail)
-        # ③ 回写数据后端：拿到「最新完整 + 旧数据迁移」的结果
+        # ③ 回写数据后端：拿到「最新完整 + 旧数据迁移」的结果。
+        #    先认领：两个不同授权的实例误指同一目录时，宁可不回写也不能互相覆盖。
         if not _off(cfg.get("UPDATER_PUSH_RUNTIME", "1")):
+            instance = (cfg.get("UPDATER_INSTANCE_ID") or "default").strip()
             try:
-                updater.push_runtime(store, migrated)
+                owned, owner = updater.claim_owner(store, instance, service)
+                if not owned:
+                    updater.elog("[%s] 数据目录已由实例 %s 认领，跳过回写"
+                                 % (service or "default", owner),
+                                 "本实例=%s；给两台服务端各配 UPDATER_DATA_NAMESPACE" % instance)
+                else:
+                    updater.push_runtime(store, migrated)
             except Exception as e:
                 updater.elog("[%s] 运行数据回写失败（服务端本地已迁移完成）"
                              % (service or "default"), str(e))
@@ -499,6 +537,10 @@ def main():
         root_store = updater.make_store(cfg)
         service_stores = {s.name: updater.make_store(cfg, s.remote_path)
                           for s in services}
+        # 信号读公共仓库本体，数据读私有后端：10 秒轮询只在真有更新时才打私有库。
+        root_signals = updater.make_signal_store(cfg)
+        signal_stores = {s.name: updater.make_signal_store(cfg, s.remote_path)
+                         for s in services}
     except Exception as e:
         _console("[fatal] 启动装配失败：%s" % e)
         updater.elog("启动装配失败", str(e))
@@ -511,7 +553,8 @@ def main():
     _console("统一 RUN 启动：服务=%s 数据后端=%s 轮询=%s 秒"
              % (",".join(s.name for s in services),
                 cfg.get("UPDATER_BACKEND"), poll))
-    preflight(cfg, root_store, services, service_stores)
+    preflight(cfg, root_store, services, service_stores,
+              root_signals, signal_stores)
     before_fp = self_fingerprint()
     if not _off(cfg.get("UPDATER_SYNC_ON_START", "1")):
         ok, info = sync_code(cfg)
@@ -540,7 +583,7 @@ def main():
                 b.start()
             # 全局信号：整仓库只 pull 一次，所有服务一起迁移
             try:
-                gsig = root_store.signal()
+                gsig = root_signals.signal()
             except Exception as e:
                 updater.elog("检查全局信号失败，本轮跳过", str(e))
                 gsig = None
@@ -567,7 +610,7 @@ def main():
                 if s.name in planned:
                     continue
                 try:
-                    sig = service_stores[s.name].signal()
+                    sig = signal_stores[s.name].signal()
                 except Exception as e:
                     updater.elog("[%s] 检查信号失败，本轮跳过" % s.name, str(e))
                     continue

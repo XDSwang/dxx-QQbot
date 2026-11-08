@@ -33,8 +33,14 @@ class _Base(unittest.TestCase):
         self.state = self.root / "state"
         for p in (self.remote, self.data, self.state):
             p.mkdir()
+        # 默认信号源是公共仓库本体 signals/；离线测试里指向临时目录，
+        # 放一个 run0 表示「没有待更新」，避免每个用例都被自检刷屏。
+        self.signals = self.root / "signals"
+        (self.signals / "wm-bot").mkdir(parents=True)
+        (self.signals / "run0").write_text("0", encoding="utf-8")
+        (self.signals / "wm-bot" / "run0").write_text("0", encoding="utf-8")
         p1 = mock.patch.multiple(
-            updater, STATE_DIR=self.state,
+            updater, SIGNAL_DIR=self.signals, STATE_DIR=self.state,
             ERROR_LOG=self.state / "updater_error.log",
             FLOW_LOG=self.state / "updater_flow.log",
             PACE_FILE=self.state / "pace.json",
@@ -339,7 +345,8 @@ class TestPreflight(_Base):
             problems = run.preflight(cfg, self.store())
         text = " ".join(problems)
         self.assertIn("占位", text)
-        self.assertIn("bot-sync", text)
+        self.assertIn("公共仓库 signals/", text,
+                      "缺信号时该指向公共库发布目录，而不是私有数据后端")
         self.assertIn("runN", text)
         self.assertIn("config.txt", text)
         self.assertIn("schema.json", text)
@@ -404,6 +411,7 @@ class TestMainLoop(_Base):
         cfg.update({"UPDATER_BACKEND": "local",
                     "UPDATER_LOCAL_DIR": str(self.remote),
                     "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
+                    "UPDATER_SIGNAL_SOURCE": "data",   # 兼容旧布局：信号也在数据后端
                     "UPDATER_PUSH_RUNTIME": "0"})
         bot_a, bot_b = FakeBot(), FakeBot()
         with mock.patch.object(run, "load_cfg", return_value=cfg), \
@@ -542,6 +550,172 @@ class TestMultiService(_Base):
         gp.assert_not_called()
 
 
+class TestSignalSeparation(_Base):
+    """runN 是公共库的发布指令，不该跟着私有库 PAT 一起走。"""
+
+    def test_default_signal_source_is_public_repo(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_GITHUB_REPO": "me/private",
+                    "UPDATER_GITHUB_TOKEN": "tok"})
+        signals = updater.make_signal_store(cfg)
+        data = updater.make_store(cfg, "wm-bot")
+        self.assertIsInstance(signals, updater.LocalStore)
+        self.assertEqual(signals.root, self.signals)
+        self.assertEqual(data.root, self.remote / "wm-bot",
+                         "信号后端与数据后端必须是两个不同目录")
+        self.assertFalse(signals.signal().need_update)
+
+    def test_data_source_is_backward_compatible(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_SIGNAL_SOURCE": "data"})
+        self.assertEqual(updater.make_signal_store(cfg, "wm-bot").root,
+                         self.remote / "wm-bot")
+
+    def test_unknown_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            updater.make_signal_store({"UPDATER_SIGNAL_SOURCE": "ftp"})
+
+    def test_no_pat_needed_to_see_a_release(self):
+        """私有目录里故意什么都不放：信号照样能判出要更新。"""
+        (self.signals / "run1").write_text("1", encoding="utf-8")
+        sig = updater.make_signal_store(dict(run.DEFAULTS)).signal()
+        self.assertTrue(sig.need_update)
+        self.assertEqual(sig.name, "run1")
+
+    def test_code_signal_triggers_only_that_service(self):
+        """新布局端到端：公共库 signals/a/run1 只更新 a，b 不受影响。"""
+        (self.root / "update.cfg").write_text("UPDATER_BACKEND = local\n",
+                                              encoding="utf-8")
+        manifest = self.root / "services.json"
+        manifest.write_text(json.dumps({"services": [
+            {"name": "a", "entry": "a/run.py", "cwd": "a", "data_dir": "a/data",
+             "config_file": "config.txt", "runtime_files": ["state.json"],
+             "remote_path": "a"},
+            {"name": "b", "entry": "b/run.py", "cwd": "b", "data_dir": "b/data",
+             "config_file": "config.txt", "runtime_files": ["state.json"],
+             "remote_path": "b"}]}), encoding="utf-8")
+        for name, signal in (("a", "run1"), ("b", "run0")):
+            sd = self.signals / name
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / signal).write_text("1", encoding="utf-8")
+            rd = self.remote / name
+            rd.mkdir(parents=True, exist_ok=True)
+            for n, t in (("config.txt", "K = \n"), ("schema.json", "{}"),
+                         ("runtime.json", "{}")):
+                (rd / n).write_text(t, encoding="utf-8")
+            (self.root / name / "data").mkdir(parents=True, exist_ok=True)
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
+                    "UPDATER_PUSH_RUNTIME": "0"})
+        bot_a, bot_b = FakeBot(), FakeBot()
+        with mock.patch.object(run, "load_cfg", return_value=cfg), \
+             mock.patch.object(run, "SERVICES_FILE", manifest), \
+             mock.patch.object(run, "BotProcess", side_effect=[bot_a, bot_b]), \
+             mock.patch.object(run, "git_pull", return_value=(True, "mock")), \
+             mock.patch.object(run.time, "sleep",
+                               side_effect=[None, KeyboardInterrupt]), \
+             mock.patch("builtins.print"):
+            rc = run.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(bot_a.started, 2, "a 被更新：停后重新拉起")
+        self.assertEqual(bot_b.started, 1, "b 没被触发：只有启动那一次")
+        self.assertIn("last_signal", updater.load_state("a"))
+        self.assertEqual(updater.load_state("b"), {}, "b 的指纹不能被 a 串写")
+
+
+class TestOwner(_Base):
+    """两个不同授权误指同一数据目录时，绝不互相覆盖。"""
+
+    def _remote_with(self, name="wm-bot"):
+        remote = self.remote / name
+        remote.mkdir(parents=True, exist_ok=True)
+        for n, t in (("config.txt", "WM_QQ_APPID = \n"),
+                     ("schema.json", "{}"), ("runtime.json", "{}"), ("run1", "1")):
+            (remote / n).write_text(t, encoding="utf-8")
+        return updater.LocalStore(remote)
+
+    def _owner_instance(self):
+        return json.loads((self.remote / "wm-bot" / updater.OWNER_NAME).read_text(
+            encoding="utf-8"))["instance"]
+
+    def test_first_claim_then_same_instance_ok(self):
+        store = self._remote_with()
+        self.assertTrue(updater.claim_owner(store, "prod", "wm-bot")[0])
+        self.assertEqual(self._owner_instance(), "prod")
+        self.assertTrue(updater.claim_owner(store, "prod", "wm-bot")[0])
+
+    def test_foreign_instance_is_refused_without_overwriting(self):
+        store = self._remote_with()
+        updater.claim_owner(store, "prod", "wm-bot")
+        ok, owner = updater.claim_owner(store, "test", "wm-bot")
+        self.assertFalse(ok)
+        self.assertEqual(owner, "prod")
+        self.assertEqual(self._owner_instance(), "prod")
+
+    def test_foreign_owner_skips_push_but_local_migration_still_runs(self):
+        store = self._remote_with()
+        (self.remote / "wm-bot" / updater.OWNER_NAME).write_text(
+            json.dumps({"instance": "prod"}), encoding="utf-8")
+        original = (self.remote / "wm-bot" / "runtime.json").read_text(encoding="utf-8")
+        (self.data / "config.txt").write_text("WM_QQ_APPID = REAL\n", encoding="utf-8")
+        sig = store.signal()
+        with mock.patch.object(run, "git_pull", return_value=(True, "mock")):
+            ok = run.do_update({"UPDATER_PUSH_RUNTIME": "1",
+                                "UPDATER_INSTANCE_ID": "test"},
+                               store, FakeBot(), sig)
+        self.assertTrue(ok, "认领冲突不该让本地迁移失败")
+        self.assertEqual((self.remote / "wm-bot" / "runtime.json").read_text(
+            encoding="utf-8"), original, "别人认领的目录绝不能被本实例覆盖")
+        self.assertIn("REAL", (self.data / "config.txt").read_text(encoding="utf-8"))
+
+
+class TestNamespace(_Base):
+    def test_namespace_isolates_data_path(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_DATA_NAMESPACE": "prod"})
+        self.assertEqual(updater.make_store(cfg, "wm-bot").root,
+                         self.remote / "prod" / "wm-bot")
+        cfg.update({"UPDATER_BACKEND": "github",
+                    "UPDATER_GITHUB_REPO": "me/private",
+                    "UPDATER_GITHUB_TOKEN": "tok",
+                    "UPDATER_GITHUB_PATH": "services"})
+        self.assertIn("/contents/services/prod/wm-bot?",
+                      updater.make_store(cfg, "wm-bot")._url())
+
+
+class TestPreflightMultiInstance(_Base):
+    def test_shared_data_dir_is_reported(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_GIT_PULL": "0", "UPDATER_SIGNAL_SOURCE": "data"})
+        def svc(name):
+            return run.Service({"name": name, "entry": name, "cwd": name,
+                                "data_dir": "same", "config_file": "config.txt",
+                                "runtime_files": []}, self.root)
+        services = [svc("a"), svc("b")]
+        with mock.patch("builtins.print"):
+            problems = run.preflight(cfg, self.store(), services,
+                                     {"a": self.store(), "b": self.store()})
+        self.assertIn("共用 data_dir", " ".join(problems))
+
+    def test_missing_git_binary_is_reported(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_GIT_PULL": "1", "UPDATER_SIGNAL_SOURCE": "data"})
+        (self.remote / "run0").write_text("0", encoding="utf-8")
+        with mock.patch.object(run.subprocess, "run",
+                               return_value=mock.Mock(returncode=1)), \
+             mock.patch("builtins.print"):
+            problems = run.preflight(cfg, self.store())
+        self.assertIn("没有 git 命令", " ".join(problems))
+
+
 class TestGitHubStore(unittest.TestCase):
     """用假 _api 验证私有仓库后端：不联网、不发真实请求。"""
 
@@ -573,6 +747,27 @@ class TestGitHubStore(unittest.TestCase):
         self.assertEqual(len(puts), 1)
         self.assertEqual(base64.b64decode(puts[0][2]["content"]).decode("utf-8"),
                          '{"x": 1}')
+
+    def test_fetch_bundle_never_uses_stale_listing(self):
+        """信号不再每 10 秒碰私有库，列目录缓存必须由 fetch_bundle 主动失效。"""
+        gets = []
+
+        def fake(method, url, body=None):
+            if method == "GET" and "contents/wm-bot?" in url:
+                gets.append(url)
+                v = len(gets)
+                return [{"name": "schema.json", "sha": "S%d" % v,
+                         "content": _b64('{"version": %d}' % v)},
+                        {"name": "config.txt", "sha": "C",
+                         "content": _b64("K = \n")}]
+            return None
+
+        s = updater.GitHubStore("me/private-repo", "tok", "wm-bot")
+        s._api = fake
+        self.assertEqual(updater.fetch_bundle(s)["schema"]["version"], 1)
+        self.assertEqual(updater.fetch_bundle(s)["schema"]["version"], 2,
+                         "第二轮必须重新列目录，不能拿上一轮缓存的旧配置")
+        self.assertEqual(len(gets), 2)
 
     def test_write_retries_409_with_fresh_sha(self):
         """多台服务端同时回写：409 后重新列目录拿最新 sha，最多 3 轮。"""
