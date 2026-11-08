@@ -542,9 +542,11 @@ class TestMultiService(_Base):
                 return 1, "", "not a git repo"
             return 0, "", ""
 
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_CODE_REPO"] = "https://example.com/public.git"
         with mock.patch.object(run, "_git", side_effect=fake), \
              mock.patch("builtins.print"):
-            ok, info = run.sync_code(dict(run.DEFAULTS))
+            ok, info = run.sync_code(cfg)
         self.assertTrue(ok)
         self.assertIn("bootstrap", info)
         flat = [" ".join(c) for c in calls]
@@ -1149,8 +1151,10 @@ class TestGitPullFailover(_Base):
                 return 0, "Fast-forward", ""
             return 0, "", ""
 
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_CODE_REPO_BACKUP"] = "git@gitee.com:mirror/public.git"
         with mock.patch.object(run, "_git", side_effect=fake):
-            ok, info = run.git_pull(dict(run.DEFAULTS))
+            ok, info = run.git_pull(cfg)
         self.assertTrue(ok)
         self.assertIn("备用库(Gitee)", info)
         fetches = [c for c in calls if c[0] == "fetch"]
@@ -1176,8 +1180,10 @@ class TestGitPullFailover(_Base):
                 return 0, "Fast-forward", ""
             return 0, "", ""
 
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_CODE_REPO_BACKUP"] = "git@gitee.com:mirror/public.git"
         with mock.patch.object(run, "_git", side_effect=fake):
-            ok, info = run.git_pull(dict(run.DEFAULTS))
+            ok, info = run.git_pull(cfg)
         self.assertTrue(ok)
         self.assertIn("备用库(Gitee)", info)
         merges = [c for c in calls if c[0] == "merge"]

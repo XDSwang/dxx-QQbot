@@ -127,7 +127,7 @@ WM_QQ_MD_GITHUB_BRANCH = main
 3. 想再自检一次真实渲染：
 
 ```bash
-cd E:\AI\dxx-QQbot\wm-bot\python
+cd wm-bot/python
 python md_probe.py                                            # 不联网：打印最小请求体 + 生成网页预览
 python md_probe.py --send --group <openid> --image media      # 当前实际通道（官方素材），发一条看 QQ
 # 仅当你自己填了图床配置，才用下面两条；没填会拿不到 URL

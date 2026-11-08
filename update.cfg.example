@@ -28,38 +28,34 @@ UPDATER_GITHUB_PATH = services
 UPDATER_GITHUB_BRANCH = main
 # UPDATER_GITHUB_API = https://api.github.com
 
-# ---------------- ①-b 数据读写：主库 3 轮失败切 Gitee ----------------
-# 这是【数据读写层】的兜底（Contents API）：主库（GitHub）连续 3 轮拉取 / 回写失败
-# （单轮超 5 秒也记「窗口过长」并回到第一步重新拉），自动切到下面这份 Gitee 备用
-# 私有库，用同样的 3 轮流程继续；主备全失败报「数据拉取异常」，本地数据始终完整。
-# 「要不要更新」的判断不在这里，见下面 ①-c 的 GIT 双源拷贝。
-# ⚠️ Gitee 的 access_token 必须自己填，否则备用私有库不启用（仍只报主库失败）。
+# ---------------- ①-b 数据读写：主库 3 轮失败切 Gitee（可选） ----------------
+# 这是【数据读写层】的兜底（Contents API），不是更新判断：主库连续 3 轮拉取 / 回写失败
+# （单轮超 5 秒也记「窗口过长」并回到第一步重新拉），才切到下面这份 Gitee 备用私有库。
+# ⚠️ 整段都是可选：GITEE_TOKEN 留空就不启用，判断层完全不受影响。
 #    Gitee 私有库务必是 Private；Contents API 写文件需要 token，公开库也写不了。
-#    主库恢复后把 UPDATER_GITEE_TOKEN 清空即可回到只用主库。
 UPDATER_FAILOVER = 1
-UPDATER_GITEE_REPO = 你的Gitee账号/dxx_private_data
+UPDATER_GITEE_REPO = <你的Gitee账号>/<你的私有库名>
 UPDATER_GITEE_TOKEN =
 UPDATER_GITEE_PATH = services
 UPDATER_GITEE_BRANCH = main
 # UPDATER_GITEE_API = https://gitee.com/api/v5
 
-# ---------------- ①-c 更新判断：GIT 双源拷贝（默认） ----------------
-# 每轮用 GIT 指令把两个私有库接口都拷贝(fetch)下来：
-#   · 谁的版本新就用谁，数据读写也跟着切到那个接口；
+# ---------------- ①-c 更新判断：GIT 双源拷贝（默认，不需要 token） ----------------
+# ⚠️ 下面两行是【GIT 拷贝用的仓库地址】，不是第三方数据接口：判断层只跑 git fetch，
+#    不碰任何 API、不需要 token。把占位换成你自己的两个私有库地址即可。
+# 每轮用 GIT 指令把两个私有库都拷贝(fetch)下来：
+#   · 谁的版本新就用谁，数据读写也跟着切到那个源；
 #   · 拷贝下来没有内容变化（HEAD 没变）就是「不用更新」，本轮直接跳过；
-#   · 一个接口因网络失败，就用拷贝成功的那个继续判断；
+#   · 一个源因网络失败，就用拷贝成功的那个继续判断；
 #   · 两个都失败才报「数据拉取异常」，本地数据保持原样；
 #   · 本地版本比远端新时不回退、不覆盖本地。
-# SSH 已配好时直接用 git@ 地址，不需要任何 token；HTTPS 地址也可以（需本机凭证）。
-# 更新判断恒为 GIT 双源拷贝，比版本、无变化不更新。
-UPDATER_DATA_REPO = git@github.com:XDSwang/dxx_private_data.git
-UPDATER_DATA_REPO_BACKUP = git@gitee.com:xdswang/dxx_private_data.git
+# 地址填 HTTPS（本机已存 git 凭证）或 SSH（手机 / 没存凭证的机器）都行，
+# 两端不必同一种方式，谁通就用谁。更新判断恒为 GIT 双源拷贝，比版本、无变化不更新。
+UPDATER_DATA_REPO = https://github.com/<账号>/<私有库>.git
+UPDATER_DATA_REPO_BACKUP = git@gitee.com:<账号>/<私有库>.git
 UPDATER_DATA_BRANCH = main
-# UPDATER_FAILOVER = 0 可关掉备用接口（只拷贝主库）
-
-# 以后接数据库 / 第三方接口时填这里（当前版本读了也只报「未实现」，不会假装能连）
-# UPDATER_DATA_URL = postgres://... 或 https://your-api/...
-# UPDATER_DATA_TOKEN =
+# UPDATER_FAILOVER = 0 可关掉备用源（只拷贝主库）
+# 两行都留空时，判断层会用 ① 段的 UPDATER_GITHUB_REPO 拼出主库地址（只剩单源）。
 
 # local 后端才生效：目录里按服务名建子目录，各放 config.txt / runtime.json /
 # owner.json（schema.json 在公共仓库，私有库不存结构文件）。更新判断走 ①-c 的 GIT 双源拷贝。
@@ -67,11 +63,11 @@ UPDATER_LOCAL_DIR = remote
 
 # ---------------- ② 公共仓库本体（代码同步） ----------------
 # 首次把整个仓库拷到服务端时若没有 .git，run.py 会用它自动 git init + fetch；
-# 之后每轮用 GIT 指令把下面两个接口都拷贝下来，比版本用最新的（本地新则不回退）。
+# 之后每轮用 GIT 指令把下面两个源都拷贝下来，比版本用最新的（本地新则不回退）。
 # 一个失败用成功的，两个都失败报「数据拉取异常」。公开仓库拉取不需要凭证。
-UPDATER_CODE_REPO = https://github.com/XDSwang/dxx-QQbot.git
-# 备用公共库（Gitee 镜像）；SSH 已配好，也可填 https://gitee.com/xdswang/dxx-QQbot.git
-UPDATER_CODE_REPO_BACKUP = git@gitee.com:xdswang/dxx-QQbot.git
+# 同样换成你自己的公共库地址；公开代码里不写死任何账号 / 仓库名。
+UPDATER_CODE_REPO = https://github.com/<账号>/<公共库>.git
+UPDATER_CODE_REPO_BACKUP = git@gitee.com:<账号>/<公共库>.git
 UPDATER_CODE_BRANCH = main
 # 启动时先自动同步一次（把「拷贝来的旧版」拉到最新，必要时自动重启 RUN）
 UPDATER_SYNC_ON_START = 1
@@ -169,3 +165,11 @@ UPDATER_PUSH_RUNTIME = 1
 #   「数据拉取异常」，服务照常跑、只是不会自动同步。
 #   os.execv 自重启、Path 路径、CRLF 都可用。
 # ============================================================
+
+# ---------------- ⑤ 以后扩展（当前不生效，别填） ----------------
+# 数据库 / 第三方数据接口是【以后】才接的：那时换 UPDATER_BACKEND + 填下面两项，
+# 再按 Store 接口在 updater.make_store 注册一个适配器即可。
+# 判断层（①-c 的 GIT 双源拷贝）与读写层是分开的两套，换接口不用动判断逻辑。
+# 当前版本读了这两项只会明确报「未实现」，不会假装能连。
+# UPDATER_DATA_URL = postgres://... 或 https://your-api/...
+# UPDATER_DATA_TOKEN =

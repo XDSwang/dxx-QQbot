@@ -51,15 +51,16 @@ DEFAULTS = {
     "UPDATER_GITEE_PATH": "services",
     "UPDATER_GITEE_BRANCH": "main",
     "UPDATER_GITEE_API": updater.GITEE_API,
-    "UPDATER_CODE_REPO": "https://github.com/XDSwang/dxx-QQbot.git",
-    "UPDATER_CODE_REPO_BACKUP": "git@gitee.com:xdswang/dxx-QQbot.git",
+    # 仓库地址一律由本机 update.cfg 提供，公开代码里不写死账号 / 仓库名
+    "UPDATER_CODE_REPO": "",
+    "UPDATER_CODE_REPO_BACKUP": "",
     "UPDATER_CODE_BRANCH": "main",
     "UPDATER_SYNC_ON_START": "1",
     "SERVICES_ENABLED": "",
     # 判断恒为 GIT 双源拷贝，不依赖任何发布标记文件
-    # 两个私有库接口的 git 地址（SSH 已配好，不需要 token）
-    "UPDATER_DATA_REPO": "git@github.com:XDSwang/dxx_private_data.git",
-    "UPDATER_DATA_REPO_BACKUP": "git@gitee.com:xdswang/dxx_private_data.git",
+    # 两个私有库的 GIT 拷贝地址（SSH 不需要 token）；由 update.cfg 填自己的仓库
+    "UPDATER_DATA_REPO": "",
+    "UPDATER_DATA_REPO_BACKUP": "",
     "UPDATER_DATA_BRANCH": "main",
     # 同一套代码、不同授权的多台服务端各配一个，数据目录就不会撞在一起
     "UPDATER_DATA_NAMESPACE": "",

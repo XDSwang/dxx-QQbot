@@ -1,9 +1,17 @@
 # dxx-QQbot — 运行与部署
 
 > 两个仓库分工：**公共库（本仓库）＝代码本体**（代码 + `services.json` 服务清单），
-> **私有库 `dxx_private_data` ＝数据**（真实配置值、运行记录、启动器 `bootstrap.py` 与凭证）。
+> **你的私有库 ＝数据**（真实配置值、运行记录、启动器 `bootstrap.py` 与凭证）。
 > 长期运行的是本仓库根目录的 `run.py`；私有库的 `bootstrap.py` 只在首次部署跑一次，
 > 跑完就 `execv` 成 `run.py`，之后不再常驻。
+>
+> 路径一律按**项目根目录相对书写**，本文不写任何盘符，需要绝对路径时自己拼：
+> 私有库根 → `bootstrap.py`、`bootstrap.cfg`、`services/wm-bot/config.txt`；
+> 公共库根（启动器默认克隆到私有库目录下的 `dxx-QQbot/`）→ `run.py`、`update.cfg`、
+> `services.json`、`wm-bot/python/data/config.txt`。
+> **所有仓库地址都是 `bootstrap.cfg` / `update.cfg` 里的参数**，代码与模板里不写死账号或仓库名。
+> 术语：GIT 拷贝语境里说的「源 / 接口」指**仓库地址**，不是第三方数据接口；
+> 后者是以后扩展、当前不生效。判断层只跑 `git fetch`，不需要任何 token。
 
 ## 一、运行流程（已经部署好的机器）
 
@@ -65,9 +73,11 @@ python run.py
    回到第一步重新拉）才切 Gitee 备用私有库再 3 轮；主备全失败报「数据拉取异常」，
    本地最新监控记录不会丢。这一层需要 `UPDATER_GITEE_TOKEN` 才启用；
    **判断层走 SSH，不需要任何 token**，不填只是少了回写兜底。
-3. **`update.cfg` 是数据后端装配入口，别删**：以后接数据库 / 第三方接口，
-   就在这里换 `UPDATER_BACKEND` + `UPDATER_DATA_URL` / `UPDATER_DATA_TOKEN`，
-   再按 Store 接口在 `updater.make_store` 注册一个适配器，服务与迁移逻辑都不用动。
+3. **`update.cfg` 是数据后端装配入口，别删**：当前只装 GitHub 私有库文件的读写。
+   数据库 / 第三方数据接口的 `UPDATER_DATA_URL` / `UPDATER_DATA_TOKEN` 是
+   **以后扩展的预留位，现在别填**（填了只会明确报「未实现」）。
+   判断层与读写层是分开的两套：将来真接接口只换数据后端 Store
+   （在 `updater.make_store` 注册适配器），GIT 双源拷贝的逻辑一行都不用动。
    `update.cfg`、`data/`、`bootstrap.cfg` 都不进 git。
 
 ## 二、部署流程（全新机器 / 手机 Termux / QPython）
@@ -75,16 +85,20 @@ python run.py
 ### 准备
 
 - 装 Python 3 与 git（Termux：`pkg install git python ca-certificates`）。
-- GitHub 与 Gitee 的 SSH key 都加好（GIT 双源拷贝要用）。
-- 一个 GitHub **fine-grained PAT**：只授权私有库 `dxx_private_data` 的
-  `Contents: Read and write`。
+- **两个私有库地址各有一条能免密 `git fetch` 的通道**：本机已保存 git 凭证就直接用
+  HTTPS（如 `https://github.com/你的账号/你的私有库.git`）；手机 / 没存凭证的机器用 SSH。
+  两端是同一个库的两份镜像，不要求同一种方式，谁通就用谁。
+- 一个 GitHub **fine-grained PAT**：只授权你自己的私有库，权限
+  `Contents: Read and write`。它是给数据读写层读配置 / 回写记录用的，
+  **判断层不需要它**；已有同权限的 PAT 直接复用，一个就够，不必额外生成。
+- 把 `bootstrap.cfg` 里标【必填】的仓库地址占位换成自己的；换账号 / 换库只改这几行。
 
 ### 步骤
 
 ```bash
 # 1. 先克隆【私有库】（不是公共库）：启动器和真实配置都在里面
-#    SSH 已配好就直接走 git@；没配 SSH 时用 https://<PAT>@github.com/... 也可以
-git clone git@github.com:XDSwang/dxx_private_data.git bot
+#    地址填你自己的私有库；没配 SSH 时才用 https://<PAT>@github.com/... 这种形式
+git clone <你的私有库 SSH 地址> bot
 cd bot
 
 # 2. 生成启动器配置（bootstrap.cfg 已被 .gitignore 忽略，不会进仓库）
