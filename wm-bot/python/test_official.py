@@ -449,6 +449,35 @@ class TestOnEvent(unittest.TestCase):
         self.bot._on_event(None, self._pkt_group_full("<@7A3B9C1D> 自检"), "TOK")
         self.assertEqual(self.calls, [])
 
+    def test_group_full_message_plain_text_at_bot(self):
+        """有的客户端把「@机器人」发成明文「@昵称」（没有 <@!openid> 占位符）：
+        自动取到昵称后要认出 at_me，免前缀指令不能静默。"""
+        self.bot.bot_name = "自动化服务查询_D/XX/"
+        for content in ("@自动化服务查询_D/XX/  自检", "@自动化服务查询_D/XX/自检"):
+            self.calls = []
+            self.bot._on_event(None, self._pkt_group_full(content), "TOK")
+            self.assertEqual(len(self.calls), 1, content)
+            self.assertIn("出图模式", self.calls[0][2])
+
+    def test_group_full_message_plain_text_at_other_silent(self):
+        """明文 @ 的是别人（昵称对不上）：依旧静默，不抢话。"""
+        self.bot.bot_name = "自动化服务查询_D/XX/"
+        self.bot._on_event(None, self._pkt_group_full("@小明 自检"), "TOK")
+        self.assertEqual(self.calls, [])
+
+    def test_fetch_self_fills_bot_name(self):
+        """GET /users/@me 的 username 就是群里显示的昵称；只试一次。"""
+        orig = qq_official._api_get
+        qq_official._api_get = lambda *a, **k: (True, {"id": "1", "username": "自动化服务查询_D/XX/"})
+        try:
+            self.bot._fetch_self("TOK")
+            self.assertEqual(self.bot.bot_name, "自动化服务查询_D/XX/")
+            qq_official._api_get = lambda *a, **k: (True, {"username": "改过的名字"})
+            self.bot._fetch_self("TOK")
+            self.assertEqual(self.bot.bot_name, "自动化服务查询_D/XX/", "只拉一次")
+        finally:
+            qq_official._api_get = orig
+
     def test_image_reply_sends_tail_in_same_message(self):
         """WM 回复：图片 + /w 字符串合成一条图文混排消息，且不带 (wf.m ...) 备注。"""
         calls = []
@@ -732,6 +761,8 @@ class TestConnectIdentify(unittest.TestCase):
         )
         bot.token_mgr.get_token = lambda *a, **k: "FAKETOKEN"
         bot._get_gateway = lambda token: "ws://127.0.0.1:%d" % port
+        # 本用例只验证握手/Identify：跳过 /users/@me（否则会打到本地假网关）
+        bot._self_tries = 3
         try:
             bot._connect_loop()
         except Exception as e:

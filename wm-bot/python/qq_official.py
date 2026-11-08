@@ -214,6 +214,29 @@ def send_message(token, appid, api_base, target_kind, target_id, content, msg_id
 
 
 # ---------------- 发图片（富媒体：先上传拿 file_info，再 msg_type=7） ----------------
+def _api_get(token, appid, api_base, path, timeout=10):
+    """统一 GET，返回 (ok, resp_dict_or_err)。失败不抛异常（与 _api_post 对称）。"""
+    url = api_base.rstrip("/") + path
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={
+            "Authorization": f"QQBot {token}",
+            "X-Union-Appid": str(appid),
+        },
+    )
+    try:
+        with bot_config.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+            try:
+                return True, json.loads(raw)
+            except ValueError:
+                return True, {"raw": raw}
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'ignore')}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _api_post(token, appid, api_base, path, body, timeout=15):
     """统一 POST，返回 (ok, resp_dict_or_err)。失败不抛异常。"""
     url = api_base.rstrip("/") + path
@@ -322,6 +345,19 @@ def strip_mention(text):
     return t.strip()
 
 
+def _text_mentions_bot(raw, bot_name):
+    """开头是不是明文的「@机器人昵称」。
+
+    官方占位符（`<@!openid>`）是标准形态，但有的客户端 / 全量消息模式下，
+    「@机器人」会以纯文字「@昵称」发过来 —— 这时只能拿自己的昵称去对。
+    只看开头（与 qq_common.strip_mentions 的口径一致），句中 / 句尾不算。
+    """
+    if not bot_name:
+        return False
+    t = (raw or "").lstrip()
+    return t.startswith("@" + bot_name) or t.startswith("＠" + bot_name)
+
+
 # ---------------- 官方机器人主类 ----------------
 class OfficialBot:
     def __init__(self, appid, secret, handler, api_base=DEFAULT_API_BASE,
@@ -342,6 +378,10 @@ class OfficialBot:
         self._reply_queues = {}
         self._reply_threads = {}
         self._reply_qlock = threading.Lock()
+        # 机器人自己的名字（GET /users/@me 自动取）；有的客户端把「@机器人」发成
+        # 明文「@昵称」而不是占位符，没有它就没法判断「@ 的是不是我」。
+        self.bot_name = ""
+        self._self_tries = 0
 
     def stop(self):
         self._stop.set()
@@ -482,6 +522,7 @@ class OfficialBot:
     # ---- 连接并维持网关会话 ----
     def _connect_loop(self):
         token = self.token_mgr.get_token()
+        self._fetch_self(token)
         gateway = self._get_gateway(token)
         u = urllib.parse.urlparse(gateway)
         host = u.hostname or "api.bot.qq.com"
@@ -503,6 +544,24 @@ class OfficialBot:
         print(f"[official] 已连网关 {host}{path}", file=sys.stderr)
         flog(f"已连网关 {host}{path}")
         self._loop(conn, token)
+
+    def _fetch_self(self, token):
+        """拉一次机器人自己的资料（GET /users/@me），username 就是群里显示的昵称。
+
+        只在启动后试（成功后不再试；失败最多 3 次，符合静默重试上限）；
+        接口不可用（老应用 / 权限不足）也不报错，继续用 `<@!openid>` 占位符与
+        WM_QQ_BOT_NAME 判定，不影响正常收发。
+        """
+        if self.bot_name or self._self_tries >= 3:
+            return
+        self._self_tries += 1
+        ok, info = _api_get(token, self.appid, self.api_base, "/users/@me")
+        if ok and isinstance(info, dict) and info.get("username"):
+            self.bot_name = str(info["username"]).strip()
+            bot_config.echo("[official] 自身信息：昵称=%r" % self.bot_name)
+            flog(f"自身信息 昵称={self.bot_name!r}")
+        elif not ok:
+            flog(f"取自身资料失败（改用占位符/配置判定）: {info}")
 
     def _get_gateway(self, token):
         url = self.api_base + "/gateway"
@@ -678,6 +737,12 @@ class OfficialBot:
             if _BOT_MENTION_RE.search(raw):
                 ctx["at_me"] = True
                 ctx["user_id"] = (d.get("author") or {}).get("user_openid")
+            elif _text_mentions_bot(raw, self.bot_name):
+                # 有的客户端 / 全量模式下「@机器人」是明文「@昵称」，没有叹号占位符。
+                # 认出来才算 @ 我；认出来就按 @ 消息处理（可以引用回复，不用普通群消息）。
+                ctx["at_me"] = True
+                ctx["user_id"] = (d.get("author") or {}).get("user_openid")
+                ctx.pop("full_message", None)
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")
@@ -698,6 +763,9 @@ class OfficialBot:
         """
         if not target_id:
             return
+        # 自己的昵称交给 handler：明文「@昵称」靠它判定（取不到就退回配置/占位符）
+        if self.bot_name:
+            ctx.setdefault("bot_name", self.bot_name)
         if not self._async_replies:
             self._do_reply(token, kind, target_id, text, ctx, msg_id)
             return
