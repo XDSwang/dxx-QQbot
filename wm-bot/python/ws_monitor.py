@@ -41,6 +41,7 @@ sender 由 QQ 后端（官方 / OneBot）在启动时注入：
 """
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -56,9 +57,11 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_SWITCH_FILE = HERE / "data" / "ws_switches.json"
 LAST_SENT_FILE = HERE / "data" / "ws_last_sent.json"   # 按栏目去重记录（落盘，防重启重发）
 DEFAULT_FILTER_FILE = HERE / "data" / "ws_filters.json"  # 裂缝维度过滤（落盘，重启后恢复）
+DEFAULT_AT_FILE = HERE / "data" / "ws_at_users.json"     # 谁发的监控指令（推送时 @ 他）
 
-_sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text) -> bool
+_sender = None                       # 由 QQ 后端注入：sender(channel, target_id, text[, at_user]) -> bool
 _monitors = {}                       # (channel, target_id) -> set(types)
+_at_users = {}                       # (channel, target_id) -> 发起监控的用户号（推送时 @ 他）
 _fissure_filters = {}                # (channel, target_id) -> {栏目键: [token...]}
                                      # 栏目维度过滤：裂缝(纪/星球/任务) 与 赏金(集团/地区) 共用
                                      # 这张表（键是栏目名 fissures/steel/bounty）
@@ -386,6 +389,84 @@ def load_filters():
     return len(data)
 
 
+def at_file():
+    raw = os.environ.get("WS_AT_FILE")
+    return Path(raw) if raw else DEFAULT_AT_FILE
+
+
+def _save_at_users():
+    """原子写盘「监控发起人」；磁盘不可写时静默降级为本次运行有效。"""
+    p = at_file()
+    tmp = p.with_name(p.name + ".tmp")
+    payload = {"version": 1,
+               "sessions": {"%s|%s" % (ch, tid): str(uid)
+                            for (ch, tid), uid in _at_users.items() if uid}}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def load_at_users():
+    """启动时恢复「监控发起人」；坏文件 / 字段不认识都当空（只是不 @ 人，不影响推送）。"""
+    p = at_file()
+    data = {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8-sig"))
+        for k, uid in ((obj or {}).get("sessions") or {}).items():
+            if not isinstance(k, str) or "|" not in k or not uid:
+                continue
+            ch, tid = k.split("|", 1)
+            if ch in ("group", "private") and tid:
+                data[(ch, tid)] = str(uid)
+    except Exception:
+        data = {}
+    with _lock:
+        _at_users.clear()
+        _at_users.update(data)
+    return len(data)
+
+
+def at_user_of(channel, target_id):
+    """本会话最近一次开监控的人；没记录就返回 None（推送时不 @ 任何人）。"""
+    with _lock:
+        return _at_users.get((channel, str(target_id)))
+
+
+_sender_at = [None]      # 缓存的探测结果：sender 是否收第四参 at_user
+
+
+def _sender_takes_at():
+    """sender 是否支持 at_user 第四参。
+
+    官方机器人主动消息不能 @ 人，注入的 sender 只有三个参数；OneBot 的可以。
+    缓存一次（set_sender 时复位），别每条推送都反射一遍。
+    """
+    if _sender_at[0] is None:
+        try:
+            params = inspect.signature(_sender).parameters.values()
+            _sender_at[0] = any(p.kind is p.VAR_POSITIONAL or p.name == "at_user"
+                                for p in params)
+        except (TypeError, ValueError):
+            _sender_at[0] = False
+    return _sender_at[0]
+
+
+def _send_one(ch, tid, text, at_user=None):
+    """调后端 sender 发一条：能给就顺手 @ 发起人，后端不支持就退回三参。"""
+    if at_user and _sender_takes_at():
+        return _sender(ch, tid, text, at_user)
+    return _sender(ch, tid, text)
+
+
 def effective_types(key, raw_types):
     """本会话真正要监控的栏目：原始监控集合 + 显式开启 - 显式关闭。"""
     with _lock:
@@ -465,6 +546,7 @@ def set_sender(fn):
     global _sender, _next_probe
     _sender = fn
     _next_probe = 0.0
+    _sender_at[0] = None         # 换了通道，重新探测它收不收 at_user
     with _lock:
         _last_sent.clear()
         _priority_sent_at.clear()
@@ -534,11 +616,13 @@ def restore_last_sent():
         len(restored), sum(len(m) for m in restored.values())))
 
 
-def start_monitor(channel, target_id, types, filters=None):
+def start_monitor(channel, target_id, types, filters=None, at_user=None):
     """开启某会话的监控；types 为 worldstate.TYPES 的键集合。
 
     filters：可选 {栏目键: [过滤 token...]}，仅对 fissures / steel 有意义；
     写盘后重启自动恢复。
+    at_user：发指令的人（群成员号 / 用户 OpenID）。推送时 @ 他，
+             让「@机器人 监控 警报」开出来的推送找得到是谁开的。
     """
     key = (channel, str(target_id))
     with _lock:
@@ -561,6 +645,10 @@ def start_monitor(channel, target_id, types, filters=None):
         # 否则磁盘会残留上一次的条件，重启后又冒出来（不新建文件，避免无谓写盘）。
         if _fissure_filters or filter_file().exists():
             _save_filters()
+        # 记住是谁开的监控：推送时 @ 回去（存盘，重启后照样 @ 得到人）
+        if at_user and _at_users.get(key) != str(at_user):
+            _at_users[key] = str(at_user)
+            _save_at_users()
     ws.ensure_active()               # 拉起世界状态后台刷新
     _ensure_push_thread()
 
@@ -580,12 +668,15 @@ def stop_monitor(channel, target_id):
         _priority_sent_at.pop(key, None)
         had_switch = bool(_switches.pop(key, None))
         had_filter = bool(_fissure_filters.pop(key, None))
+        had_at = _at_users.pop(key, None) is not None
         if had_switch:
             _save_switches()
         if had_filter:
             _save_filters()
+        if had_at:
+            _save_at_users()
         removed = _monitors.pop(key, None) is not None
-        changed = removed or had_switch or had_filter
+        changed = removed or had_switch or had_filter or had_at
     if changed:
         _save_last_sent()            # 把「已移除该会话」的去重记录落盘
     return changed
@@ -927,7 +1018,7 @@ def _push_priority(ch, tid, key, state, prio, now):
         ok = False
         if _sender is not None and now >= _next_probe:
             try:
-                ok = bool(_sender(ch, tid, x))
+                ok = bool(_send_one(ch, tid, x, at_user_of(ch, tid)))
             except Exception:
                 ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
             _note_probe(ok)
@@ -1064,7 +1155,7 @@ def push_once():
             ok = False
             if _sender is not None and now >= _next_probe:
                 try:
-                    ok = bool(_sender(ch, tid, x))
+                    ok = bool(_send_one(ch, tid, x, at_user_of(ch, tid)))
                 except Exception:
                     ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
                 _note_probe(ok)             # 只有真去试了才更新探测时刻

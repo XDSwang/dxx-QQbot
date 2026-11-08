@@ -182,6 +182,118 @@ class TestHandler(unittest.TestCase):
         self.assertIsNotNone(h("D/XX/自检", {"channel": "group", "group_id": "g"}))
 
 
+class TestAtBot(unittest.TestCase):
+    """@ 机器人：允许不带 D/XX/ 前缀；回复与监控推送都 @ 发起人。"""
+
+    @classmethod
+    def setUpClass(cls):
+        global ws_monitor
+        import ws_monitor
+        d = tempfile.mkdtemp(prefix="at_bot_")
+        os.environ["WS_AT_FILE"] = os.path.join(d, "ws_at.json")
+        os.environ["WS_SWITCH_FILE"] = os.path.join(d, "ws_sw.json")
+        os.environ["WS_FILTER_FILE"] = os.path.join(d, "ws_fl.json")
+        ws_monitor.LAST_SENT_FILE = Path(d) / "ws_last_sent.json"
+        cls._dir = d
+
+    def setUp(self):
+        os.environ["WM_SOURCE"] = "mock"
+        ws_monitor._at_users.clear()
+
+    def test_parse_at_segments(self):
+        """数组段 / 老协议 CQ 码都能认出「@ 了机器人」，@ 别人不算。"""
+        segs = [{"type": "at", "data": {"qq": "999"}},
+                {"type": "text", "data": {"text": " 监控 警报"}}]
+        self.assertEqual(onebot._parse_message(segs, "999"), ("监控 警报", True))
+        other = [{"type": "at", "data": {"qq": "111"}},
+                 {"type": "text", "data": {"text": " hello"}}]
+        self.assertEqual(onebot._parse_message(other, "999"), ("hello", False))
+        self.assertEqual(onebot._parse_message("[CQ:at,qq=999] 平原", "999"),
+                         ("平原", True))
+        # 图片 / 表情段不能混进指令文本
+        mixed = [{"type": "at", "data": {"qq": "999"}},
+                 {"type": "image", "data": {"file": "x"}},
+                 {"type": "text", "data": {"text": "wm Boltor"}}]
+        self.assertEqual(onebot._parse_message(mixed, "999"), ("wm Boltor", True))
+
+    def test_at_allows_prefixless(self):
+        """@ 了机器人 = 明确对着我说的：不带 D/XX/ 也能用；没 @ 仍然静默。"""
+        h = qq_bot.make_handler()
+        at = {"channel": "group", "group_id": "G1", "user_id": "12345", "at_me": True}
+        self.assertIsNotNone(h("wm Boltor", at))
+        self.assertIsNotNone(h("平原", at))
+        self.assertIsNotNone(h("帮助", at))
+        no_at = {"channel": "group", "group_id": "G1", "user_id": "12345"}
+        self.assertIsNone(h("wm Boltor", no_at), "没 @ 就该维持静默")
+        self.assertIsNone(h("平原", no_at))
+        # @ 了但说的不是指令：仍然不猜、不接话
+        self.assertIsNone(h("今天吃什么", at))
+
+    def test_monitor_records_at_user(self):
+        """@机器人 开监控要记住是谁开的，推送才 @ 得到人；停止监控要连带清掉。"""
+        from unittest import mock
+        with mock.patch.object(ws_monitor, "_ensure_push_thread", lambda: None), \
+             mock.patch.object(ws_monitor.ws, "ensure_active", lambda: None):
+            h = qq_bot.make_handler()
+            self.assertIsNotNone(h("监控 警报", {
+                "channel": "group", "group_id": "G9",
+                "user_id": "12345", "at_me": True}))
+        self.assertEqual(ws_monitor.at_user_of("group", "G9"), "12345")
+        ws_monitor._at_users.clear()
+        self.assertGreaterEqual(ws_monitor.load_at_users(), 1, "重启后要能恢复")
+        self.assertEqual(ws_monitor.at_user_of("group", "G9"), "12345")
+        with mock.patch.object(ws_monitor, "_save_last_sent", lambda: None):
+            self.assertTrue(ws_monitor.stop_monitor("group", "G9"))
+        self.assertIsNone(ws_monitor.at_user_of("group", "G9"))
+
+    def test_push_passes_at_user(self):
+        """推送把发起人交给后端；只有三参的后端（官方不能 @）自动退回，不崩。"""
+        got = []
+        ws_monitor.set_sender(lambda ch, tid, text, at_user=None:
+                              got.append((ch, tid, at_user)) or True)
+        self.assertTrue(ws_monitor._send_one("group", "G1", "x", "12345"))
+        self.assertEqual(got, [("group", "G1", "12345")])
+        got.clear()
+        ws_monitor.set_sender(lambda ch, tid, text: got.append((ch, tid, None)) or True)
+        self.assertTrue(ws_monitor._send_one("group", "G1", "x", "12345"))
+        self.assertEqual(got, [("group", "G1", None)])
+        ws_monitor.set_sender(None)
+
+    def test_reply_mentions_sender(self):
+        """群回复带 @ 发送者（文本用 CQ 码前缀，老客户端也认）；私聊不加。"""
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c._send_reply(FakeConn(), {"message_type": "group", "group_id": 777,
+                                   "user_id": 12345}, "你好")
+        self.assertEqual(sent[-1]["params"]["message"], "[CQ:at,qq=12345] 你好")
+        sent.clear()
+        c._send_reply(FakeConn(), {"message_type": "private", "user_id": 1}, "你好")
+        self.assertEqual(sent[-1]["params"]["message"], "你好")
+
+    def test_send_active_mentions(self):
+        """监控推送：给了 at_user 就在最前面 @ 他，没给就还是原样子符串。"""
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c._conn = FakeConn()
+        c.send_active("group", 777, "警报：新", at_user=12345)
+        segs = sent[-1]["params"]["message"]
+        self.assertEqual(segs[0], {"type": "at", "data": {"qq": "12345"}})
+        self.assertEqual(segs[1]["data"]["text"], "警报：新")
+        sent.clear()
+        c.send_active("group", 777, "警报：新")
+        self.assertEqual(sent[-1]["params"]["message"], "警报：新")
+
+
 class TestIntegrationServer(unittest.TestCase):
     """起 onebot server，用 mock OneBot 客户端连过来，验证端到端收发。"""
 

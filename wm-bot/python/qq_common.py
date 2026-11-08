@@ -455,10 +455,16 @@ def make_handler(allowed_groups=None, allow_all=False):
         # 只有「主推信息」（机器人主动推出来的监控）不受限。
         q = strip_query_prefix(body)
         if q is None:
-            # 例外：裸「帮助 / help / 菜单 / 指令…」不要求前缀，发这两个字就直接出菜单
+            # 例外 1：裸「帮助 / help / 菜单 / 指令…」不要求前缀，发这两个字就直接出菜单
             bare = (body or "").strip().lstrip("/").strip().lower()
             if bare in BARELESS_HELP_WORDS:
                 q = bare
+            elif ctx.get("at_me"):
+                # 例外 2：@ 了机器人 —— 这句话本来就是对着我说的，允许不带 D/XX/
+                # （@ 本身已是明确意图，群里闲聊不会误触；仍要求是完整指令才会回）
+                q = (body or "").strip().lstrip("/").strip()
+                if not q:
+                    return None
             else:
                 # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
                 return None
@@ -594,7 +600,10 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
         if bounty_toks:
             filters = dict(filters or {})
             filters["bounty"] = bounty_toks
-        ws_monitor.start_monitor(ch, tid, set(cmd["types"]), filters=filters)
+        # 记下发起人：之后这个会话的监控推送会 @ 他（私聊没有 @ 概念，不记）
+        at_user = (ctx.get("user_id") or ctx.get("sender_id")) if ch == "group" else None
+        ws_monitor.start_monitor(ch, tid, set(cmd["types"]), filters=filters,
+                                 at_user=at_user)
         names = "、".join(worldstate.TYPES[t][0] for t in cmd["types"] if t in worldstate.TYPES)
         msg = ("✅ 已开始监控：%s\n每 %d 秒检查一次，内容有变化才推送"
                "（周期最小间隔 %d 秒，倒计时跳动不算变化）。"

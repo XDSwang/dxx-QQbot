@@ -642,7 +642,11 @@ class OfficialBot:
             text = strip_mention(raw)
             group_openid = d.get("group_openid")
             flog(f"群@消息 group_openid={group_openid} 原始内容={raw!r} 剥离后={text!r}")
-            ctx = {"channel": "group", "group_id": group_openid}
+            ctx = {"channel": "group", "group_id": group_openid,
+                   # 群 @ 事件：明确对着机器人说的，允许不带 D/XX/ 前缀；
+                   # user_openid 记下来，之后本会话的监控推送 @ 他
+                   "at_me": True,
+                   "user_id": (d.get("author") or {}).get("user_openid")}
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "GROUP_MESSAGE_CREATE":
             # 群消息「全量模式」：机器人在 q.qq.com 开了「接收所有消息」后，
@@ -962,6 +966,10 @@ def main():
     saved_f = ws_monitor.load_filters()
     if saved_f:
         print(f"[official] 已恢复 {saved_f} 个会话的裂缝过滤条件", file=sys.stderr)
+    # 恢复「监控是谁开的」：官方主动消息不能 @ 人，这里只保留记录（换到 OneBot 时立刻生效）
+    saved_a = ws_monitor.load_at_users()
+    if saved_a:
+        print(f"[official] 已恢复 {saved_a} 个会话的监控发起人", file=sys.stderr)
     # 可选：对白名单群自动注册「警报 / 活动」主推（默认关，见 WS_AUTO_PRIORITY）
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:

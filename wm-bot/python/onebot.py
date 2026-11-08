@@ -20,6 +20,7 @@ onebot.py — OneBot v11 传输层（纯 Python 标准库，零依赖）
 handler(text, ctx) -> str | None：返回要回复的文本；返回 None 表示不回复。
 """
 import os
+import re
 import sys
 import json
 import time
@@ -33,6 +34,40 @@ import urllib.parse
 import config as bot_config   # 统一 wss 证书处理（手机端缺 CA 时自动兼容）
 
 WSS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# CQ 码形式的 @（老协议 / 字符串消息里是 "…[CQ:at,qq=123456]…"）
+_CQ_AT = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
+
+
+def _bot_self_id(msg):
+    """机器人自己的 QQ 号：优先事件里的 self_id（OneBot 标准字段），
+    缺失时用 WM_QQ_SELF_ID 兜底（个别实现不填 self_id）。"""
+    sid = msg.get("self_id") or os.environ.get("WM_QQ_SELF_ID") or ""
+    return str(sid).strip()
+
+
+def _parse_message(raw, self_id):
+    """把 OneBot 的 message 拆成 (纯文本, 是否 @ 了机器人)。
+
+    数组形式（OneBot 11 主流）：text 段拼成指令文本，at 段拿 qq 与自己对；
+    字符串形式（老协议）：剥掉 [CQ:at,qq=…] 再比对。
+    图片 / 表情 / 回复引用等段一律忽略 —— 它们不能混进指令文本里。
+    """
+    sid = str(self_id or "")
+    if isinstance(raw, list):
+        out, at_me = [], False
+        for seg in raw:
+            if not isinstance(seg, dict):
+                continue
+            data = seg.get("data") or {}
+            if seg.get("type") == "text":
+                out.append(str(data.get("text") or ""))
+            elif seg.get("type") == "at" and sid and str(data.get("qq") or "") == sid:
+                at_me = True
+        return "".join(out).strip(), at_me
+    text = str(raw or "")
+    at_me = bool(sid) and any(m.group(1) == sid for m in _CQ_AT.finditer(text))
+    return _CQ_AT.sub("", text).strip(), at_me
 
 
 def _make_frame(opcode, payload, mask):
@@ -324,12 +359,20 @@ class OneBotClient:
         finally:
             self._conn = None
 
-    def send_active(self, channel, target_id, text):
-        """主动发送（供世界状态监控推送）：直接走 OneBot API（send_group_msg / send_private_msg）。"""
+    def send_active(self, channel, target_id, text, at_user=None):
+        """主动发送（供世界状态监控推送）：直接走 OneBot API（send_group_msg / send_private_msg）。
+
+        at_user：开监控的人。给了就在群消息最前面 @ 他 —— 推送是他要的，
+        回到他头上；私聊没有 @ 概念，忽略。
+        """
         if self._conn is None or not target_id:
             return False
         if channel == "group":
-            action, params = "send_group_msg", {"group_id": target_id, "message": text}
+            message = text
+            if at_user:
+                message = [{"type": "at", "data": {"qq": str(at_user)}},
+                           {"type": "text", "data": {"text": str(text)}}]
+            action, params = "send_group_msg", {"group_id": target_id, "message": message}
         elif channel == "private":
             action, params = "send_private_msg", {"user_id": target_id, "message": text}
         else:
@@ -347,16 +390,16 @@ class OneBotClient:
             return  # 心跳 / 生命周期：无需回应
         if post_type != "message":
             return
-        text = msg.get("message", "")
-        if isinstance(text, list):   # OneBot 11 的 message 可能是数组（CQ 段）
-            text = "".join(
-                s.get("text", "") for s in text
-                if isinstance(s, dict) and s.get("type") == "text"
-            )
+        # @ 机器人 = 这句话是明确对着我说的：ctx.at_me 亮起来，qq_common 就允许
+        # 不带 D/XX/ 前缀；同时把发送者放进 ctx，回复和后续推送都 @ 他。
+        text, at_me = _parse_message(msg.get("message", ""), _bot_self_id(msg))
         if self.handler is None:
             return
+        ctx = dict(msg)
+        ctx["at_me"] = at_me
+        ctx["user_id"] = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
         try:
-            reply = self.handler(text, msg)
+            reply = self.handler(text, ctx)
         except Exception as e:
             reply = f"⚠️ 处理出错：{e}"
         if reply:
@@ -366,23 +409,27 @@ class OneBotClient:
         message_type = msg.get("message_type")
         pngs = list(getattr(reply, "pngs", None) or [])
         tail = str(getattr(reply, "tail", "") or "").strip()
-        if pngs:
-            # OneBot 11：message 传数组，图片用 base64://（免图床、免公网地址）
-            segs = []
-            for png in pngs[:4]:
-                try:
-                    segs.append({"type": "image", "data": {
-                        "file": "base64://" + base64.b64encode(png).decode("ascii")}})
-                except Exception:
-                    segs = []
-                    break
-            if segs and tail:
+        # 群聊回复一律 @ 提问的人（谁问的就回给谁）；私聊没有 @ 概念，不加
+        at_qq = str(msg.get("user_id") or "") if message_type == "group" else ""
+        head = [{"type": "at", "data": {"qq": at_qq}}] if at_qq else []
+        img_segs = []
+        for png in pngs[:4]:
+            try:
+                img_segs.append({"type": "image", "data": {
+                    "file": "base64://" + base64.b64encode(png).decode("ascii")}})
+            except Exception:
+                img_segs = []
+                break
+        if img_segs:
+            segs = head + img_segs
+            if tail:
                 # 同一条消息里，图片段后跟可复制的 /w 指令文本段
                 segs.append({"type": "text", "data": {"text": tail}})
-            params = ({"message": segs} if segs
-                      else {"message": str(reply) + (("\n" + tail) if tail else "")})
+            params = {"message": segs}
         else:
-            params = {"message": reply}
+            # 纯文本仍发单个字符串（老客户端 / 老实现都认），@ 用 CQ 码前缀带出去
+            body = str(reply) + (("\n" + tail) if tail else "")
+            params = {"message": (f"[CQ:at,qq={at_qq}] " if at_qq else "") + body}
         if message_type == "group":
             params["group_id"] = msg.get("group_id")
             action = "send_group_msg"

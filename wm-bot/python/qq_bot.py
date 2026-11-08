@@ -14,7 +14,7 @@ qq_bot.py — WM→QQ 机器人统一入口
 
 群白名单（两种后端通用）：
   - 默认【不监控任何群】。只有 data/groups.txt 里写进的群号 / 群 OpenID，才被监听；
-  - 白名单群内，仅当消息以 /wm（物品）或 /zk（紫卡）开头时才回复（不刷屏）；
+  - 白名单群内，指令需带 D/XX/ 前缀（或直接 @机器人）才回复，避免群聊误触发；
   - 私聊不受白名单限制（一对一，无刷屏风险），照常响应 WM/ZK 查询。
 
 消息规则：触发词 WM / ZK（带不带斜杠均可，大小写不敏感）、/报错（强制刷新）、/查询；
@@ -64,6 +64,10 @@ def _run_onebot():
               "（发「主推状态」可查看）", file=sys.stderr)
     if saved_f:
         print(f"[qq_bot] 已恢复 {saved_f} 个会话的裂缝过滤条件", file=sys.stderr)
+    # 恢复「监控是谁开的」：之后这个会话的推送会 @ 他
+    saved_a = ws_monitor.load_at_users()
+    if saved_a:
+        print(f"[qq_bot] 已恢复 {saved_a} 个会话的监控发起人", file=sys.stderr)
     auto_n = ws_monitor.auto_start_priority(allowed if not allow_all else ())
     if auto_n:
         print(f"[qq_bot] WS_AUTO_PRIORITY 已开启：{auto_n} 个白名单群自动主推 "
