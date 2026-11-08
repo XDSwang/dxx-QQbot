@@ -2,6 +2,17 @@
 # run.py 的配置模板 —— 复制成同目录的 update.cfg 再填（update.cfg 不进 git）
 # 服务端只需要跑一条命令：python run.py
 # ============================================================
+# 【重要】三条安全前提，不要跳过：
+#  1. 这个仓库必须新建一个独立的 Private 仓库。不要复用现有的公开图床仓库
+#     （WM_QQ_MD_GITHUB_REPO / WM_QQ_MD_IMAGE_URL 那一套，为了 raw 链接能被 QQ
+#      客户端加载通常是公开的）—— 复用等于把 AppSecret、群 openid、谁开了监控
+#      这些运行数据放进公开仓库。
+#  2. 私有地址上的 config.txt 保持模板状态：WM_QQ_APPID / WM_QQ_SECRET 等留空。
+#     真实值只放服务端 python/data/config.txt，由 structure 模式自动保留。
+#     GitHub 有 secret scanning，往仓库文件里写 token 可能被自动吊销。
+#  3. 图床 token 与更新器 PAT 分开：前者写公开图床仓库，后者只给这个私有仓库的
+#     Contents 读（不回写时）或读写权限；用 fine-grained PAT，别用 classic PAT。
+# ============================================================
 
 # 私有地址后端：github（推荐，私有仓库）/ local（本地目录；测试或内网挂载用）
 UPDATER_BACKEND = github
