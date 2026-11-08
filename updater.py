@@ -53,12 +53,14 @@ SCHEMA_PATH = HERE / "wm-bot" / "python" / "schema.json"
 SIGNAL_RE = re.compile(r"^run(\d+)$")
 POLL_SECONDS = 10
 HOST_GAP_SECONDS = 3.5                           # 写死：落在规范的 3~5 秒区间内
+PACE_EXEMPT_HOSTS = ("localhost", "127.0.0.1", "::1")   # 规范 1.8：只有自己的地址豁免
+GIT_NET_COMMANDS = ("fetch", "push", "clone", "ls-remote", "pull")
 GITHUB_API = "https://api.github.com"
 GITEE_API = "https://gitee.com/api/v5"
 DATA_ANOMALY = "数据拉取异常"           # 主库与备用库全失败的统一报告用语
 FAILOVER_MAX_ATTEMPTS = 3                 # 规范 1.1：静默重试最多 3 轮
 FAILOVER_WINDOW = 5.0                    # 单轮超 5 秒视为窗口过长，回到第一步重拉
-GIT_SYNC_TIMEOUT = 60                     # git 拷贝两个接口时单条指令的超时
+GIT_SYNC_TIMEOUT = 20                     # 网络 IO 超时：超时明确报错，不是静默等待（规范 1.2）
 CONFIG_KV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
@@ -90,6 +92,32 @@ def elog(msg, extra=""):
 _PACE_LOCK = threading.Lock()
 
 
+def normalize_host(value):
+    """把任意 GIT 地址 / 裸域名归一到同一个节流 key；本地路径返回空串。
+
+    同一域名含子域：api.github.com 与 github.com 归到 github.com；
+    git@gitee.com:owner/repo.git 与 https://gitee.com/... 归到 gitee.com。
+    由公共层统一提供，各模块不要自己切字符串。
+    """
+    s = (value or "").strip()
+    if not s:
+        return ""
+    if re.match(r"^[A-Za-z]:[\\/]", s) or s.startswith(("/", ".", "~")):
+        return ""          # 本地文件系统路径不是地址访问，不排队
+    if "://" in s:
+        host = urllib.parse.urlparse(s).netloc.split("@")[-1].split(":")[0]
+    elif "@" in s and ":" in s:
+        host = s.split("@", 1)[1].split(":", 1)[0]
+    else:
+        host = s.split("/")[0].split(":")[0]
+    host = host.lower().rstrip(".")
+    for prefix in ("api.", "www.", "git."):
+        if host.startswith(prefix) and len(host) > len(prefix):
+            host = host[len(prefix):]
+            break
+    return host
+
+
 def _read_json(path, fallback):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -104,19 +132,58 @@ def _atomic_write(path, text):
     os.replace(str(tmp), str(path))
 
 
+def _pace_lock_path():
+    """闸门锁与节流状态同目录同前缀，由统一入口推导，不各模块自己起名。"""
+    return PACE_FILE.with_name(PACE_FILE.name + ".lock")
+
+
+def _hold_pace_lock(f):
+    """跨进程互斥：避免两个进程读到同一个 last 后同时放行（规范 1.8）。"""
+    f.seek(0, os.SEEK_END)
+    if f.tell() == 0:
+        f.write(b"0")
+        f.flush()
+    f.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        for _ in range(3):          # 规范 1.1：静默重试最多 3 次
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                time.sleep(1)
+        return False
+    import fcntl
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    return True
+
+
 def pace_gate(host):
-    """同一 host 连续访问前过闸：不足 3.5 秒就补齐，状态落盘跨进程共享。"""
+    """同一 host 连续访问前过闸：不足 3.5 秒就补齐，状态落盘跨进程共享。
+
+    host 可以传完整 GIT 地址或裸域名；统一由 normalize_host 归一，别各自计时。
+    线程锁管同进程并发，OS 文件锁管跨进程并发，两者共用同一份落盘状态。
+    """
+    key = normalize_host(host)
+    if not key or key in PACE_EXEMPT_HOSTS:
+        return
     with _PACE_LOCK:
-        state = _read_json(PACE_FILE, {})
-        last = float(state.get(host, 0) or 0)
-        wait = HOST_GAP_SECONDS - (time.time() - last)
-        if wait > 0:
-            time.sleep(wait)
-        state[host] = time.time()
-        try:
-            _atomic_write(PACE_FILE, json.dumps(state, ensure_ascii=False))
-        except Exception as e:
-            elog("节流状态落盘失败", str(e))
+        lock_path = _pace_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(lock_path), "a+b") as lf:
+            if not _hold_pace_lock(lf):
+                elog("同域名闸门跨进程锁未拿到",
+                     "仍按落盘状态排队，不跳过间隔")
+            state = _read_json(PACE_FILE, {})
+            last = float(state.get(key, 0) or 0)
+            wait = HOST_GAP_SECONDS - (time.time() - last)
+            if wait > 0:
+                time.sleep(wait)
+            state[key] = time.time()
+            try:
+                _atomic_write(PACE_FILE, json.dumps(state, ensure_ascii=False))
+            except Exception as e:
+                elog("节流状态落盘失败", str(e))
 
 
 # ------------------------------ 信号与状态 ------------------------------
@@ -386,7 +453,6 @@ class GitRepoStore(object):
         """把本源最新 commit 拉到专用 ref；不写 FETCH_HEAD，不干扰判断层。"""
         if not self._ensure():
             raise RuntimeError("GIT 数据镜像不可用")
-        pace_gate(self._host())
         code, out, err = git_cmd(
             ["fetch", "--no-tags", "-f", self.url,
              "%s:%s" % (self.branch, self.base_ref)], cwd=self.mirror)
@@ -434,7 +500,6 @@ class GitRepoStore(object):
                 cwd=self.mirror)
             if code != 0 or not commit:
                 raise RuntimeError("GIT 建提交失败：%s" % (err or "")[:200])
-            pace_gate(self._host())
             code, out, err = git_cmd(
                 ["push", self.url, "%s:refs/heads/%s" % (commit, self.branch)],
                 cwd=self.mirror)
@@ -499,8 +564,8 @@ def make_store(cfg, service=None):
         return LocalStore(root)
     if kind in ("database", "http", "api"):
         raise NotImplementedError(
-            "数据后端 %s 尚未实现：请按 Store 接口加适配器，"
-            "请按 Store 接口加适配器并在 make_store 里注册" % kind)
+            "数据后端 %s 尚未实现：请按 Store 接口加适配器并在 make_store 里注册"
+            % kind)
     raise ValueError("未知的 UPDATER_BACKEND: %s" % kind)
 
 
@@ -594,12 +659,32 @@ def make_store_chain(cfg, service=None):
 
 
 # --------------------- GIT 双源拷贝：更新判断 ---------------------
+def _git_net_url(args):
+    """从网络 git 指令里取出目标地址；本地指令返回 None（不排队）。"""
+    if not args or str(args[0]) not in GIT_NET_COMMANDS:
+        return None
+    for a in list(args)[1:]:
+        s = str(a)
+        if s.startswith("-"):
+            continue
+        if "://" in s:
+            return s
+        if "@" in s and ":" in s and s.index("@") < s.index(":"):
+            return s
+    return None
+
+
 def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
     """跑一条 git 指令，返回 (returncode, stdout, stderr)；失败不抛，交给编排层判。
 
     env 供 GIT_INDEX_FILE 这类只影响单次调用的 plumbing 变量使用；
     strip=False 用于 git show 取文件内容，保留首尾空白与末尾换行。
+    fetch / push / clone / pull 都是地址访问：统一在这里自动过同域名闸门，
+    调用点不必各自记得 pace_gate，判断层 / 代码同步 / 数据读写都不会漏。
     """
+    url = _git_net_url(args)
+    if url:
+        pace_gate(url)
     try:
         run_env = None
         if env:
@@ -691,15 +776,18 @@ class GitSignalStore(object):
              % (self.state_key, len(found), best["label"], best["sha"][:8]))
         return best
 
-    def signal(self):
-        best = self.sync()
-        if best is None:
+    def signal_from(self, base, state_key):
+        """用本轮已拷好的结果派生某个服务的 Signal：一轮只拷一次，不重复 fetch。"""
+        if base is None:
             return Signal("(git-sync-failed)", "none", False)
-        prev = load_state(self.state_key).get("last_signal")
-        changed = best["sha"] != prev
+        prev = load_state(state_key).get("last_signal")
+        changed = base["sha"] != prev
         if not changed:
-            flog("[%s] 拷贝没有内容更新，本轮不用更新" % self.state_key)
-        return Signal("git:" + best["label"], best["sha"], changed)
+            flog("[%s] 拷贝没有内容更新，本轮不用更新" % state_key)
+        return Signal("git:" + base["label"], base["sha"], changed)
+
+    def signal(self):
+        return self.signal_from(self.sync(), self.state_key)
 
     def signals(self):
         best = self.last or self.sync()
@@ -718,6 +806,40 @@ def make_signal_store(cfg, service=None, chain=None):
     chain 传入时，选中的接口同步成为数据后端活跃源。
     """
     return GitSignalStore(cfg, service, chain)
+
+
+class CodeSignalStore(GitSignalStore):
+    """盯公共仓库代码的版本：只看两个公共库源，状态与私有库信号完全分开。
+
+    为什么必须独立：私有库没有新提交时，数据信号会一直报「不用更新」；
+    但用户修 bug 只 push 公共库代码，手机也必须自动同步（无人值守的根诉求）。
+    """
+
+    def __init__(self, cfg):
+        GitSignalStore.__init__(self, cfg, service="__code__")
+        self.branch = (cfg.get("UPDATER_CODE_BRANCH") or "main").strip()
+
+    def sources(self):
+        pairs = [("主库(GitHub)", self.cfg.get("UPDATER_CODE_REPO")),
+                 ("备用库(Gitee)", self.cfg.get("UPDATER_CODE_REPO_BACKUP"))]
+        return [(label, (url or "").strip())
+                for label, url in pairs if (url or "").strip()]
+
+
+def make_code_signal_store(cfg):
+    """配了公共库地址才启用代码版本轮询；没配就保持旧行为（只在启动时同步）。"""
+    for key in ("UPDATER_CODE_REPO", "UPDATER_CODE_REPO_BACKUP"):
+        if (cfg.get(key) or "").strip():
+            return CodeSignalStore(cfg)
+    return None
+
+
+def derive_signal(store, base, state_key):
+    """一轮只拷一次：把本轮拷贝结果派生给各服务；旧 Store 仍走自己的 signal()。"""
+    fn = getattr(store, "signal_from", None)
+    if fn is not None:
+        return fn(base, state_key)
+    return store.signal()
 
 
 def claim_owner(store, instance_id, service=None):

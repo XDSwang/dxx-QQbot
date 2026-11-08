@@ -65,6 +65,7 @@ class _Base(unittest.TestCase):
         # 离线测试：默认禁掉真实 git 拷贝（GitSignalStore 走模块级 git_cmd）
         p3 = mock.patch.object(updater, "git_cmd",
                                return_value=(1, "", "offline-test: git disabled"))
+        self._git_cmd_patch = p3
         p1.start()
         p2.start()
         p3.start()
@@ -1412,6 +1413,208 @@ class TestGitRepoStore(_Base):
              mock.patch.object(updater, "pace_gate"):
             with self.assertRaises(RuntimeError):
                 store.write("runtime.json", "{}")
+
+
+
+class TestUnattended(_Base):
+    """无人值守回归：只 push 代码也更新、失败能自愈、GIT 全过闸、崩溃/残留锁不致死。"""
+
+    def test_code_signal_store_only_watches_public_repos(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_CODE_REPO": "https://example.com/owner/public.git",
+                    "UPDATER_CODE_REPO_BACKUP": "git@example.com:owner/public.git",
+                    "UPDATER_CODE_BRANCH": "dev",
+                    "UPDATER_DATA_REPO": "https://example.com/owner/private.git"})
+        store = updater.make_code_signal_store(cfg)
+        self.assertIsInstance(store, updater.CodeSignalStore)
+        self.assertEqual(store.state_key, "__code__", "代码指纹不能污染私有库指纹")
+        self.assertEqual(store.branch, "dev")
+        urls = [u for _, u in store.sources()]
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(all("public.git" in u for u in urls))
+        self.assertIsNone(updater.make_code_signal_store(dict(run.DEFAULTS)),
+                          "没配公共库地址就保持旧行为")
+
+    def test_code_only_push_triggers_update_without_private_change(self):
+        """V1：私有库完全没动，只 push 公共库代码，手机也必须自动同步并迁移。"""
+        (self.root / "update.cfg").write_text("UPDATER_BACKEND = local\n",
+                                              encoding="utf-8")
+        manifest = self.root / "services.json"
+        manifest.write_text(json.dumps({"services": [
+            {"name": "wm-bot", "entry": "wm-bot/python/qq_bot.py",
+             "cwd": "wm-bot", "data_dir": "wm-bot/python/data",
+             "config_file": "config.txt", "runtime_files": ["state.json"],
+             "remote_path": "wm-bot"}]}), encoding="utf-8")
+        rd = self.remote / "wm-bot"
+        rd.mkdir(parents=True, exist_ok=True)
+        for n, t in (("config.txt", "K = \n"), ("schema.json", "{}"),
+                     ("runtime.json", "{}")):
+            (rd / n).write_text(t, encoding="utf-8")
+        (self.root / "wm-bot" / "python" / "data").mkdir(parents=True,
+                                                         exist_ok=True)
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
+                    "UPDATER_PUSH_RUNTIME": "0",
+                    "UPDATER_CODE_REPO": "https://example.com/owner/public.git"})
+        bot = FakeBot()
+        fake_code = mock.Mock()
+        fake_code.signal.return_value = updater.Signal("code:主库", "NEWCODE", True)
+        with mock.patch.object(run, "load_cfg", return_value=cfg), \
+             mock.patch.object(run, "SERVICES_FILE", manifest), \
+             mock.patch.object(run, "BotProcess", return_value=bot), \
+             mock.patch.object(run, "git_pull", return_value=(True, "mock")) as gp, \
+             mock.patch.object(updater, "make_code_signal_store",
+                               return_value=fake_code), \
+             mock.patch.object(run.time, "sleep",
+                               side_effect=[None, KeyboardInterrupt]), \
+             mock.patch("builtins.print"):
+            rc = run.main()
+        self.assertEqual(rc, 0)
+        gp.assert_called_once_with(cfg)
+        self.assertEqual(bot.started, 2, "代码更新必须停服务、迁移、再拉起")
+        self.assertEqual(updater.load_state("__code__")["last_signal"], "NEWCODE")
+
+    def test_failed_signal_window_allows_retry_then_backs_off(self):
+        """V2：失败后网络恢复但远端没新提交，也要在窗口过后自动重试。"""
+        sig = updater.Signal("git", "BAD", True)
+        with mock.patch.object(run.time, "time", return_value=1000.0):
+            run.mark_failed(sig, "wm-bot")
+        st = updater.load_state("wm-bot")
+        self.assertEqual(st["failed_rounds"], 1)
+        self.assertTrue(run._blocked_by_failure(st, "BAD", now=1001.0))
+        self.assertFalse(run._blocked_by_failure(
+            st, "BAD", now=1000.0 + run.FAILED_RETRY_SECONDS + 1),
+            "窗口过后必须重新给机会，不能永久卡死")
+        st["failed_rounds"] = run.FAILED_MAX_ROUNDS
+        self.assertTrue(run._blocked_by_failure(
+            st, "BAD", now=1000.0 + run.FAILED_RETRY_SECONDS + 1),
+            "3 轮用尽后进入长退避，不无限静默轰炸")
+        self.assertFalse(run._blocked_by_failure(
+            st, "BAD", now=1000.0 + run.FAILED_LONG_PAUSE_SECONDS + 1))
+        self.assertFalse(run._blocked_by_failure(st, "OTHER", now=1001.0))
+
+    def test_normalize_host_merges_subdomains_and_exempts_local(self):
+        """V3：同一域名的各种写法归到同一个闸门 key。"""
+        self.assertEqual(
+            updater.normalize_host("https://api.github.com/repos/x"),
+            updater.normalize_host("https://github.com/me/repo.git"))
+        self.assertEqual(
+            updater.normalize_host("git@gitee.com:me/repo.git"),
+            updater.normalize_host("https://gitee.com/api/v5/x"))
+        self.assertEqual(updater.normalize_host(""), "")
+        self.assertEqual(updater.normalize_host(r"C://tmp//remote.git"), "",
+                         "本地文件系统路径不是地址访问")
+        self.assertEqual(updater.normalize_host("/tmp/remote.git"), "")
+        self.assertIn("localhost", updater.PACE_EXEMPT_HOSTS)
+
+    def test_git_cmd_auto_paces_only_network_commands(self):
+        """V3：fetch / push 自动过闸，本地 show 不排队。"""
+        # 本类默认把 git_cmd 整个 mock 掉（离线测试禁联网）；这里临时恢复真实函数，
+        # 只把底层 subprocess.run 换成假对象，才能验证闸门这一层。
+        self._git_cmd_patch.stop()
+        try:
+            with mock.patch.object(updater, "pace_gate") as gate, \
+                 mock.patch.object(updater.subprocess, "run") as sp:
+                sp.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                updater.git_cmd(["fetch", "--no-tags",
+                                 "https://github.com/me/p.git", "main"])
+                updater.git_cmd(["push", "git@gitee.com:me/p.git",
+                                 "C:refs/heads/main"])
+                updater.git_cmd(["show", "refs/updater/x:services/config.txt"])
+        finally:
+            self._git_cmd_patch.start()
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(updater.normalize_host(gate.call_args_list[0][0][0]),
+                         "github.com")
+        self.assertEqual(updater.normalize_host(gate.call_args_list[1][0][0]),
+                         "gitee.com")
+
+    def test_git_pull_fetches_configured_url_for_pacing(self):
+        """V3：代码同步主库用真实地址，不再写死 origin 让闸门没法归一。"""
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if args[0] == "fetch":
+                return 0, "", ""
+            if args[0] == "rev-parse":
+                return 0, "AAA111", ""
+            if args[0] == "log":
+                return 0, ("900" if args[-1] == "HEAD" else "100"), ""
+            return 0, "", ""
+
+        cfg = dict(run.DEFAULTS)
+        cfg["UPDATER_CODE_REPO"] = "https://example.com/owner/public.git"
+        with mock.patch.object(run, "_git", side_effect=fake):
+            ok, info = run.git_pull(cfg)
+        self.assertTrue(ok)
+        fetches = [c for c in calls if c[0] == "fetch"]
+        self.assertIn("https://example.com/owner/public.git", fetches[0])
+
+    def test_derive_signal_reuses_one_copy_for_all_services(self):
+        """V6：同一轮拷贝结果派生给所有服务，不再每个服务各 fetch 一遍。"""
+        store = updater.GitSignalStore(
+            {"UPDATER_DATA_REPO": "https://example.com/me/p.git",
+             "UPDATER_DATA_BRANCH": "main"})
+        base = {"label": "主库", "sha": "AAA111", "ts": 100, "index": 0}
+        with mock.patch.object(store, "sync",
+                               side_effect=AssertionError("不该再 fetch")):
+            sig = updater.derive_signal(store, base, "wm-bot")
+        self.assertEqual(sig.fingerprint, "AAA111")
+        self.assertTrue(sig.need_update)
+        (self.remote / "run1").write_text("1", encoding="utf-8")
+        self.assertTrue(
+            updater.derive_signal(updater.LocalStore(self.remote),
+                                  None, "wm-bot").need_update,
+            "旧 Store 仍走自己的 signal()")
+
+    def test_crash_budget_resets_on_window_and_code_update(self):
+        """V4：窗口过期或代码更新后重新给 3 次机会，不是永久不再拉起。"""
+        ok, count, _ = run.next_crash_budget(0, 100.0, 101.0)
+        self.assertTrue(ok)
+        self.assertEqual(count, 1)
+        ok, _, _ = run.next_crash_budget(3, 100.0, 102.0)
+        self.assertFalse(ok, "窗口内第 4 次必须被拦下")
+        ok, count, _ = run.next_crash_budget(
+            3, 100.0, 100.0 + run.CRASH_WINDOW_SECONDS + 1)
+        self.assertTrue(ok)
+        self.assertEqual(count, 1)
+        ok, count, _ = run.next_crash_budget(
+            9, 100.0, 101.0, code_updated=True)
+        self.assertTrue(ok)
+        self.assertEqual(count, 1, "修复推上来后崩溃预算立刻清零")
+
+    def test_second_instance_is_rejected_until_lock_is_released(self):
+        """V5：OS 文件锁判单实例，残留锁不会因 pid 复用误拒启动。"""
+        self.addCleanup(run.release_lock)
+        self.assertTrue(run.acquire_lock())
+        self.assertFalse(run.acquire_lock(), "第二个实例必须被拦下")
+        run.release_lock()
+        self.assertTrue(run.acquire_lock(), "锁释放后可以重新启动")
+        run.release_lock()
+
+    def test_bootstrap_pace_shares_state_with_updater(self):
+        """V3：启动器 clone / pull 与长期运行共用同一份落盘节流状态。"""
+        import importlib.util
+        bs_path = (Path(__file__).resolve().parent.parent
+                   / "dxx_private_data" / "bootstrap.py")
+        spec = importlib.util.spec_from_file_location("bs_under_test", str(bs_path))
+        bs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bs)
+        self.assertEqual(bs.normalize_host("git@gitee.com:me/p.git"),
+                         updater.normalize_host("git@gitee.com:me/p.git"))
+        dest = self.root / "public"
+        with mock.patch.object(bs.time, "sleep") as slp:
+            bs._pace("https://github.com/me/a.git", dest)
+            bs._pace("https://api.github.com/me/b.git", dest)
+        pf = dest / "data" / "updater_pace.json"
+        self.assertTrue(pf.exists())
+        state = json.loads(pf.read_text(encoding="utf-8"))
+        self.assertEqual(list(state), ["github.com"],
+                         "github.com 与 api.github.com 归到同一个 key")
+        self.assertEqual(slp.call_count, 1, "第二次同域名访问被补齐间隔")
 
 
 if __name__ == "__main__":

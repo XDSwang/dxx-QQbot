@@ -78,8 +78,13 @@ DEFAULTS = {
 }
 
 STOP_WAIT_SECONDS = 3       # 规范 1.2 单次等待缺省 3 秒
-GIT_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = updater.GIT_SYNC_TIMEOUT
 MAX_CRASH_RESTART = 3       # 规范 1.1 静默重试最多 3 次
+FAILED_RETRY_SECONDS = 300          # 失败版本重新给机会的时间窗口
+FAILED_MAX_ROUNDS = 3               # 一个窗口内最多 3 轮，守住规范 1.1
+FAILED_LONG_PAUSE_SECONDS = 3600    # 3 轮全失败后的长退避，不无限静默轰炸
+CRASH_WINDOW_SECONDS = 3600         # 崩溃重启预算的时间窗口
+CODE_CHECK_EVERY = 6                # 公共库版本检查降频：约 1 分钟一轮
 SELF_FILES = (HERE / "run.py", HERE / "updater.py", HERE / "services.json")
 
 
@@ -157,26 +162,64 @@ def _pid_alive(pid):
         return False
 
 
+_LOCK_HANDLE = None
+
+
+def _lock_fd(f):
+    """OS 级非阻塞文件锁：进程被杀 / 手机重启由系统自动释放，pid 复用不会误判。"""
+    if os.name == "nt":
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 def acquire_lock():
-    """单实例锁：残留锁不算有效凭证，先确认 pid 不存活才清场覆盖（规范 1.5）。"""
+    """单实例锁：靠 OS 文件锁判定，残留锁不算有效凭证（规范 1.5）。
+
+    旧版只写 pid，手机重启后 pid 被别的进程复用会误拒启动；现在锁由系统持有，
+    进程一退出就自动释放，锁文件本身保留作握手载体、每次启动覆盖内容。
+    """
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        updater.elog("已有统一 RUN 在运行",
+                     "本进程已持有实例锁；不要开第二个 run.py")
+        return False
     updater.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if updater.LOCK_FILE.exists():
-        raw = updater.LOCK_FILE.read_text(encoding="utf-8").strip()
-        if raw.isdigit() and _pid_alive(raw):
-            updater.elog("已有统一 RUN 在运行", "pid=%s；不要开第二个 run.py" % raw)
-            return False
-        updater.LOCK_FILE.unlink()
-    updater._atomic_write(updater.LOCK_FILE, str(os.getpid()))
+    f = open(str(updater.LOCK_FILE), "a+b")
+    try:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            f.write(b"0")
+            f.flush()
+        f.seek(0)
+        _lock_fd(f)
+    except Exception as e:
+        f.close()
+        updater.elog("已有统一 RUN 在运行",
+                     "文件锁被占用：%s；不要开第二个 run.py" % e)
+        return False
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()).encode("ascii"))
+    f.flush()
+    _LOCK_HANDLE = f
     atexit.register(release_lock)
     return True
 
 
 def release_lock():
-    try:
-        if updater.LOCK_FILE.exists():
-            updater.LOCK_FILE.unlink()
-    except Exception as e:
-        updater.elog("清理实例锁失败", str(e))
+    """只释放 OS 锁；文件保留，避免「删文件 + 另一个进程等锁」的竞态。"""
+    global _LOCK_HANDLE
+    f = _LOCK_HANDLE
+    _LOCK_HANDLE = None
+    if f is not None:
+        try:
+            f.close()
+        except Exception as e:
+            updater.elog("释放实例锁失败", str(e))
 
 
 class BotProcess(object):
@@ -229,20 +272,46 @@ def _console(msg):
 
 
 def mark_failed(sig, service=None):
-    """失败版本落盘：同一版本不再每 10 秒重试（私有库有新提交才会重试）。"""
+    """失败版本落盘：同一版本一个窗口内最多 3 轮，窗口过后重新给机会。
+
+    旧版「私有库有新提交才会重试」在无人值守下等于永久卡死：网络恢复但远端
+    没有新 commit 时，每轮都会跳过，永远不会自愈。
+    """
     st = updater.load_state(service)
-    st["failed_signal"] = sig.fingerprint
-    st["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    same = st.get("failed_signal") == sig.fingerprint
+    st.update({
+        "failed_signal": sig.fingerprint,
+        "failed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "failed_at_epoch": time.time(),
+        "failed_rounds": (int(st.get("failed_rounds") or 0) + 1) if same else 1,
+    })
     updater.save_state(st, service)
 
 
+def _blocked_by_failure(st, fingerprint, now=None):
+    """失败版本是否仍在退避窗口内；3 轮用尽后长退避，之后重新给机会。"""
+    if st.get("failed_signal") != fingerprint:
+        return False
+    now = time.time() if now is None else now
+    last = float(st.get("failed_at_epoch") or 0)
+    rounds = int(st.get("failed_rounds") or 0)
+    if rounds >= FAILED_MAX_ROUNDS and now - last < FAILED_LONG_PAUSE_SECONDS:
+        return True
+    return (now - last) < FAILED_RETRY_SECONDS
+
+
+def next_crash_budget(count, since, now, code_updated=False,
+                      limit=MAX_CRASH_RESTART, window=CRASH_WINDOW_SECONDS):
+    """崩溃重启预算：窗口内最多 limit 次；窗口过期或代码更新后重新给机会。"""
+    if code_updated or now - since >= window:
+        count, since = 0, now
+    count += 1
+    return count <= limit, count, since
+
+
 def _git(args, timeout=GIT_TIMEOUT_SECONDS):
-    try:
-        r = subprocess.run(["git"] + list(args), cwd=str(HERE),
-                           capture_output=True, text=True, timeout=timeout)
-        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
-    except Exception as e:
-        return 1, "", str(e)
+    """统一走公共层 git_cmd：网络指令自动过同域名闸门，不在这里另开一条路。"""
+    return updater.git_cmd(args, cwd=HERE, timeout=timeout)
 
 
 def preflight(cfg, store, services=None, service_stores=None,
@@ -390,7 +459,12 @@ def git_pull(cfg):
     if _off(cfg.get("UPDATER_GIT_PULL", "1")):
         return True, "已关闭"
     branch = (cfg.get("UPDATER_CODE_BRANCH") or "main").strip()
-    sources = [("主库(GitHub)", "origin")]
+    primary = (cfg.get("UPDATER_CODE_REPO") or "").strip()
+    if not primary:
+        # 老部署只配了 origin：把地址解析出来，节流闸门才能按 host 归一排队
+        _, primary, _ = _git(["config", "--get", "remote.origin.url"])
+        primary = (primary or "").strip()
+    sources = [("主库(GitHub)", primary or "origin")]
     backup = (cfg.get("UPDATER_CODE_REPO_BACKUP") or "").strip()
     if not _off(cfg.get("UPDATER_FAILOVER", "1")) and backup:
         sources.append(("备用库(Gitee)", backup))
@@ -441,7 +515,7 @@ def sync_code(cfg):
              "user.email=bootstrap@localhost", "commit", "-m",
              "bootstrap: 拷贝来的本地版本"],
             ["remote", "add", "origin", repo],
-            ["fetch", "origin", branch],
+            ["fetch", repo, branch],
         ]
         for args in steps:
             c, o, e = _git(args, timeout=120)
@@ -551,7 +625,8 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
         st.update({"last_signal": sig.fingerprint, "signal_name": sig.name,
                    "schema_version": schema.get("version"),
                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                   "failed_signal": ""})
+                   "failed_signal": "", "failed_rounds": 0,
+                   "failed_at_epoch": 0})
         updater.save_state(st, service)
         updater.flog("[%s] 更新完成：配置 新增=%d 删除=%d 保留=%d；"
                      "运行数据 改名=%d 删除=%d 补默认=%d；未解析=%s"
@@ -628,6 +703,8 @@ def main():
         signal_stores = {s.name: updater.make_signal_store(
             cfg, s.remote_path, chain=service_stores[s.name])
             for s in services}
+        # 代码版本必须独立盯：只 push 公共库、私有库没动，也要能自动更新
+        code_signals = updater.make_code_signal_store(cfg)
     except Exception as e:
         _console("[fatal] 启动装配失败：%s" % e)
         updater.elog("启动装配失败", str(e))
@@ -655,57 +732,105 @@ def main():
         b.start()
     self_fp = self_fingerprint()
     crashes = {s.name: 0 for s in services}
+    crash_since = {s.name: time.time() for s in services}
     applied_cfg_hash = {}        # 各服务私有库 config 的上次哈希；变了就热更新
+    tick = 0
+    code_updated = False
     try:
         while True:
             time.sleep(poll)
+            tick += 1
+            now = time.time()
             for name, b in bots.items():
                 if b.alive():
                     crashes[name] = 0
                     continue
-                crashes[name] += 1
-                if crashes[name] > MAX_CRASH_RESTART:
-                    # 规范 1.1：静默重试耗尽就停下并如实提示，不无限自动拉起
+                allowed, crashes[name], crash_since[name] = next_crash_budget(
+                    crashes[name], crash_since[name], now, code_updated)
+                if not allowed:
+                    # 规范 1.1：停下并如实提示；窗口过期 / 代码更新后会重新给机会
+                    updater.elog("[%s] 连续崩溃超过 %d 次，等待下一个重试窗口"
+                                 % (name, MAX_CRASH_RESTART),
+                                 "代码更新或窗口过期后自动重新拉起")
                     continue
                 updater.flog("[%s] 服务已退出，第 %d 次自动拉起" % (name, crashes[name]))
                 b.start()
-            # 全局信号：整仓库只 pull 一次，所有服务一起迁移
+            code_updated = False
+            # 本轮私有库只拷一次；各服务的信号由同一份结果派生，不再各拷一遍
             try:
-                gsig = root_signals.signal()
+                syncer = getattr(root_signals, "sync", None)
+                gbase = syncer() if syncer is not None else None
+                gsig = (root_signals.signal_from(gbase, "__global__")
+                        if syncer is not None else root_signals.signal())
             except Exception as e:
                 updater.elog("检查全局信号失败，本轮跳过", str(e))
-                gsig = None
+                gbase, gsig = None, None
             gst = updater.load_state("__global__")
             global_hit = (gsig is not None and gsig.need_update
                           and gsig.fingerprint != gst.get("last_signal")
-                          and gsig.fingerprint != gst.get("failed_signal"))
+                          and not _blocked_by_failure(gst, gsig.fingerprint))
+            # 公共库代码版本独立轮询：只 push 了代码、私有库没动也必须触发更新
+            code_sig = None
+            if code_signals is not None and (
+                    tick == 1 or tick % CODE_CHECK_EVERY == 0):
+                try:
+                    csig = code_signals.signal()
+                except Exception as e:
+                    updater.elog("检查公共库版本失败，本轮跳过", str(e))
+                    csig = None
+                cst = updater.load_state("__code__")
+                if (csig is not None and csig.need_update
+                        and csig.fingerprint != cst.get("last_signal")
+                        and not _blocked_by_failure(cst, csig.fingerprint)):
+                    code_sig = csig
             plan = []
+            target_key = None
+            trigger_sig = None
             if global_hit:
+                target_key, trigger_sig = "__global__", gsig
+            elif code_sig is not None:
+                target_key, trigger_sig = "__code__", code_sig
+            if target_key is not None:
+                # 整仓库只 pull 一次，所有服务一起迁移
                 ok, info = git_pull(cfg)
                 if not ok:
                     updater.elog("全局更新 git pull 失败，本轮作废", info)
-                    gst["failed_signal"] = gsig.fingerprint
-                    updater.save_state(gst, "__global__")
+                    mark_failed(trigger_sig, target_key)
                 else:
                     updater.flog("[global] git pull: %s" % (info or "无变更"))
-                    plan = [(s, service_stores[s.name], bots[s.name], gsig, False)
-                            for s in services]
-                    gst["last_signal"] = gsig.fingerprint
-                    updater.save_state(gst, "__global__")
+                    plan = [(s, service_stores[s.name], bots[s.name],
+                             trigger_sig, False) for s in services]
+                    st = updater.load_state(target_key)
+                    st.update({"last_signal": trigger_sig.fingerprint,
+                               "failed_signal": "", "failed_rounds": 0,
+                               "failed_at_epoch": 0})
+                    updater.save_state(st, target_key)
+                    if code_sig is not None and target_key != "__code__":
+                        # 两条信号同轮命中：代码版本也要记掉，别在下一轮又触发一次
+                        cst = updater.load_state("__code__")
+                        cst.update({"last_signal": code_sig.fingerprint,
+                                    "failed_signal": "", "failed_rounds": 0,
+                                    "failed_at_epoch": 0})
+                        updater.save_state(cst, "__code__")
+                    code_updated = True       # 修复推上来了，崩溃预算立刻清零
+                    for n in crashes:
+                        crashes[n] = 0
+                        crash_since[n] = now
             # 各服务独立信号：只更新被点名的那个，不惊动其他服务
             planned = {s.name for s, _, _, _, _ in plan}
             for s in services:
                 if s.name in planned:
                     continue
                 try:
-                    sig = signal_stores[s.name].signal()
+                    sig = updater.derive_signal(signal_stores[s.name],
+                                                gbase, s.name)
                 except Exception as e:
                     updater.elog("[%s] 检查信号失败，本轮跳过" % s.name, str(e))
                     continue
                 st = updater.load_state(s.name)
                 if (not sig.need_update
                         or sig.fingerprint == st.get("last_signal")
-                        or sig.fingerprint == st.get("failed_signal")):
+                        or _blocked_by_failure(st, sig.fingerprint)):
                     continue
                 plan.append((s, service_stores[s.name], bots[s.name], sig, True))
             for s, store, bot, sig, pull in plan:
