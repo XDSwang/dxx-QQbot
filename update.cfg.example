@@ -1,0 +1,93 @@
+# ============================================================
+# 仓库根目录【优先配置】—— 复制成同目录的 update.cfg 再填（update.cfg 不进 git）
+#
+# run.py 启动第一件事就是读这个文件：读不到 / 数据后端没配好，不会启动任何服务。
+# 公共仓库才是本体（代码 + services.json 服务清单，能放任意服务端跑）；
+# 下面这一段配的是【数据后端】—— 授权信息、配置和运行记录本来该放数据库，
+# 现在没有数据库，用 GitHub 私有仓库的文件代替。以后换成数据库地址 /
+# 第三方数据接口，只改这一段，服务代码不用动。
+#
+# 服务端只需要一条命令：python run.py
+# ============================================================
+
+# ---------------- ① 数据后端（最先配） ----------------
+# github   = 用私有仓库文件当数据库（当前实现）
+# local    = 本地目录当数据后端（离线测试 / 内网挂载）
+# database / http = 以后接数据库 / 第三方数据接口，现在只留位，填了会明确报「未实现」
+UPDATER_BACKEND = github
+
+# 私有仓库：必须是【独立 Private 仓库】，不要复用公开图床仓库。
+# token 用 fine-grained PAT，只给这个仓库的 Contents 读写权限；只轮询不回写可给只读。
+UPDATER_GITHUB_REPO = 你的账号/私有仓库名
+UPDATER_GITHUB_TOKEN = github_pat_xxxxxxxx
+# 私有仓库里「所有服务数据」的根目录；每个服务再占一个子目录 <PATH>/<服务名>/
+UPDATER_GITHUB_PATH = services
+UPDATER_GITHUB_BRANCH = main
+# UPDATER_GITHUB_API = https://api.github.com
+
+# 以后接数据库 / 第三方接口时填这里（当前版本读了也只报「未实现」，不会假装能连）
+# UPDATER_DATA_URL = postgres://... 或 https://your-api/...
+# UPDATER_DATA_TOKEN =
+
+# local 后端才生效：目录里按服务名建子目录，各放 run0 / config.txt / schema.json / runtime.json
+UPDATER_LOCAL_DIR = remote
+
+# ---------------- ② 公共仓库本体（代码同步） ----------------
+# 首次把整个仓库拷到服务端时若没有 .git，run.py 会用它自动 git init + fetch + checkout；
+# 之后每轮 git pull --ff-only。公开仓库 pull 不需要凭证。
+UPDATER_CODE_REPO = https://github.com/XDSwang/dxx-QQbot.git
+UPDATER_CODE_BRANCH = main
+# 启动时先自动同步一次（把「拷贝来的旧版」拉到最新，必要时自动重启 RUN）
+UPDATER_SYNC_ON_START = 1
+
+# ---------------- ③ 本机跑哪些服务 ----------------
+# 留空 = services.json 里全部；填名字（逗号分隔）= 这台服务端只跑这几个。
+# 同一个公共仓库能放任意服务端跑，各自用自己这份 update.cfg。
+SERVICES_ENABLED =
+
+# ---------------- ④ 更新行为 ----------------
+UPDATER_POLL_SECONDS = 10
+UPDATER_GIT_PULL = 1
+# structure = 按云端结构增删字段但保留服务端本地的值（默认，安全）
+# overwrite = 整份照抄云端（只有云端放的是含密钥的完整副本时才用）
+UPDATER_CONFIG_MERGE = structure
+# 迁移完成后把「最新完整 + 旧数据迁移」结果回写数据后端。
+# 多台服务端同时跑同一个服务时建议设 0，避免互相覆盖同一份 runtime.json。
+UPDATER_PUSH_RUNTIME = 1
+
+# ============================================================
+# 数据后端（私有仓库）里的目录布局
+# ------------------------------------------------------------
+# services/                      ← UPDATER_GITHUB_PATH
+#   run0 / run1                 全局信号：改 run1 = 所有服务一起更新
+#   wm-bot/                     ← 服务名（services.json 里的 remote_path）
+#     run0 / run1               本服务信号：只更新这一个服务，不惊动别人
+#     config.txt                配置模板（密钥留空，服务端本地真实值会保留）
+#     schema.json               最新字段结构 + 改名/删除规则（用户维护，服务端只读）
+#     runtime.json              服务端回写的迁移结果（机器维护，用户只读）
+#   <以后的服务名>/             同样的四个文件，互不干扰
+#
+# schema.json 示例：
+#   {"version": 3, "rename": {"users": "members"},
+#    "drop": ["obsolete_field"],
+#    "files": {"ws_subs.json": {"keep": ["version", "sessions", "members"],
+#                                "defaults": {"version": 1, "sessions": {}}}}}
+#   · rename 递归进嵌套层级；删掉的字段不再写入；没写 defaults 的新字段「没有就不写入」
+#   · 没写 keep 时用云端 runtime.json 里该文件的顶层键当最新结构
+#   · 顶层写 {} 是安全的（不删任何字段）；别给某个文件写空对象，那会把本地字段清空
+# ============================================================
+# 启动流程与几个前提
+# ------------------------------------------------------------
+# · 读 update.cfg → 装配数据后端 → 启动先同步代码 → 需要时自动重启 RUN
+#   → 按 services.json 逐个拉起服务 → 每 10 秒查各服务信号。
+# · git pull 是整仓库一次，但只停 / 迁 / 启【被触发的那个服务】；
+#   指纹、备份、进程按服务隔离，单实例锁全局一份。
+# · 一轮更新失败：整次回滚、照常用旧数据启动，该信号指纹记入 failed_signal，
+#   不会每 10 秒自动重试；修好后改一下 runN 内容或换 run2/run3 再触发。
+# · 启动自检会在控制台直接列出：数据后端还是模板占位值、缺 services.json、
+#   不在 git 仓库且没配 UPDATER_CODE_REPO、某服务私有目录缺 runN / config / schema。
+# · 首次部署绕不过去：PAT 不能经 git 下发，服务端要手工放一次 update.cfg，
+#   以及各服务自己的真实配置（wm-bot 是 wm-bot/python/data/config.txt）。
+# · 一个 fine-grained PAT 是【仓库级】权限，不是目录级：多台服务端各跑不同服务时，
+#   每台都能读到别的项目的文件。要隔离就得给每个项目单独建私有仓库。
+# ============================================================

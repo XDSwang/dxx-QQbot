@@ -1,5 +1,27 @@
 # WM 机器人（纯 Python 单端 · QQ 查价 · 按需缓存）
 
+## 服务端统一运行（仓库根 `run.py`）
+
+> 公共仓库是本体：代码 + `services.json` 服务清单，能放任意服务端跑。
+> 数据后端（授权、配置、运行记录，本质该放数据库；现在先用 GitHub 私有仓库文件代替，
+> 以后可换数据库地址 / 第三方数据接口）由**仓库根 `update.cfg` 优先配置**，不进 git。
+
+服务端只跑这一条：`python run.py`
+
+启动后：读 `update.cfg` → 装配数据后端 → 先同步代码（拷贝来的目录没有 `.git` 会自动自举，
+**绝不覆盖本地较新的版本**）→ 按 `services.json` 逐个拉起服务 → 每 10 秒查信号。
+一次 `git pull` 是整仓库的，但只停 / 迁 / 启【被触发的那个服务】；指纹、备份、进程按服务隔离。
+
+- `services.json`（进 git）：服务清单，以后加服务只加一项，不改 `run.py`。
+- 数据后端布局：`services/<服务名>/{runN, config.txt, schema.json, runtime.json}`；
+  根目录再放一个 `runN` 可作全局信号（所有服务一起更新）。
+- 配置模板见 `update.cfg.example`；`update.cfg`、`data/`、`remote/` 都不进 git。
+- 首次部署仍要手工放一次 `update.cfg` 和各服务自己的真实配置
+  （wm-bot 是 `wm-bot/python/data/config.txt`）：PAT 不能经 git 下发。
+
+⚠️ **代码必须先 push 到公共仓库**：本地提交没推上去，服务端 `git pull` 拉不到新代码；
+即使把新版本整个拷过去，自举后本地领先远端，`--ff-only` 会拒绝非快进（不会回退，但也更新不了）。
+
 > ⚠️ 本项目**只维护 Python 端**（零依赖，仅标准库）。Node 端已删除。
 > 整个文件夹可拷到电脑 / 手机（Termux / QPython）**任意位置**：路径全部基于 Python 文件自身目录
 > （`__file__`）解析，不写死盘符、不依赖当前工作目录、无 `../` 上层路径。

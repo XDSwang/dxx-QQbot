@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "_comment": "服务注册表：公共仓库本体的一部分。以后加服务只加一项，不改 run.py。私钥/口令一律不写这里。",
+  "services": [
+    {
+      "name": "wm-bot",
+      "entry": "wm-bot/python/qq_bot.py",
+      "cwd": "wm-bot",
+      "data_dir": "wm-bot/python/data",
+      "config_file": "config.txt",
+      "runtime_files": [
+        "ws_switches.json",
+        "ws_filters.json",
+        "ws_at_users.json",
+        "ws_subs.json",
+        "ws_last_sent.json"
+      ],
+      "remote_path": "wm-bot"
+    }
+  ]
+}

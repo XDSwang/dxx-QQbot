@@ -25,18 +25,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PYTHON_DIR = HERE / "python"
-STATE_DIR = HERE / "data"                       # updater 自己的状态（根 .gitignore 已忽略 data/）
-BOT_DATA_DIR = PYTHON_DIR / "data"              # 机器人运行数据（同样不进 git）
+HERE = Path(__file__).resolve().parent          # 仓库根：公共仓库本体所在目录
+STATE_DIR = HERE / "data"                       # 更新器自身状态（根 .gitignore 已忽略 data/）
 
 ERROR_LOG = STATE_DIR / "updater_error.log"     # 异常日志：覆盖式，只记异常
 FLOW_LOG = STATE_DIR / "updater_flow.log"       # 流程日志：追加式，正常操作也记
 PACE_FILE = STATE_DIR / "updater_pace.json"     # 同域名节流状态（落盘）
-STATE_FILE = STATE_DIR / "update_state.json"    # 已处理的信号指纹 / 迁移版本
+STATE_FILE = STATE_DIR / "update_state.json"    # 全局指纹（无服务归属时用）
 BACKUP_ROOT = STATE_DIR / "backup"
 LOCK_FILE = STATE_DIR / "updater.lock"
-BOT_CONFIG_FILE = BOT_DATA_DIR / "config.txt"
 
 CONFIG_NAME = "config.txt"
 SCHEMA_NAME = "schema.json"
@@ -135,12 +132,26 @@ def pick_signal(pairs):
     return Signal(name, fp, False)
 
 
-def load_state():
-    return _read_json(STATE_FILE, {})
+def state_file(service=None):
+    """按服务隔离指纹：多服务共用一份 state 会互相误判「这个信号已处理过」。"""
+    if not service:
+        return STATE_FILE
+    return STATE_DIR / "services" / service / "state.json"
 
 
-def save_state(state):
-    _atomic_write(STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+def backup_root(service=None):
+    if not service:
+        return BACKUP_ROOT
+    return STATE_DIR / "services" / service / "backup"
+
+
+def load_state(service=None):
+    return _read_json(state_file(service), {})
+
+
+def save_state(state, service=None):
+    _atomic_write(state_file(service),
+                  json.dumps(state, ensure_ascii=False, indent=2) + "\n")
 
 
 # ------------------------------ 私有地址后端 ------------------------------
@@ -244,27 +255,51 @@ class GitHubStore(object):
         return base64.b64decode(obj["content"]).decode("utf-8")
 
     def write(self, name, text):
-        listing = self._dir()
-        body = {"message": "updater: migrated runtime data",
-                "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
-                "branch": self.branch}
-        if name in listing:
-            body["sha"] = listing[name]["sha"]
-        self._api("PUT", self._url(name), body)
-        self._listing = None
+        # 多台服务端可能同时回写同一个 runtime.json：409 时重新列目录拿最新 sha，
+        # 最多 3 轮（规范 1.1 静默重试 ≤3 次），仍冲突就如实抛给上层记异常日志。
+        for attempt in range(3):
+            listing = self._dir()
+            body = {"message": "updater: migrated runtime data",
+                    "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+                    "branch": self.branch}
+            if name in listing:
+                body["sha"] = listing[name]["sha"]
+            try:
+                self._api("PUT", self._url(name), body)
+                self._listing = None
+                return
+            except urllib.error.HTTPError as e:
+                if e.code != 409 or attempt == 2:
+                    raise
+                self._listing = None
+                time.sleep(HOST_GAP_SECONDS)
 
 
-def make_store(cfg):
-    """按配置造后端；后端可插拔，换私有地址不用改迁移逻辑。"""
+def make_store(cfg, service=None):
+    """按配置造【数据后端】；service 给定时自动切到该服务在私有仓库里的子目录。
+
+    这层是可替换的：现在用 GitHub 私有仓库文件代替数据库，以后换成数据库地址 /
+    第三方数据接口，只要按 Store 接口（signals / signal / read / write）加一个
+    适配器并在这里注册，服务与迁移逻辑都不用动。
+    """
     kind = (cfg.get("UPDATER_BACKEND") or "local").strip().lower()
+    sub = (service or "").strip().strip("/")
     if kind == "github":
+        path = (cfg.get("UPDATER_GITHUB_PATH") or "").strip().strip("/")
+        if sub:
+            path = (path + "/" + sub) if path else sub
         return GitHubStore(cfg.get("UPDATER_GITHUB_REPO"),
                            cfg.get("UPDATER_GITHUB_TOKEN"),
-                           cfg.get("UPDATER_GITHUB_PATH", ""),
+                           path,
                            cfg.get("UPDATER_GITHUB_BRANCH", "main"),
                            cfg.get("UPDATER_GITHUB_API", GITHUB_API))
     if kind == "local":
-        return LocalStore(cfg.get("UPDATER_LOCAL_DIR") or str(HERE / "remote"))
+        root = Path(cfg.get("UPDATER_LOCAL_DIR") or str(HERE / "remote"))
+        return LocalStore(root / sub if sub else root)
+    if kind in ("database", "http", "api"):
+        raise NotImplementedError(
+            "数据后端 %s 尚未实现：请按 Store 接口加适配器，"
+            "地址 / 凭证填 UPDATER_DATA_URL / UPDATER_DATA_TOKEN" % kind)
     raise ValueError("未知的 UPDATER_BACKEND: %s" % kind)
 
 
@@ -420,14 +455,18 @@ def collect_runtime(data_dir, names):
     return out, bad
 
 
-def write_runtime_files(runtime, data_dir, backup=True):
-    """备份 → 逐文件原子写 → 出错整体回滚。返回 (ok, 备份目录/错误)。"""
+def write_runtime_files(runtime, data_dir, backup=True, backup_base=None):
+    """备份 → 逐文件原子写 → 出错整体回滚。返回 (ok, 备份目录/错误)。
+
+    backup_base 由调用方按服务传入，多个服务的备份不混在同一个目录里。
+    """
     data_dir = Path(data_dir)
     backup_dir = None
     written = []
     try:
         if backup:
-            backup_dir = BACKUP_ROOT / time.strftime("%Y%m%d-%H%M%S")
+            root = Path(backup_base) if backup_base else BACKUP_ROOT
+            backup_dir = root / time.strftime("%Y%m%d-%H%M%S")
             for name in runtime:
                 src = data_dir / name
                 if src.exists():

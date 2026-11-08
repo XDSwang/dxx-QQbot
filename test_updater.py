@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -360,7 +361,9 @@ class TestPreflight(_Base):
 
 class TestMainLoop(_Base):
     def test_main_starts_bot_and_exits_cleanly(self):
-        """run.py 唯一入口：能装配后端、拉起机器人、Ctrl+C 时收干净。"""
+        """统一 RUN：装配数据后端与服务清单、拉起服务、Ctrl+C 时收干净。"""
+        (self.root / "update.cfg").write_text("UPDATER_BACKEND = local\n",
+                                              encoding="utf-8")
         (self.remote / "run0").write_text("0", encoding="utf-8")
         cfg = dict(run.DEFAULTS)
         cfg.update({"UPDATER_BACKEND": "local",
@@ -375,6 +378,168 @@ class TestMainLoop(_Base):
         self.assertEqual(rc, 0)
         self.assertEqual(bot.started, 1)
         self.assertEqual(bot.stopped, 1)
+
+    def test_only_signaled_service_is_updated(self):
+        """两个服务共用统一 RUN：只停 / 迁 / 启被点名的那个，指纹不串。"""
+        (self.root / "update.cfg").write_text("UPDATER_BACKEND = local\n",
+                                              encoding="utf-8")
+        manifest = self.root / "services.json"
+        manifest.write_text(json.dumps({"services": [
+            {"name": "a", "entry": "a/run.py", "cwd": "a", "data_dir": "a/data",
+             "config_file": "config.txt", "runtime_files": ["state.json"],
+             "remote_path": "a"},
+            {"name": "b", "entry": "b/run.py", "cwd": "b", "data_dir": "b/data",
+             "config_file": "config.txt", "runtime_files": ["state.json"],
+             "remote_path": "b"}]}), encoding="utf-8")
+        for name, signal in (("a", "run1"), ("b", "run0")):
+            d = self.remote / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / signal).write_text("1" if signal == "run1" else "0",
+                                    encoding="utf-8")
+            (d / "config.txt").write_text("K = \n", encoding="utf-8")
+            (d / "schema.json").write_text("{}", encoding="utf-8")
+            (d / "runtime.json").write_text("{}", encoding="utf-8")
+            (self.root / name / "data").mkdir(parents=True, exist_ok=True)
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote),
+                    "UPDATER_GIT_PULL": "0", "UPDATER_SYNC_ON_START": "0",
+                    "UPDATER_PUSH_RUNTIME": "0"})
+        bot_a, bot_b = FakeBot(), FakeBot()
+        with mock.patch.object(run, "load_cfg", return_value=cfg), \
+             mock.patch.object(run, "SERVICES_FILE", manifest), \
+             mock.patch.object(run, "BotProcess", side_effect=[bot_a, bot_b]), \
+             mock.patch.object(run, "git_pull", return_value=(True, "mock")), \
+             mock.patch.object(run.time, "sleep",
+                               side_effect=[None, KeyboardInterrupt]), \
+             mock.patch("builtins.print"):
+            rc = run.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(bot_a.started, 2, "a 被更新：停后重新拉起")
+        self.assertEqual(bot_b.started, 1, "b 没被触发：只有启动时那一次")
+        self.assertIn("last_signal", updater.load_state("a"))
+        self.assertEqual(updater.load_state("b"), {}, "b 的指纹不能被 a 串写")
+
+
+class TestMultiService(_Base):
+    """公共仓库本体 + 根目录优先配置 + 数据后端按服务隔离。"""
+
+    def _svc(self, name="wm-bot", root=None):
+        return run.Service({
+            "name": name,
+            "entry": "wm-bot/python/qq_bot.py",
+            "cwd": "wm-bot",
+            "data_dir": "wm-bot/python/data",
+            "config_file": "config.txt",
+            "runtime_files": ["ws_subs.json"],
+            "remote_path": name,
+        }, root or self.root)
+
+    def test_services_json_is_the_public_repo_manifest(self):
+        svcs = run.load_services()
+        self.assertEqual([s.name for s in svcs], ["wm-bot"])
+        self.assertTrue(svcs[0].entry.endswith("qq_bot.py"))
+        self.assertEqual(svcs[0].remote_path, "wm-bot")
+        self.assertIn("config.txt", str(svcs[0].config_file))
+
+    def test_enabled_whitelist_and_unknown_name(self):
+        svcs = [self._svc("a"), self._svc("b")]
+        got = run.enabled_services(svcs, {"SERVICES_ENABLED": "b"})
+        self.assertEqual([s.name for s in got], ["b"])
+        self.assertEqual(len(run.enabled_services(svcs, {})), 2)
+        with self.assertRaises(RuntimeError):
+            run.enabled_services(svcs, {"SERVICES_ENABLED": "nope"})
+
+    def test_duplicate_service_name_rejected(self):
+        p = self.root / "services.json"
+        p.write_text(json.dumps({"services": [
+            {"name": "x", "entry": "a", "data_dir": "d"},
+            {"name": "x", "entry": "b", "data_dir": "d"}]}), encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            run.load_services(p)
+
+    def test_data_backend_points_into_service_subdir(self):
+        cfg = dict(run.DEFAULTS)
+        cfg.update({"UPDATER_BACKEND": "github", "UPDATER_GITHUB_REPO": "me/private",
+                    "UPDATER_GITHUB_TOKEN": "tok", "UPDATER_GITHUB_PATH": "services"})
+        self.assertIn("/contents/services?", updater.make_store(cfg)._url())
+        self.assertIn("/contents/services/wm-bot?",
+                      updater.make_store(cfg, "wm-bot")._url())
+        cfg.update({"UPDATER_BACKEND": "local",
+                    "UPDATER_LOCAL_DIR": str(self.remote)})
+        self.assertEqual(updater.make_store(cfg, "wm-bot").root,
+                         self.remote / "wm-bot")
+
+    def test_database_backend_is_explicitly_unimplemented(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            updater.make_store({"UPDATER_BACKEND": "database",
+                                "UPDATER_DATA_URL": "postgres://x"})
+        self.assertIn("Store", str(ctx.exception))
+
+    def test_state_and_backup_are_isolated_per_service(self):
+        updater.save_state({"mark": "A"}, "wm-bot")
+        updater.save_state({"mark": "B"}, "other")
+        self.assertEqual(updater.load_state("wm-bot")["mark"], "A")
+        self.assertEqual(updater.load_state("other")["mark"], "B")
+        self.assertEqual(updater.load_state(), {})
+        self.assertIn("services", str(updater.backup_root("wm-bot")))
+
+    def test_sync_code_bootstraps_without_checkout(self):
+        calls = []
+
+        def fake(args, timeout=60):
+            calls.append(list(args))
+            if args[:2] == ["rev-parse", "--show-toplevel"]:
+                return 1, "", "not a git repo"
+            return 0, "", ""
+
+        with mock.patch.object(run, "_git", side_effect=fake), \
+             mock.patch("builtins.print"):
+            ok, info = run.sync_code(dict(run.DEFAULTS))
+        self.assertTrue(ok)
+        self.assertIn("bootstrap", info)
+        flat = [" ".join(c) for c in calls]
+        self.assertTrue(any("init" in c for c in flat))
+        self.assertTrue(any("fetch" in c for c in flat))
+        self.assertFalse(any("checkout" in c for c in flat),
+                         "绝不能把本地较新的代码覆盖成远端旧版")
+
+    def _remote_service(self, name="wm-bot"):
+        remote = self.remote / name
+        remote.mkdir(parents=True, exist_ok=True)
+        for n, t in (("config.txt", "WM_QQ_APPID = \n"),
+                     ("schema.json", "{}"), ("runtime.json", "{}"), ("run1", "1")):
+            (remote / n).write_text(t, encoding="utf-8")
+        return updater.LocalStore(remote)
+
+    def test_do_update_uses_service_paths_and_state(self):
+        svc = self._svc("wm-bot", self.root)
+        svc.data_dir.mkdir(parents=True, exist_ok=True)
+        (svc.data_dir / "config.txt").write_text("WM_QQ_APPID = REAL\n",
+                                                 encoding="utf-8")
+        (svc.data_dir / "ws_subs.json").write_text(
+            json.dumps({"version": 1, "sessions": {}}), encoding="utf-8")
+        store = self._remote_service()
+        sig = store.signal()
+        with mock.patch.object(run, "git_pull", return_value=(True, "mock")):
+            ok = run.do_update({"UPDATER_CONFIG_MERGE": "structure",
+                                "UPDATER_PUSH_RUNTIME": "0"},
+                               store, FakeBot(), sig, svc=svc)
+        self.assertTrue(ok)
+        self.assertIn("REAL", (svc.data_dir / "config.txt").read_text(encoding="utf-8"))
+        self.assertEqual(updater.load_state("wm-bot")["last_signal"], sig.fingerprint)
+        self.assertEqual(updater.load_state(), {}, "指纹不能再写全局 state")
+
+    def test_pull_false_skips_git_pull_for_global_signal(self):
+        svc = self._svc("wm-bot", self.root)
+        svc.data_dir.mkdir(parents=True, exist_ok=True)
+        store = self._remote_service()
+        sig = store.signal()
+        with mock.patch.object(run, "git_pull") as gp:
+            ok = run.do_update({"UPDATER_PUSH_RUNTIME": "0"}, store, FakeBot(),
+                               sig, svc=svc, pull=False)
+        self.assertTrue(ok)
+        gp.assert_not_called()
 
 
 class TestGitHubStore(unittest.TestCase):
@@ -408,6 +573,27 @@ class TestGitHubStore(unittest.TestCase):
         self.assertEqual(len(puts), 1)
         self.assertEqual(base64.b64decode(puts[0][2]["content"]).decode("utf-8"),
                          '{"x": 1}')
+
+    def test_write_retries_409_with_fresh_sha(self):
+        """多台服务端同时回写：409 后重新列目录拿最新 sha，最多 3 轮。"""
+        calls = []
+
+        def fake(method, url, body=None):
+            calls.append((method, url, body))
+            if method == "GET":
+                return [{"name": "runtime.json", "sha": "S1",
+                         "content": _b64("{}")}]
+            if len([c for c in calls if c[0] == "PUT"]) == 1:
+                raise urllib.error.HTTPError(url, 409, "conflict", {}, None)
+            return {"ok": True}
+
+        s = updater.GitHubStore("me/private-repo", "tok", "wm-bot")
+        s._api = fake
+        with mock.patch.object(updater.time, "sleep"):
+            s.write("runtime.json", '{"x": 1}')
+        puts = [c for c in calls if c[0] == "PUT"]
+        self.assertEqual(len(puts), 2)
+        self.assertEqual(puts[1][2]["sha"], "S1")
 
 
 if __name__ == "__main__":
