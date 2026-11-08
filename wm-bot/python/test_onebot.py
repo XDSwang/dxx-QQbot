@@ -16,6 +16,8 @@ import time
 import socket
 import threading
 import unittest
+import contextlib
+import io
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["WM_SOURCE"] = "mock"   # 必须在 import wm 之前：离线测试不发 HTTP
@@ -389,6 +391,58 @@ class TestIntegrationServer(unittest.TestCase):
                            _Reply("hello 文本"))
         payload = json.loads(conn.sent)
         self.assertEqual(payload["params"]["message"], "hello 文本")
+
+
+class TestEcho(unittest.TestCase):
+    """收发都打一行：手机上才能分清「没收到」「收到了但静默」「回了但发失败」。"""
+
+    def setUp(self):
+        os.environ["WM_QQ_ECHO"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("WM_QQ_ECHO", None)
+
+    def _feed(self, handler, msg):
+        sent = []
+
+        class FakeConn:
+            def send_text(self, s):
+                sent.append(json.loads(s))
+
+        c = onebot.OneBotClient(mode="client")
+        c.handler = handler
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            c._on_message(FakeConn(), msg)
+        return buf.getvalue(), sent
+
+    def test_recv_then_silent(self):
+        """收到先说一句（含 @ 状态与原文），静默再补一行原因。"""
+        at_msg = {"post_type": "message", "message_type": "group", "group_id": 77,
+                  "user_id": 5, "self_id": 9,
+                  "message": [{"type": "at", "data": {"qq": "9"}},
+                              {"type": "text", "data": {"text": " 今天吃什么"}}]}
+        out, sent = self._feed(lambda t, c: None, at_msg)
+        self.assertIn("[recv] 群 77 用户=5 @我=是 文本='今天吃什么'", out)
+        self.assertIn("[silent]", out)
+        self.assertEqual(sent, [])
+
+    def test_recv_then_reply(self):
+        """命中指令：先打 [reply] 行，再真的发出去。"""
+        msg = {"post_type": "message", "message_type": "private", "user_id": 5,
+               "self_id": 9, "message": "D/XX/自检"}
+        out, sent = self._feed(lambda t, c: "好的", msg)
+        self.assertIn("[recv] 私聊 5 用户=5 @我=否 文本='D/XX/自检'", out)
+        self.assertIn("[reply] 私聊 5", out)
+        self.assertEqual(len(sent), 1)
+
+    def test_echo_muted(self):
+        """WM_QQ_ECHO = 0 时一行都不打（群全量模式嫌吵时用）。"""
+        os.environ["WM_QQ_ECHO"] = "0"
+        msg = {"post_type": "message", "message_type": "group", "group_id": 77,
+               "user_id": 5, "self_id": 9, "message": "闲聊"}
+        out, _ = self._feed(lambda t, c: None, msg)
+        self.assertEqual(out.strip(), "")
 
 
 if __name__ == "__main__":

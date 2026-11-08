@@ -94,6 +94,21 @@ def flag(name, default=False):
     return default
 
 
+def echo(msg):
+    """收发调试输出：把「收到什么 / 回了什么」打到控制台（stderr，立即 flush）。
+
+    手机 / 服务器上看不到后台日志时，这是唯一能确认「消息到底进没进机器人」的通道：
+    收到就有一行 `[recv]`，命不中指令会有一行 `[silent]`，发出去会有一行 `[official] 已回复`。
+    群聊全量模式下每条闲聊都会打，嫌吵就在 data/config.txt 写 WM_QQ_ECHO = 0 关掉。
+    """
+    if not flag("WM_QQ_ECHO", True):
+        return
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 # ---------------- 移动端 HTTPS / WSS 证书兼容 ----------------
 # 手机上的 Python 常缺 CA 根证书 bundle，报：
 #   <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:

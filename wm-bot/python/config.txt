@@ -316,3 +316,10 @@ WM_QQ_MD_MEDIA_MAX = 3
 # WM_CARD_FONT = /path/to/NotoSansCJK-Regular.ttc
 # WM_CARD_FONT_BOLD = /path/to/NotoSansCJK-Bold.ttc
 
+# ---- 收发调试输出（排查「发了指令没反应」）----
+# 默认开：每收到一条消息先打一行 [recv]（会话 + 是否 @ 我 + 原文），
+# 命中指令打 [reply]，没命中（或群不在白名单）打 [silent] 并写明原因。
+# 手机上就靠这三行分清「消息没收到 / 收到了但被静默 / 回了但发失败」；
+# 群「获取全部消息」模式下每条闲聊都会打，嫌吵就设 0 关掉：
+# WM_QQ_ECHO = 1
+

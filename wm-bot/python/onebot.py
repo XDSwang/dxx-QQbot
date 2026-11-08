@@ -60,6 +60,13 @@ def _at_list(at_user):
     return out
 
 
+def _peer(msg):
+    """一行摘要里的会话标识：群聊写群号，私聊写对方 QQ 号。"""
+    if msg.get("message_type") == "group":
+        return "群 %s" % msg.get("group_id")
+    return "私聊 %s" % (msg.get("user_id") or "")
+
+
 def _parse_message(raw, self_id):
     """把 OneBot 的 message 拆成 (纯文本, 是否 @ 了机器人)。
 
@@ -413,12 +420,22 @@ class OneBotClient:
         ctx = dict(msg)
         ctx["at_me"] = at_me
         ctx["user_id"] = msg.get("user_id") or (msg.get("sender") or {}).get("user_id")
+        # 收到就打一行：手机上分不清「机器人没收到」还是「收到了但静默」，全靠这行。
+        bot_config.echo("[recv] %s 用户=%s @我=%s 文本=%r"
+                        % (_peer(msg), ctx.get("user_id"),
+                           "是" if at_me else "否", text))
         try:
             reply = self.handler(text, ctx)
         except Exception as e:
             reply = f"⚠️ 处理出错：{e}"
         if reply:
+            bot_config.echo("[reply] %s 文本=%r 图片=%d 张"
+                            % (_peer(msg), text,
+                               len(getattr(reply, "pngs", None) or [])))
             self._send_reply(conn, msg, reply)
+        else:
+            bot_config.echo("[silent] %s 文本=%r 没命中指令或群不在白名单，不回复"
+                            % (_peer(msg), text))
 
     def _send_reply(self, conn, msg, reply):
         message_type = msg.get("message_type")

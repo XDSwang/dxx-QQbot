@@ -643,6 +643,10 @@ class OfficialBot:
             text = strip_mention(raw)
             group_openid = d.get("group_openid")
             flog(f"群@消息 group_openid={group_openid} 原始内容={raw!r} 剥离后={text!r}")
+            bot_config.echo("[recv] 群@ %s 用户=%s 原文=%r 剥离=%r"
+                            % (group_openid,
+                               (d.get("author") or {}).get("user_openid"),
+                               raw, text))
             ctx = {"channel": "group", "group_id": group_openid,
                    # 群 @ 事件：明确对着机器人说的，允许不带 D/XX/ 前缀；
                    # user_openid 记下来，之后本会话的监控推送 @ 他
@@ -657,6 +661,10 @@ class OfficialBot:
             text = strip_mention(raw)
             group_openid = d.get("group_openid")
             flog(f"群消息(全量) group_openid={group_openid} 原始内容={raw!r} 剥离后={text!r}")
+            bot_config.echo("[recv] 群 %s 用户=%s 原文=%r 剥离=%r"
+                            % (group_openid,
+                               (d.get("author") or {}).get("user_openid"),
+                               raw, text))
             # full_message：这条消息没有 @ 机器人，回复也不要「对着某人引用」，
             # 而是单纯往群里发一条普通消息（不 @ 任何人、不带 msg_id 引用）。
             ctx = {"channel": "group", "group_id": group_openid,
@@ -667,6 +675,7 @@ class OfficialBot:
             text = strip_mention(raw)
             openid = (d.get("author") or {}).get("user_openid")
             flog(f"单聊消息 user_openid={openid} 原始内容={raw!r} 剥离后={text!r}")
+            bot_config.echo("[recv] 单聊 %s 原文=%r 剥离=%r" % (openid, raw, text))
             ctx = {"channel": "private", "group_id": openid}
             self._dispatch_reply(token, "user", openid, text, ctx, msg_id)
         else:
@@ -771,6 +780,8 @@ class OfficialBot:
             flog(f"handler 抛出异常: {e}")
         if not reply:
             flog("handler 返回空（闲聊未带 D/XX/ 前缀 / 白名单外群静默），不回复")
+            bot_config.echo("[silent] %s %s 文本=%r 没命中指令或群不在白名单，不回复"
+                            % (kind, target_id, text))
             return
         # 全量群消息（没 @ 机器人）：优先【不带 msg_id】发一条普通群消息，
         # 不 @ 任何人、也不显示「引用某条消息」；@ 消息才走被动引用回复。
