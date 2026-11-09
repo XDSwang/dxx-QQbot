@@ -1030,16 +1030,18 @@ def load_local_schema():
     return {}
 
 
-def reconcile_config(template_text, values_text, mode="structure"):
-    """以【公共仓库模板】为结构基准，私有库真实值为覆盖，安全合并。
+def reconcile_config(template_text, values_text, mode="structure", local_text=""):
+    """以【公共仓库模板】为结构基准，按「私有库 > 本地当前运行配置 > 模板默认/空」安全合并。
 
     - 模板有、私有值非空 → 用私有值（保留真实值，绝不被空值冲掉）
-    - 模板有、私有值为空 → 保留模板行（空 / 默认），即「新字段先留空」
+    - 私有值为空、本地当前配置有值 → 用本地当前配置的值（防止别的设备推来的旧版
+      空值把本地原本有值的字段冲空；本地运行过就有最新值）
+    - 两者都没有 → 保留模板行（空 / 默认），即「新字段先留空」
     - 私有有、模板没有 → 保留（绝不静默删除；方案 A 的兼容兜底）
     模板的注释 / 描述行原样保留，保证私有库里也能看到每个字段的说明。
 
-    返回 (合并文本, 报告)。报告里的 new_fields 是「模板有、私有没有」的真·新字段，
-    只有这些出现时才需要把结构回写私有库；removed 永远为空。
+    返回 (合并文本, 报告)。报告里的 new_fields 是「模板有、私有没有」的字段（含用本地值
+    补上的），出现时需要把结果回写私有库；removed 永远为空。
     """
     if mode == "overwrite":
         # 全量覆盖：按私有值原样写回，不参与模板对账（保留注释/字段全交给调用方）
@@ -1050,10 +1052,11 @@ def reconcile_config(template_text, values_text, mode="structure"):
         return (values_text or ""), {"mode": mode, "added": [], "removed": [],
                                      "kept": [], "new_fields": [], "extra_kept": [],
                                      "skipped": "公共仓库没有配置模板"}
-    if not values_text:
-        # 私有库没有任何真实值：直接给一份模板（全空），等私有库自己填
+    if not values_text and not local_text:
+        # 私有库和本地都没有任何值：直接给一份模板（全空），等私有库自己填
         return template_text, {"mode": mode, "added": [], "removed": [],
-                               "kept": [], "new_fields": [], "extra_kept": [],
+                               "kept": [], "from_local": [],
+                               "new_fields": [], "extra_kept": [],
                                "skipped": "私有地址没有 config.txt，先用模板"}
     tmpl_keys = {}
     for line in template_text.splitlines():
@@ -1061,12 +1064,18 @@ def reconcile_config(template_text, values_text, mode="structure"):
         if m:
             tmpl_keys[m.group(1)] = m.group(2)
     val_vals = {}
-    for line in values_text.splitlines():
+    for line in (values_text or "").splitlines():
         m = CONFIG_KV.match(line)
         if m:
             val_vals[m.group(1)] = m.group(2)
+    # 本地当前运行配置：私有库缺值时的第二来源（防止旧版空值冲掉本地真实值）
+    local_vals = {}
+    for line in (local_text or "").splitlines():
+        m = CONFIG_KV.match(line)
+        if m:
+            local_vals[m.group(1)] = m.group(2)
     out = []
-    added, kept = [], []
+    added, kept, from_local = [], [], []
     for line in template_text.splitlines():
         m = CONFIG_KV.match(line)
         if not m:
@@ -1076,6 +1085,11 @@ def reconcile_config(template_text, values_text, mode="structure"):
         if key in val_vals and val_vals[key].strip():
             out.append("%s = %s" % (key, val_vals[key].rstrip()))
             kept.append(key)
+        elif key in local_vals and local_vals[key].strip():
+            # 私有库没值、本地运行过有值：用本地当前值，绝不冲成空
+            out.append("%s = %s" % (key, local_vals[key].rstrip()))
+            kept.append(key)
+            from_local.append(key)
         else:
             out.append(line)                      # 模板空 / 默认：新字段先留空
             added.append(key)
@@ -1088,6 +1102,7 @@ def reconcile_config(template_text, values_text, mode="structure"):
         text += "\n"
     new_fields = sorted(set(tmpl_keys) - set(val_vals))
     return text, {"mode": mode, "added": added, "removed": [], "kept": kept,
+                  "from_local": from_local,
                   "new_fields": new_fields, "extra_kept": extra, "skipped": ""}
 
 
@@ -1328,4 +1343,59 @@ def push_config(store, text):
     只在新字段出现时才调用（见 do_update / sync_config），避免每轮空提交。
     """
     store.write(CONFIG_NAME, text)
+    return text
+
+
+# ------------------- 运行记录类（纯文本 / 本地优先 / 备份到私有库） -------------------
+# 与模板类（config.txt：私有库为准）相反：这类文件条目允许增删（如群白名单 groups.txt），
+# 本地就是最新；私有库只作备份，本地丢了能从私有库恢复。
+TEXT_RUNTIME_SUBDIR = "data"          # 私有库里落点：<服务目录>/data/<文件名>
+
+
+def read_text_runtime(store, names):
+    """从私有库读纯文本运行记录；读失败 / 不存在返回 None（本次跳过，不覆盖本地）。"""
+    out = {}
+    for name in names:
+        try:
+            out[name] = store.read(TEXT_RUNTIME_SUBDIR + "/" + name)
+        except Exception as e:
+            elog("文本运行记录读取失败（本次跳过该文件）", "%s %s" % (name, e))
+            out[name] = None
+    return out
+
+
+def merge_text_runtime(data_dir, names, cloud_texts):
+    """合并纯文本运行记录：本地优先，本地空时由私有库恢复。
+
+    返回 [(name, text, write_local, write_cloud)]；text 为 None 表示读取失败、跳过。
+      - 本地有内容 → 用本地；与私有库不同才回写（本地删掉的条目也随之同步删除）
+      - 本地空 / 不存在、私有库有 → 用私有库内容恢复本地
+      - 两边都空 → 什么都不做
+    """
+    plan = []
+    for name in names:
+        p = Path(data_dir) / name
+        local = ""
+        try:
+            if p.exists():
+                local = p.read_text(encoding="utf-8-sig")
+        except Exception as e:
+            elog("文本运行记录读取失败，本次不覆盖", "%s %s" % (name, e))
+            plan.append((name, None, False, False))
+            continue
+        cloud = cloud_texts.get(name) or ""
+        if local.strip():
+            plan.append((name, local, False, local != cloud))
+        elif cloud.strip():
+            plan.append((name, cloud, True, False))
+        else:
+            plan.append((name, "", False, False))
+    return plan
+
+
+def push_text_runtime(store, name, text):
+    """把本地文本运行记录回写私有库 data/<name>（本地为准）；只在内容不同时调用。"""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    store.write(TEXT_RUNTIME_SUBDIR + "/" + name, text)
     return text

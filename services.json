@@ -15,6 +15,9 @@
         "ws_subs.json",
         "ws_last_sent.json"
       ],
+      "runtime_text_files": [
+        "groups.txt"
+      ],
       "remote_path": "wm-bot"
     }
   ]

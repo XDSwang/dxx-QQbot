@@ -40,6 +40,8 @@ DEFAULT_RUNTIME_FILES = (
     "ws_switches.json", "ws_filters.json", "ws_at_users.json",
     "ws_subs.json", "ws_last_sent.json",
 )
+# 运行记录类（纯文本、条目可增删）：本地优先，同时备份到私有库 data/ 下，本地丢了能恢复。
+DEFAULT_RUNTIME_TEXT_FILES = ("groups.txt",)
 
 DEFAULTS = {
     "UPDATER_BACKEND": "local",
@@ -124,6 +126,10 @@ class Service(object):
         self.data_dir = Path(root) / str(raw["data_dir"])
         self.config_file = self.data_dir / str(raw.get("config_file") or "config.txt")
         self.runtime_files = tuple(raw.get("runtime_files") or ())
+        # 显式写 [] 表示「这类不做备份」，不能用 or 兜底（空列表会被误当未配置）
+        self.runtime_text_files = tuple(
+            raw["runtime_text_files"] if "runtime_text_files" in raw
+            else DEFAULT_RUNTIME_TEXT_FILES)
         self.remote_path = str(raw.get("remote_path") or self.name)
 
 
@@ -655,6 +661,21 @@ def _read_bot_credentials(cfg_path):
     return appid, secret, api_base
 
 
+def _read_local_config(cfg_path):
+    """读本地当前运行数据文件，作为配置合并的补缺来源（私有库缺该值时才用）。
+
+    合并顺序固定：私有库有值 > 本地运行时数据有值 > 模板默认 / 空。
+    读不到 / 不存在按空串处理（合并自然只剩「私有库 > 模板默认」两档）。
+    """
+    try:
+        p = Path(cfg_path)
+        if p.exists():
+            return p.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        pass
+    return ""
+
+
 def _broadcast_update(text, cfg_path, data_dir):
     """更新前/后给所有授权群广播一条系统通知（主动群消息，逐群发）。
 
@@ -733,8 +754,10 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
         config_report = {"skipped": "数据后端没有 config.txt"}
         template_text = updater.load_local_template()
         values_text = bundle["config"] or ""
+        local_text = _read_local_config(cfg_path)
         merged, config_report = updater.reconcile_config(
-            template_text, values_text, cfg.get("UPDATER_CONFIG_MERGE", "structure"))
+            template_text, values_text, cfg.get("UPDATER_CONFIG_MERGE", "structure"),
+            local_text)
         updater._atomic_write(cfg_path, merged)
         # 只有出现模板里没有的新字段时才把结构回写私有库（把空位同步回去让本人填）
         if (not _off(cfg.get("UPDATER_PUSH_CONFIG", "1"))
@@ -752,6 +775,30 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
         ok, detail = updater.write_runtime_files(migrated, data_dir, backup=False)
         if not ok:
             raise RuntimeError(detail)
+        # ②-b 文本运行记录（如群白名单 groups.txt）：本地优先——本地有就保留并回写
+        #      私有库（本地删掉的条目随之同步删除），本地为空则从私有库恢复备份。
+        #      与模板类相反：这类文件用户会自己增删条目，本地才是最新。
+        text_names = list(svc.runtime_text_files if svc
+                          else DEFAULT_RUNTIME_TEXT_FILES)
+        push_rt = not _off(cfg.get("UPDATER_PUSH_RUNTIME", "1"))
+        if text_names:
+            try:
+                cloud_texts = updater.read_text_runtime(store, text_names)
+                for name, txt, to_local, to_cloud in updater.merge_text_runtime(
+                        data_dir, text_names, cloud_texts):
+                    if txt is None:
+                        continue            # 读失败：跳过，绝不覆盖本地
+                    if to_local:
+                        updater._atomic_write(Path(data_dir) / name, txt)
+                        updater.flog("[%s] 运行记录 %s 已从私有库恢复（本地原本为空）"
+                                     % (service or "default", name))
+                    elif to_cloud and push_rt:
+                        updater.push_text_runtime(store, name, txt)
+                        updater.flog("[%s] 运行记录 %s 已回写私有库（以本地为准）"
+                                     % (service or "default", name))
+            except Exception as e:
+                updater.elog("[%s] 运行记录同步失败（本地数据未改动）"
+                             % (service or "default"), str(e))
         # ③ 回写数据后端：拿到「最新完整 + 旧数据迁移」的结果。
         #    先认领：两个不同授权的实例误指同一目录时，宁可不回写也不能互相覆盖。
         if not _off(cfg.get("UPDATER_PUSH_RUNTIME", "1")):
@@ -827,8 +874,9 @@ def sync_config(cfg, store, svc, bot):
     if raw is None:
         return False
     template_text = updater.load_local_template()
+    local_text = _read_local_config(cfg_path)
     merged, rep = updater.reconcile_config(
-        template_text, raw, cfg.get("UPDATER_CONFIG_MERGE", "structure"))
+        template_text, raw, cfg.get("UPDATER_CONFIG_MERGE", "structure"), local_text)
     updater._atomic_write(cfg_path, merged)
     if (not _off(cfg.get("UPDATER_PUSH_CONFIG", "1")) and rep.get("new_fields")):
         try:

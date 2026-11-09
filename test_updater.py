@@ -145,6 +145,33 @@ class TestReconcileConfig(_Base):
         self.assertEqual(text, self.TEMPLATE, "私有没有值时给模板（全空）等本人填")
         self.assertTrue(rep["skipped"])
 
+    def test_local_fallback_when_private_empty(self):
+        # 私有库只有空值（别的设备推来旧版），本地运行过有真实值 → 用本地值补，不冲成空
+        private_empty = "WM_QQ_APPID = \nWM_QQ_SECRET = \n"
+        local = "WM_QQ_APPID = LOCAL_ID\nWM_QQ_SECRET = LOCAL_SEC\nNEW_FLAG = 0\n"
+        text, rep = updater.reconcile_config(
+            self.TEMPLATE, private_empty, "structure", local)
+        self.assertIn("WM_QQ_APPID = LOCAL_ID", text, "私有空 → 用本地值")
+        self.assertIn("WM_QQ_SECRET = LOCAL_SEC", text, "私有空 → 用本地值")
+        self.assertIn("NEW_FLAG = 0", text, "本地有值 → 覆盖模板默认")
+        self.assertIn("WM_QQ_APPID", rep["from_local"])
+
+    def test_private_value_wins_over_local(self):
+        private = "WM_QQ_APPID = PRIV_ID\nWM_QQ_SECRET = PRIV_SEC\n"
+        local = "WM_QQ_APPID = LOCAL_ID\nWM_QQ_SECRET = LOCAL_SEC\n"
+        text, rep = updater.reconcile_config(self.TEMPLATE, private, "structure", local)
+        self.assertIn("WM_QQ_APPID = PRIV_ID", text, "私有库有值时优先用私有")
+        self.assertNotIn("LOCAL_ID", text)
+        self.assertEqual(rep["from_local"], [], "私有有值时不启用本地回退")
+
+    def test_all_empty_keeps_template(self):
+        # 私有空、本地也只有空值 → 保留模板（空 / 默认），不凭空造值
+        local = "WM_QQ_APPID = \n"
+        text, rep = updater.reconcile_config(self.TEMPLATE, "", "structure", local)
+        self.assertIn("WM_QQ_APPID = ", text)
+        self.assertNotIn("LOCAL", text)
+        self.assertIn("NEW_FLAG = 1", text)
+
     def test_load_cfg_merges_defaults(self):
         (self.root / "update.cfg").write_text(
             "# c\nUPDATER_BACKEND = local\nUPDATER_POLL_SECONDS = 7\n", encoding="utf-8")
@@ -2020,6 +2047,66 @@ class TestPlatformCompat(_Base):
         self.assertTrue(rc)
         self.assertIn("git@github.com:mirror/public.git", tried,
                       "主库 HTTPS 克隆失败应改试 SSH 备选")
+
+
+class TestTextRuntimeMerge(unittest.TestCase):
+    """运行记录类（纯文本）：本地优先、私有库只作备份、本地空可从私有库恢复。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_local_wins_and_pushes_when_differs(self):
+        (self.dir / "groups.txt").write_text("A\nB\n", encoding="utf-8")
+        plan = updater.merge_text_runtime(
+            self.dir, ["groups.txt"], {"groups.txt": "A\nB\nC\n"})
+        _, text, to_local, to_cloud = plan[0]
+        self.assertEqual(text, "A\nB\n", "本地是最新：不能被私有库的旧值覆盖")
+        self.assertFalse(to_local, "本地已有内容，不需要写本地")
+        self.assertTrue(to_cloud, "与私有库不同才回写")
+
+    def test_same_content_no_commit(self):
+        (self.dir / "groups.txt").write_text("A\n", encoding="utf-8")
+        plan = updater.merge_text_runtime(
+            self.dir, ["groups.txt"], {"groups.txt": "A\n"})
+        self.assertFalse(plan[0][3], "内容一致不应产生空提交")
+
+    def test_restore_from_cloud_when_local_missing(self):
+        plan = updater.merge_text_runtime(
+            self.dir, ["groups.txt"], {"groups.txt": "A\nB\n"})
+        _, text, to_local, to_cloud = plan[0]
+        self.assertTrue(to_local, "本地丢了要从私有库恢复")
+        self.assertEqual(text, "A\nB\n")
+        self.assertFalse(to_cloud)
+
+    def test_deleted_entry_follows_local(self):
+        # 本地删掉 B（白名单只留 A），私有库还是 A+B：以本地为准，回写后私有库也跟着删
+        (self.dir / "groups.txt").write_text("A\n", encoding="utf-8")
+        plan = updater.merge_text_runtime(
+            self.dir, ["groups.txt"], {"groups.txt": "A\nB\n"})
+        self.assertEqual(plan[0][1], "A\n")
+        self.assertTrue(plan[0][3], "本地删除的条目要同步到私有库")
+
+    def test_both_empty_does_nothing(self):
+        plan = updater.merge_text_runtime(self.dir, ["groups.txt"], {})
+        self.assertEqual(plan[0][1], "")
+        self.assertFalse(plan[0][2] or plan[0][3])
+
+    def test_push_text_runtime_uses_data_subdir(self):
+        class _S(object):
+            def __init__(self):
+                self.calls = []
+
+            def write(self, name, text):
+                self.calls.append((name, text))
+
+        s = _S()
+        updater.push_text_runtime(s, "groups.txt", "A")
+        self.assertEqual(s.calls, [("data/groups.txt", "A\n")],
+                         "运行记录落在私有库 data/ 子目录，末尾补换行")
 
 
 if __name__ == "__main__":
