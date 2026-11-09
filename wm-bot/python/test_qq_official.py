@@ -98,5 +98,26 @@ class TestReplyAtTag(unittest.TestCase):
         self.assertEqual(qq_official.reply_at_tag({"at_me": True}, "group"), "")
 
 
+class TestMentionPlaceholder(unittest.TestCase):
+    """@ 占位符四种形态：能剥干净，且只有真正 @机器人 的才点亮 at_me。"""
+
+    def test_strip_all_forms(self):
+        for raw in ("<@openid> 平原", "<@all> 平原", "<@!botid> 平原",
+                    "<@//9700b570215f656ce30231ee174ed3c1/> 平原"):
+            self.assertEqual(qq_official.strip_mention(raw), "平原",
+                             "%r 没被剥干净" % raw)
+
+    def test_bot_mention_forms(self):
+        for raw in ("<@!botid> 平原",
+                    "<@//9700b570215f656ce30231ee174ed3c1/> 平原"):
+            self.assertTrue(qq_official._BOT_MENTION_RE.search(raw),
+                            "%r 应判为 @机器人" % raw)
+
+    def test_member_mention_not_bot(self):
+        for raw in ("<@memberid> 平原", "<@all> 平原"):
+            self.assertFalse(qq_official._BOT_MENTION_RE.search(raw),
+                             "%r 不该判成 @机器人" % raw)
+
+
 if __name__ == "__main__":
     unittest.main()

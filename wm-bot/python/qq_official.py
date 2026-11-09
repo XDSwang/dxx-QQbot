@@ -356,10 +356,18 @@ class _ImageSendResult:
 
 
 # ---------------- 剥离 @ 占位符 ----------------
-_MENTION_RE = re.compile(r"<@!?\w+>")
-# 机器人专属占位符（带叹号）：<@!bot_openid>。成员是 <@openid>、全体是 <@all>，
-# 所以「这条消息 @ 的是不是机器人」只看有没有这个叹号，不用猜。
-_BOT_MENTION_RE = re.compile(r"<@!\w+>")
+# 群聊 @ 占位符共四种形态（均在真实事件里出现过）：
+#   <@openid>    @普通成员
+#   <@all>       @全体成员
+#   <@!bot_id>   @机器人（GROUP_AT_MESSAGE_CREATE）
+#   <@//id/>     @机器人（GROUP_MESSAGE_CREATE 全量消息里的新形态，斜杠包裹）
+# 注意 \w 匹配不到 "/"，所以 `<@//id/>` 必须单独列一支，否则既剥不掉也认不出。
+_MENTION_RE = re.compile(r"<@//[^>]*/>|<@!?\w+>")
+# 「这条消息 @ 的是不是机器人」：带叹号的，或全量消息里的 <@//id/> 形态。
+# 后者按实测样本（@机器人 必带此形态）判定；若将来发现它也用于 @成员，
+# 再改成用机器人自身 openid 精确比对（at_me 只影响免前缀与是否 @ 回去，
+# 不影响白名单，误判不会让白名单外的群被回复）。
+_BOT_MENTION_RE = re.compile(r"<@//[^>]*/>|<@!\w+>")
 
 
 def strip_mention(text):
