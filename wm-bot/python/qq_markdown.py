@@ -703,11 +703,14 @@ def send(token, appid, api_base, kind, target_id, markdown_obj,
 
 
 def send_reply(token, appid, api_base, kind, target_id, reply,
-               msg_id=None, pngs=None, tail=None, post=None, at_tag=""):
+               msg_id=None, pngs=None, tail=None, post=None, at_tag="",
+               on_built=None):
     """一步到位：把 handler 回复尝试发成 markdown 消息。
 
     返回 (ok, info, mode)。图片的二进制上传在这里完成（走官方素材管理）。
     at_tag：只在「@ 了机器人」时由上层传入，写进原生 markdown 最前面。
+    on_built：可选回调 (mode, markdown_obj)，在组装完成、发送给客户端之前调用，
+    让上层拿到【代码层原样、未被渲染】的 mk 原文做链路日志；回调异常不影响发送。
     失败由上层回退，不吞异常、不阻塞主通道。
     """
     m = resolved_mode()
@@ -726,6 +729,11 @@ def send_reply(token, appid, api_base, kind, target_id, reply,
         m, md, _ = build_markdown(reply, pngs=pngs, tail=tail, image=image,
                                   token=token, appid=appid, api_base=api_base,
                                   at_tag=at_tag)
+        if on_built is not None:
+            try:
+                on_built(m, md)
+            except Exception:
+                pass
         ok, info = send(token, appid, api_base, kind, target_id, md,
                         msg_id=msg_id, post=post)
         return bool(ok), info, m

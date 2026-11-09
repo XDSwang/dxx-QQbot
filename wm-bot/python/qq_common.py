@@ -108,8 +108,31 @@ def build_diagnostic():
         out.append("【Markdown 通道】异常：" + repr(e))
     # 5) 出图模式
     out.append("【出图模式 WM_WS_CARD】" + (os.environ.get("WM_WS_CARD") or "always"))
+    # 6) 消息链路三层（2026-11-09 叠加，上面原有检查内容一条不删）
+    out.append("【消息链路三层】①收到 → ②组装 → ③已发送，逐条落盘 data/selfcheck_trace.log")
+    out.append("   收到层没记录 = 服务已被冻结/结束；只有收到没组装 = handler 没回；")
+    out.append("   没有已发送 = 发送通道失败。第 3 层记代码层原样 mk 原文（含图片链接）。")
+    out.append("   本条自检即一条真实样本：能记下「收到」就证明服务还活着。")
     out.append("【结论】若上面任一 ✗，所有回复都会退回纯文字；复原对应文件/库即可恢复图片。")
     return "\n".join(out)
+
+
+def build_selfcheck_reply(force_text=False):
+    """自检指令回复：原有诊断内容 + 三层链路说明，升级为「图片 + 自定义 MK 内容」。
+
+    图片由 maybe_image 渲染；ImageReply.tail 是用户能直接看到的字符串，与图片
+    标签一起组成原生 Markdown（字符串 + 图片链接）。服务端「已发送」层日志记的
+    就是这份未渲染的 mk 原文，图片链接可整段复制出来单独打开验证。
+    渲染失败（缺 Pillow / 中文字体）时按既有降级返回纯文字，不打断回复。
+    """
+    text = build_diagnostic()
+    img = maybe_image(text, force_image=not force_text,
+                      force_text=force_text, title="机器人自检")
+    if not isinstance(img, ImageReply):
+        return img
+    img.tail = ("🔧 自检链路三层：①收到 → ②组装 → ③已发送（逐条落盘，以服务端日志为准）\n"
+                "日志：data/selfcheck_trace.log｜第 3 层记完整 MK 原文（字符串 + 图片链接）")
+    return img
 
 
 def build_full_help():
@@ -622,9 +645,9 @@ def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
             else:
                 # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
                 return None
-        # 排障：发「自检」直接回一段文字，列出手机端图片/Markdown 各部件状态
+        # 排障：发「自检」回原有诊断内容 + 三层链路说明，走「图片 + 自定义 MK」
         if is_diagnostic(q):
-            return build_diagnostic()
+            return build_selfcheck_reply(force_text=force_txt)
         # 全局「全部指令」查看：返回合并总览（WM + 世界状态）
         if _is_global_help(q):
             return finalize(build_full_help(), ctx, force_image=force_img,

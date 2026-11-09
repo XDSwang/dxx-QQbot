@@ -420,6 +420,36 @@ with patch.dict(os.environ, {"WM_QQ_MARKDOWN": "native",
           and "🔗" not in body["markdown"]["content"])
     check("不带 @ 占位符", "<@" not in body["markdown"]["content"])
 
+    # on_built：发送前拿到「代码层原样、未渲染」的 markdown 原文（链路日志第 3 层用）
+    clean_cache()
+    captured = []
+    calls_mk, fake_mk = fake_http(media_handler)
+    with patch.object(M.bot_config, "urlopen", fake_mk):
+        M.send_reply("TOK", "APP", "https://api.bot.qq.com", "group", "G1",
+                     image_reply(), msg_id="M1", pngs=[PNG], tail=WHISPER,
+                     on_built=lambda mode, md: captured.append((mode, md)))
+    check("on_built 在发送前给出组装好的 markdown 原文",
+          len(captured) == 1 and captured[0][0] == "native"
+          and "content" in captured[0][1])
+    mk_calls = [r for r in calls_mk if r.full_url.endswith("/messages")]
+    sent_content = json.loads(mk_calls[0].data.decode("utf-8"))["markdown"]["content"]
+    check("原文与实际发送 body 的 content 一字不差（未渲染/未截断）",
+          bool(captured) and captured[0][1]["content"] == sent_content)
+    check("原文里图片链接原样保留，可单独复制打开",
+          bool(captured) and "qqbot-media://" in captured[0][1]["content"])
+
+    def bad_cb(mode, md):
+        raise RuntimeError("log broken")
+
+    clean_cache()
+    calls_bad, fake_bad = fake_http(media_handler)
+    with patch.object(M.bot_config, "urlopen", fake_bad):
+        ok_cb, _, _ = M.send_reply(
+            "TOK", "APP", "https://api.bot.qq.com", "group", "G1",
+            image_reply(), msg_id="M1", pngs=[PNG], tail=WHISPER,
+            on_built=bad_cb)
+    check("on_built 抛异常不影响正常发送", ok_cb)
+
     # @ 了机器人：同一条 markdown 最前面多一行官方 @ 用户标签（member_openid）
     clean_cache()
     calls_at, fake_at = fake_http(media_handler)

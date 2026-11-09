@@ -249,7 +249,12 @@ class TestAtBot(unittest.TestCase):
                                  {"type": "text", "data": {"text": " 自检"}}]}
         c._on_message(FakeConn(), at_me_msg)
         self.assertEqual(len(sent), 1)
-        self.assertIn("[CQ:at,qq=5]", sent[0]["params"]["message"])
+        out_msg = sent[0]["params"]["message"]
+        has_at = ("[CQ:at,qq=5]" in out_msg if isinstance(out_msg, str) else
+                  any(s.get("type") == "at"
+                      and str(s.get("data", {}).get("qq")) == "5"
+                      for s in out_msg))
+        self.assertTrue(has_at, "回复要 @ 提问人（CQ 码或 at 段均可）")
         sent.clear()
         at_other = dict(at_me_msg, message=[
             {"type": "at", "data": {"qq": "111"}},
@@ -294,7 +299,12 @@ class TestAtBot(unittest.TestCase):
                "user_id": 5, "message": "@自动化服务查询_D/XX/自检"}
         c._on_message(FakeConn(), msg)
         self.assertEqual(len(sent), 1, "自动昵称应能切开紧贴的指令")
-        self.assertIn("[CQ:at,qq=5]", sent[0]["params"]["message"])
+        out_msg = sent[0]["params"]["message"]
+        has_at = ("[CQ:at,qq=5]" in out_msg if isinstance(out_msg, str) else
+                  any(s.get("type") == "at"
+                      and str(s.get("data", {}).get("qq")) == "5"
+                      for s in out_msg))
+        self.assertTrue(has_at, "回复要 @ 提问人（CQ 码或 at 段均可）")
 
     def test_monitor_records_at_user(self):
         """@机器人 开监控要记住是谁开的，推送才 @ 得到人；停止监控要连带清掉。"""

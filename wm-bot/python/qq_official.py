@@ -124,6 +124,46 @@ def flog(msg):
         pass
 
 
+# ---------------- 消息链路三层记录（收到 / 组装 / 已发送） ----------------
+# 独立于 bot_flow.log 的单份固定记录：手机熄屏冻结 / 进程被结束时，要能看出
+# 「到底卡在哪一层」。故每条单独开写、立刻 flush + fsync，不进 logging 缓冲。
+# ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（第三个固定日志文件） |
+# 原因：用户明确要求链路记录单独一个文件、逐条落盘；非临时实现，但同按 1.4 锁进本函数 |
+# 隔离：仅本函数内，参数进返回值出。
+TRACE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "selfcheck_trace.log")
+TRACE_STAGES = ("收到", "组装", "已发送")
+
+
+def trace_chain(stage, detail, raw=None):
+    """链路三层记录，逐条追加、立刻刷盘；异常静默返回 False，绝不卡住消息主流程。
+
+    raw 是「代码层原样、未被客户端渲染处理」的完整内容（图片链接原样、不截断、
+    不做展示层替换），单独成块写出，方便整段复制出来验证链接与拼接。
+    """
+    if stage not in TRACE_STAGES:
+        return False
+    head = "%s | %s | %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), stage, detail)
+    if raw is not None:
+        head += "---- 完整内容（代码层原样，未渲染）----\n" \
+                + str(raw) + "\n---- 完整内容结束 ----\n"
+    try:
+        with open(TRACE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(head)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except Exception:
+        return False
+
+
+def _mk_raw(md):
+    """取 markdown 对象的代码层原文：native 直接取 content；template 取整份 JSON。"""
+    if isinstance(md, dict) and "content" in md:
+        return md["content"]
+    return json.dumps(md, ensure_ascii=False, sort_keys=True)
+
+
 DEFAULT_API_BASE = "https://api.bot.qq.com"
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 # 1 << 25 = GROUP_AND_C2C_EVENT：群@、群全量消息、单聊、通知开关、进退群、好友变更
@@ -781,7 +821,9 @@ class OfficialBot:
                    # member_openid 记下来，回复时用它 @ 回去、之后的监控推送也 @ 他
                    "at_me": True,
                    "user_id": mo or uo,
-                   "member_openid": mo}
+                   "member_openid": mo,
+                   # 链路日志「收到」层要用的原始内容 / 对方昵称 / 事件类型
+                   "raw": raw, "nickname": name, "event": t}
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "GROUP_MESSAGE_CREATE":
             # 群消息「全量模式」：机器人在 q.qq.com 开了「接收所有消息」后，
@@ -799,7 +841,8 @@ class OfficialBot:
             ctx = {"channel": "group", "group_id": group_openid,
                    "full_message": True,
                    "user_id": mo or uo,
-                   "member_openid": mo}
+                   "member_openid": mo,
+                   "raw": raw, "nickname": name, "event": t}
             # 但「@机器人 平原」在全量模式下也走这个事件：机器人占位符带叹号
             # （<@!bot_openid>），普通成员是 <@openid>、全体是 <@all>。据此点亮 at_me，
             # 否则免前缀的 @ 指令会被当成闲聊静默 —— 用户看到的就是「@ 了没反应」。
@@ -819,7 +862,8 @@ class OfficialBot:
             flog(f"单聊消息 user_openid={openid} 原始内容={raw!r} 剥离后={text!r}")
             bot_config.echo("[recv] 单聊 %s 昵称=%s 原文=%r 剥离=%r"
                             % (openid, name or "-", raw, text))
-            ctx = {"channel": "private", "group_id": openid}
+            ctx = {"channel": "private", "group_id": openid,
+                   "raw": raw, "nickname": name, "event": t}
             self._dispatch_reply(token, "user", openid, text, ctx, msg_id)
         else:
             flog(f"未处理的事件类型 t={t}（已忽略）")
@@ -832,6 +876,21 @@ class OfficialBot:
         """
         if not target_id:
             return
+        c = ctx or {}
+        # 自检只是「一条真实样本」：打标只用于日志区分，不产生新消息，
+        # 所以不会递归触发自己、也不会刷屏。
+        tag = ""
+        try:
+            q = qq_common.strip_query_prefix(text) or text
+            if qq_common.is_diagnostic(q):
+                tag = "[自检] "
+        except Exception:
+            tag = ""
+        nick = str(c.get("nickname") or "").strip() or "-"
+        trace_chain("收到", "%s事件=%s 目标=%s %s msg_id=%s 昵称=%s 剥离后=%r"
+                    % (tag, c.get("event") or "-", kind, target_id,
+                       msg_id or "-", nick, text),
+                    raw=str(c.get("raw", text)))
         # 自己的昵称交给 handler：明文「@昵称」靠它判定（取不到就退回配置/占位符）
         if self.bot_name:
             ctx.setdefault("bot_name", self.bot_name)
@@ -918,6 +977,13 @@ class OfficialBot:
     def _do_reply(self, token, kind, target_id, text, ctx, msg_id):
         if not target_id:
             return
+        trace_tag = ""
+        try:
+            q = qq_common.strip_query_prefix(text) or text
+            if qq_common.is_diagnostic(q):
+                trace_tag = "[自检] "
+        except Exception:
+            trace_tag = ""
         flog(f"进入回复分发 kind={kind} target_id={target_id} msg_id={msg_id} 文本={text!r}")
         try:
             reply = self.handler(text, ctx)
@@ -979,15 +1045,27 @@ class OfficialBot:
             # 排查用：@ 了机器人却没生成 @ 回标签，说明事件里 member_openid/user_id 都是空。
             flog(f"⚠️ @ 了机器人但拿不到 @ 回标签（member_openid/user_id 均空）: "
                  f"{kind} {target_id}")
+        nick = str((ctx or {}).get("nickname") or "").strip() or "-"
+        composed = ("@%s %s" % (nick, str(reply))) if at_tag else str(reply)
+        trace_chain("组装", "%s准备发送 昵称=%s at_tag=%r 回复类型=%s"
+                    % (trace_tag, nick, at_tag, type(reply).__name__),
+                    raw=composed)
 
         # ① 默认 Markdown 消息（msg_type=2）：图片 + 图下两条 /w（图里已有正文，不重复）
         #    config.txt: WM_QQ_MARKDOWN = native；设为 0 可关。
         #    发送失败自动回退下面的富媒体图文混排 / 纯文本。
         if qq_markdown is not None and qq_markdown.enabled():
+            # 捕获组装完成、尚未交给客户端渲染的 markdown 原文，供「已发送」层落盘
+            built = {}
+
+            def _capture_mk(mode, md):
+                built["mode"] = mode
+                built["md"] = md
+
             ok_md, info_md, md_mode = qq_markdown.send_reply(
                 token, self.appid, self.api_base, kind, target_id, reply,
                 msg_id=mid_try, pngs=pngs, tail=tail, post=_api_post,
-                at_tag=at_tag)
+                at_tag=at_tag, on_built=_capture_mk)
             # 图片没上传成功时换 msg_id 重试毫无意义（还是没图），直接回退发图通道
             no_image = str(info_md).startswith(qq_markdown.NO_IMAGE)
             if not ok_md and _can_retry() and not no_image:
@@ -995,11 +1073,15 @@ class OfficialBot:
                 ok_md, info_md, md_mode = qq_markdown.send_reply(
                     token, self.appid, self.api_base, kind, target_id, reply,
                     msg_id=mid_fallback, pngs=pngs, tail=tail, post=_api_post,
-                    at_tag=at_tag)
+                    at_tag=at_tag, on_built=_capture_mk)
             if ok_md:
                 print(f"[official] 已回复 Markdown（{md_mode}）{kind} {target_id}",
                       file=sys.stderr)
                 flog(f"发送 Markdown 成功: {kind} {target_id} 模式={md_mode}")
+                trace_chain("已发送", "%s方式=Markdown(msg_type=2,%s) 目标=%s %s 模式=%s"
+                            % (trace_tag, built.get("mode", md_mode), kind,
+                               target_id, md_mode),
+                            raw=_mk_raw(built.get("md", {})))
                 return
             flog(f"Markdown 发送失败({info_md})，回退富媒体/文本通道")
             # 没图属于「通道拿不到素材」，不是业务发送失败：即便调试时关了
@@ -1027,6 +1109,9 @@ class OfficialBot:
                     print(f"[official] 图片后字符串发送失败: {info2}",
                           file=sys.stderr)
                     flog(f"图片后字符串发送失败: {info2}")
+            trace_chain("已发送", "%s方式=富媒体(msg_type=7) 目标=%s %s 张数=%d %s"
+                        % (trace_tag, kind, target_id, len(pngs), way),
+                        raw=mix_tail if mix_tail is not None else "(纯图，无文字)")
             return
         # 图片没发成：退回完整文本；tail（/w 指令）并回正文一起发，不能丢
         text_out = str(reply)
@@ -1042,6 +1127,8 @@ class OfficialBot:
         else:
             print(f"[official] 已回复 {kind} {target_id}", file=sys.stderr)
             flog(f"发送成功: {kind} {target_id}")
+            trace_chain("已发送", "%s方式=文本(msg_type=0) 目标=%s %s"
+                        % (trace_tag, kind, target_id), raw=text_out)
 
     def _reply_images(self, token, kind, target_id, pngs, msg_id, content=None):
         """逐张上传 + 发送；content 非空时并进【最后一张】图片消息做图文混排。

@@ -177,7 +177,7 @@ def main():
     ok += check("世界状态 HELP_WORDS 不含 帮助/help/?",
                 not ({"帮助", "help", "?" } & ws.HELP_WORDS))
 
-    # 5) 排障「自检」命令：识别 + handler 直接回诊断文字（不进图片/不静默）
+    # 5) 排障「自检」命令：识别 + 原有诊断文字 + 三层链路说明，升级为图片 + 自定义 MK
     for w in ("自检", "诊断", "diy", "diagnose", "状态"):
         total += 1
         ok += check("排障词命中: %r" % w, q.is_diagnostic(w))
@@ -193,8 +193,20 @@ def main():
                 "render_card" in r_diag and "Markdown" in r_diag
                 and "出图模式" in r_diag)
     total += 1
-    ok += check("诊断不是图片（pngs 为空）",
-                not getattr(r_diag, "pngs", None))
+    ok += check("自检已升级为图片回复（pngs 非空）",
+                bool(getattr(r_diag, "pngs", None)))
+    total += 1
+    ok += check("自检 tail 含三层顺序（收到/组装/已发送）",
+                all(w in str(getattr(r_diag, "tail", ""))
+                    for w in ("收到", "组装", "已发送")))
+    total += 1
+    ok += check("自检保留原有检查项并叠加三层链路说明",
+                "消息链路三层" in r_diag and "selfcheck_trace.log" in r_diag)
+    r_txt = q.build_selfcheck_reply(force_text=True)
+    total += 1
+    ok += check("强制纯文字时自检仍返回诊断正文、不出图",
+                not isinstance(r_txt, q.ImageReply)
+                and "消息链路三层" in r_txt)
 
     # 6) maybe_image 在 render_card 不可用时，把失败原因直接带进回复文字
     import builtins
