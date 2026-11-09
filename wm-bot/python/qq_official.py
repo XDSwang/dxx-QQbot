@@ -213,6 +213,35 @@ def send_message(token, appid, api_base, target_kind, target_id, content, msg_id
         return False, str(e)
 
 
+def broadcast_to_groups(appid, secret, api_base, groups, text, kind="group"):
+    """给一组授权群逐个主动推送一条纯文字系统通知（不依赖 bot_config/config 模块）。
+
+    用于「服务端更新前/后」给所有授权群广播暂停/恢复服务。逐群发送，
+    单群失败（如该群没开「机器人主动在群聊内发言」开关）只记日志、
+    不中断其余群；全部失败返回 (sent, failed)。发送走与查询回复同一套
+    send_message（被动窗口之外，故不带 msg_id，纯主动推送）。
+    """
+    if not groups:
+        return 0, 0
+    try:
+        mgr = TokenManager(appid, secret, api_base)
+        token = mgr.get_token()
+    except Exception as e:
+        flog(f"广播取 token 失败: {e}")
+        return 0, len(groups)
+    sent = 0
+    failed = 0
+    for gid in groups:
+        ok, info = send_message(token, appid, api_base, kind, gid, text, msg_id=None)
+        if ok:
+            sent += 1
+            flog(f"广播成功: {kind} {gid}")
+        else:
+            failed += 1
+            flog(f"广播失败: {kind} {gid} {info}")
+    return sent, failed
+
+
 # ---------------- 发图片（富媒体：先上传拿 file_info，再 msg_type=7） ----------------
 def _api_get(token, appid, api_base, path, timeout=10):
     """统一 GET，返回 (ok, resp_dict_or_err)。失败不抛异常（与 _api_post 对称）。"""
@@ -1069,7 +1098,8 @@ def main():
                                  str(qq_common.DEFAULT_GROUPS_FILE))
     allowed = qq_common.load_allowed_groups(groups_file)
     allow_all = bot_config.flag("WM_QQ_ALLOW_ALL_GROUPS")
-    base_handler = qq_common.make_handler(allowed, allow_all=allow_all)
+    base_handler = qq_common.make_handler(allowed, allow_all=allow_all,
+                                         groups_file=groups_file)
     # 全量群消息下任意一条消息都能作为「监控内容被动捎带」的窗口，
     # 不必非等有人发查询指令（白名单外依然严格静默）。
     handler = qq_common.make_monitor_aware_handler(base_handler)

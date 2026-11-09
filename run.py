@@ -28,6 +28,11 @@ HERE = Path(__file__).resolve().parent          # 仓库根（公共仓库本体
 CFG_FILE = HERE / "update.cfg"
 SERVICES_FILE = HERE / "services.json"
 
+# 广播功能（更新前后通知授权群）由 _broadcast_update 懒导入 wm-bot 的 qq_official；
+# 这里提前把子目录放进 sys.path，使 supervisor 进程也能 import，而无需在启动时
+# 拉起整个机器人模块栈。
+sys.path.insert(0, str(HERE / "wm-bot" / "python"))
+
 # 没传 svc 的调用（离线测试 / 单服务旧调用）仍落在 wm-bot 上
 BOT_DATA_DIR = HERE / "wm-bot" / "python" / "data"
 BOT_CONFIG = BOT_DATA_DIR / "config.txt"
@@ -623,7 +628,61 @@ def _restore_backup(backup_dir, data_dir):
             (Path(data_dir) / src.name).write_bytes(src.read_bytes())
 
 
-def do_update(cfg, store, bot, sig, svc=None, pull=True):
+def _read_bot_credentials(cfg_path):
+    """从 wm-bot/python/data/config.txt 解析 QQ 机器人凭证（与 bot_config 同一份文件）。
+
+    按「名称 = 值」解析 WM_QQ_APPID / WM_QQ_SECRET / WM_QQ_API_BASE；缺字段或文件
+    缺失返回 None。**绝不打印 secret**。
+    """
+    p = Path(cfg_path)
+    if not p.exists():
+        return None
+    kv = {}
+    try:
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+    except (OSError, UnicodeError):
+        return None
+    appid = kv.get("WM_QQ_APPID")
+    secret = kv.get("WM_QQ_SECRET")
+    if not appid or not secret:
+        return None
+    api_base = kv.get("WM_QQ_API_BASE") or "https://api.bot.qq.com"
+    return appid, secret, api_base
+
+
+def _broadcast_update(text, cfg_path, data_dir):
+    """更新前/后给所有授权群广播一条系统通知（主动群消息，逐群发）。
+
+    整段包 try/except：广播失败（缺模块 / 读不到凭证 / token 失败 / 群没开主动发言）
+    绝不阻塞更新流程。需要每个群在群资料页开启「机器人主动在群聊内发言」。
+    """
+    try:
+        import qq_official
+        import qq_common
+        creds = _read_bot_credentials(cfg_path)
+        if not creds:
+            updater.flog("广播跳过：读不到 QQ 机器人凭证（config.txt 缺 "
+                         "WM_QQ_APPID/SECRET）")
+            return
+        groups_file = Path(data_dir) / "groups.txt"
+        groups = sorted(qq_common.load_allowed_groups(str(groups_file)))
+        if not groups:
+            updater.flog("广播跳过：群白名单为空（%s）" % groups_file)
+            return
+        appid, secret, api_base = creds
+        sent, failed = qq_official.broadcast_to_groups(
+            appid, secret, api_base, groups, text)
+        updater.flog("广播[%s] 成功=%d 失败=%d" % (text, sent, failed))
+    except Exception as e:
+        updater.elog("广播异常（不影响更新）", str(e))
+
+
+def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
     """执行一个服务的一轮更新；无论成败都在 finally 里把该服务拉起来。
 
     svc 为空时退回单服务默认路径（离线测试 / 旧调用）；pull=False 用于全局信号
@@ -638,15 +697,29 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
     backup_dir = None
     succeeded = False       # 不叫 ok：do_update 里 ok 是 git_pull / 写文件的返回值
     try:
-        if not bot.stop():
-            return False
+        # code_updated：本次更新是否拉到了公共库新代码（仅此情形才给群广播）。
+        #  - pull=True（单服务独立信号路径）：下方 git_pull 后比对 HEAD 自算；
+        #  - pull=False（全局已统一 pull 过）：用调用方传入的 code_updated。
+        # 只有公共库真有新 commit 才广播「即将更新 / 更新完成」，避免「更新完成」
+        # 误导群友（因为本地代码其实没变）。
         if pull:
+            pre_c, pre_sha, _ = _git(["rev-parse", "HEAD"])
             ok, info = git_pull(cfg)
             if not ok:
                 updater.elog("[%s] git pull 失败，本次更新作废" % (service or "default"),
                              info)
                 return False
             updater.flog("[%s] git pull: %s" % (service or "default", info or "无变更"))
+            post_c, post_sha, _ = _git(["rev-parse", "HEAD"])
+            code_updated = bool(pre_sha and post_sha
+                                and pre_sha.strip() != post_sha.strip()
+                                and pre_c == 0 and post_c == 0)
+        # 仅公共库有新 commit 才广播「即将更新，暂停服务」；无新代码直接停（不广播）。
+        # 广播失败绝不阻塞更新。
+        if code_updated:
+            _broadcast_update("即将更新，暂停服务", cfg_path, data_dir)
+        if not bot.stop():
+            return False
 
         backup_dir = str(updater.backup_root(service) /
                          (time.strftime("%Y%m%d-%H%M%S") + "-%d" % os.getpid()))
@@ -710,6 +783,18 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True):
                         len(report["renamed"]), len(report["dropped"]),
                         len(report["added"]), ",".join(bad) or "-"))
         succeeded = True
+        try:
+            updater.prune_backups(service, keep=3)
+        except Exception as e:
+            updater.elog("[%s] 旧备份清理失败（不影响本次更新）"
+                         % (service or "default"), str(e))
+        # 仅在有新代码时才广播「更新完成，开始服务」（与停前广播成对）。
+        if code_updated:
+            try:
+                _broadcast_update("更新完成，开始服务", cfg_path, data_dir)
+            except Exception as e:
+                updater.elog("[%s] 更新完成广播失败（不影响已完成的更新）"
+                             % (service or "default"), str(e))
         return True
     except Exception as e:
         _restore_backup(backup_dir, data_dir)
@@ -872,14 +957,20 @@ def main():
                 target_key, trigger_sig = "__code__", code_sig
             if target_key is not None:
                 # 整仓库只 pull 一次，所有服务一起迁移
+                pre_c, pre_sha, _ = _git(["rev-parse", "HEAD"])
                 ok, info = git_pull(cfg)
                 if not ok:
                     updater.elog("全局更新 git pull 失败，本轮作废", info)
                     mark_failed(trigger_sig, target_key)
                 else:
                     updater.flog("[global] git pull: %s" % (info or "无变更"))
+                    post_c, post_sha, _ = _git(["rev-parse", "HEAD"])
+                    # 公共库是否真拉到新 commit：决定各服务停前/成功后是否广播。
+                    new_code = bool(pre_sha and post_sha
+                                    and pre_sha.strip() != post_sha.strip()
+                                    and pre_c == 0 and post_c == 0)
                     plan = [(s, service_stores[s.name], bots[s.name],
-                             trigger_sig, False) for s in services]
+                             trigger_sig, False, new_code) for s in services]
                     st = updater.load_state(target_key)
                     st.update({"last_signal": trigger_sig.fingerprint,
                                "failed_signal": "", "failed_rounds": 0,
@@ -897,7 +988,7 @@ def main():
                         crashes[n] = 0
                         crash_since[n] = now
             # 各服务独立信号：只更新被点名的那个，不惊动其他服务
-            planned = {s.name for s, _, _, _, _ in plan}
+            planned = {s.name for s, _, _, _, _, _ in plan}
             for s in services:
                 if s.name in planned:
                     continue
@@ -912,9 +1003,10 @@ def main():
                         or sig.fingerprint == st.get("last_signal")
                         or _blocked_by_failure(st, sig.fingerprint)):
                     continue
-                plan.append((s, service_stores[s.name], bots[s.name], sig, True))
-            for s, store, bot, sig, pull in plan:
-                do_update(cfg, store, bot, sig, svc=s, pull=pull)
+                plan.append((s, service_stores[s.name], bots[s.name], sig, True, False))
+            for s, store, bot, sig, pull, new_code in plan:
+                do_update(cfg, store, bot, sig, svc=s, pull=pull,
+                          code_updated=new_code)
             # 私有库配置热更新（账号本人在网站 / git 改了 config）：只处理本轮没被
             # 代码更新碰过的服务，避免重复重启；检测哈希变化即按模板迁移 + 热重载。
             if not _off(cfg.get("UPDATER_SYNC_PRIVATE_CONFIG", "1")):

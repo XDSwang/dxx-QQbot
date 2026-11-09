@@ -517,13 +517,51 @@ def load_allowed_groups(path):
     return allowed
 
 
-def make_handler(allowed_groups=None, allow_all=False):
+def _load_groups_cached(cache, groups_file):
+    """带 mtime+size 缓存地读取群白名单（支持热加载）。
+
+    文件没变（mtime_ns + size 都没变）就返回上次解析好的集合，不重复读盘；
+    变了才重读。用于：用户改 groups.txt 后无需重启机器人，下次群消息即生效。
+    文件不存在 / 读失败（如正在写）按空集处理，绝不因此误放行白名单外的群。
+    cache 为单元素列表 [ (mtime_ns, size, set) ]，由调用方持有。
+    """
+    try:
+        p = Path(groups_file)
+        st = p.stat()
+    except OSError:
+        cache[0] = (0, 0, set())
+        return set()
+    key = (st.st_mtime_ns, st.st_size)
+    if cache[0][2] is not None and cache[0][0] == key[0] and cache[0][1] == key[1]:
+        return cache[0][2]
+    allowed = set()
+    try:
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            gid = line.split("#", 1)[0].strip()
+            if gid:
+                allowed.add(gid)
+    except (OSError, UnicodeError):
+        # 读到一半被改写：保留上一份结果，避免误放行
+        if cache[0][2] is not None:
+            return cache[0][2]
+        return set()
+    cache[0] = (key[0], key[1], allowed)
+    return allowed
+
+
+def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
     """
     返回一个 handler(text, ctx) -> str|None，供两种传输层共用。
 
     - allowed_groups=None 或 allow_all=True：宽松，所有群都处理（测试 / 调试用）；
-    - 正式运行传 allowed_groups（群号/OpenID 集合）且 allow_all=False：
-      只有白名单内的群才回复，且需消息以 /wm 或 /zk 开头，避免刷屏。
+    - groups_file 给定时：每次群消息按该文件【当前内容】判断白名单（带 mtime+size
+      缓存，文件没变不重读），改完 groups.txt 即时生效，无需重启；groups_file 优先
+      于静态 allowed_groups（传了 groups_file 就不再用静态 allowed_groups 判断）；
+    - 正式运行传 groups_file（群 OpenID 逐行）且 allow_all=False：只有白名单内的群
+      才回复，且需消息以 /wm 或 /zk 开头，避免刷屏。
     私聊（channel != "group"）不受群白名单限制（一对一，无刷屏风险）。
 
     ctx 字段约定（两种传输层归一化后传入）：
@@ -531,13 +569,24 @@ def make_handler(allowed_groups=None, allow_all=False):
       - group_id：群号（OneBot，整数）或群 OpenID（官方，字符串）
     """
 
+    # 热加载缓存：groups_file 给定时，每次取白名单先查这个（文件没变就不重读），
+    # 改完 groups.txt 无需重启机器人即可生效。
+    _gcache = [(0, 0, None)]
+
+    def _current_groups():
+        if groups_file:
+            return _load_groups_cached(_gcache, groups_file)
+        return allowed_groups
+
+
     def handler(text, ctx=None):
         ctx = ctx or {}
         channel = ctx.get("channel") or ctx.get("message_type")
         if channel == "group":
             # 群聊：严格按白名单；不在名单内直接静默（不回复）
             gid = str(ctx.get("group_id", ""))
-            if not allow_all and allowed_groups is not None and gid not in allowed_groups:
+            cur = _current_groups()
+            if not allow_all and cur is not None and gid not in cur:
                 # 白名单外的群：严格静默，不回复、不打印任何提示；
                 # 不自动写入 groups.txt（否则等于监控所有群，违反"只监控白名单群"的铁律）。
                 return None

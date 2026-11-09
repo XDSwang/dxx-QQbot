@@ -111,6 +111,39 @@ def main():
         total += 1
         ok += check("handler %r 未精确命中 → 静默（None）" % w, r is None)
 
+    # 3.9) 群白名单热加载：不改 handler、直接改文件内容，白名单即时变化（无需重启）
+    gf = os.path.join(HERE, "_test_groups_hot.txt")
+    try:
+        if os.path.exists(gf):
+            os.remove(gf)
+        HG = q.make_handler(allowed_groups=None, allow_all=False, groups_file=gf)
+        GRP1 = {"channel": "group", "group_id": "HOT1"}
+        GRP2 = {"channel": "group", "group_id": "HOT2"}
+        total += 1
+        ok += check("热加载初始（文件不存在）：白名单外群静默",
+                    HG("帮助", GRP1) is None)
+        # 写入白名单（含 HOT1，不含 HOT2）
+        with open(gf, "w", encoding="utf-8") as _f:
+            _f.write("# 测试白名单\nHOT1\n")
+        total += 1
+        ok += check("热加载：写入 HOT1 后该群即时响应（无需重启）",
+                    isinstance(HG("帮助", GRP1), str))
+        total += 1
+        ok += check("热加载：未写入的 HOT2 仍静默",
+                    HG("帮助", GRP2) is None)
+        # 把 HOT1 换成 HOT2（验证文件变化被识别，不是只读一次缓存）
+        with open(gf, "w", encoding="utf-8") as _f:
+            _f.write("HOT2\n")
+        total += 1
+        ok += check("热加载：文件改完后 HOT1 退回静默",
+                    HG("帮助", GRP1) is None)
+        total += 1
+        ok += check("热加载：HOT2 接手响应",
+                    isinstance(HG("帮助", GRP2), str))
+    finally:
+        if os.path.exists(gf):
+            os.remove(gf)
+
     # 4) 世界状态 HELP_WORDS 不再含 帮助/help/?（避免与全局总览冲突）
     total += 1
     ok += check("世界状态 HELP_WORDS 不含 帮助/help/?",

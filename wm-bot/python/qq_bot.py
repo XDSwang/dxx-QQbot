@@ -52,7 +52,8 @@ def _run_onebot():
                                  str(qq_common.DEFAULT_GROUPS_FILE))
     allowed = qq_common.load_allowed_groups(groups_file)
     allow_all = bot_config.flag("WM_QQ_ALLOW_ALL_GROUPS")
-    base_handler = qq_common.make_handler(allowed, allow_all=allow_all)
+    base_handler = qq_common.make_handler(allowed, allow_all=allow_all,
+                                         groups_file=groups_file)
     client = OneBotClient(
         url=url, token=token, mode=mode,
         handler=qq_common.make_monitor_aware_handler(base_handler),

@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -285,6 +286,27 @@ def backup_root(service=None):
     if not service:
         return BACKUP_ROOT
     return STATE_DIR / "services" / service / "backup"
+
+
+def prune_backups(service=None, keep=3):
+    """清理 backup_root(service) 下最旧的整份备份目录，只留最近 keep 份。
+
+    备份子目录命名 ``<时间戳>-<进程号>``（前缀 %Y%m%d-%H%M%S），字典序即时间序。
+    只删 backup_root 内部的纯时间戳子目录，**绝不碰运行数据根目录**。
+    返回实际删除的目录数。
+    """
+    if keep is None or keep < 0:
+        keep = 0
+    root = backup_root(service)
+    if not root.exists():
+        return 0
+    subs = [p for p in root.iterdir() if p.is_dir()]
+    subs.sort(key=lambda p: p.name, reverse=True)  # 最新在前
+    removed = 0
+    for p in subs[keep:]:
+        shutil.rmtree(str(p), ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def load_state(service=None):
@@ -757,9 +779,11 @@ def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
     if url:
         pace_gate(url)
     try:
-        run_env = None
+        run_env = dict(os.environ)
+        # 无凭据时禁止 git 弹交互式「Username for ...」验证提示，直接失败并让
+        # 编排层回退到备用协议 / 备用源（手机没配 GitHub 凭据时尤其必要）。
+        run_env["GIT_TERMINAL_PROMPT"] = "0"
         if env:
-            run_env = dict(os.environ)
             run_env.update(env)
         r = subprocess.run(["git"] + list(args), cwd=str(cwd) if cwd else None,
                            capture_output=True, text=True, timeout=timeout,

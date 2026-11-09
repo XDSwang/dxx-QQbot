@@ -536,6 +536,39 @@ class TestMultiService(_Base):
         self.assertEqual(updater.load_state(), {})
         self.assertIn("services", str(updater.backup_root("wm-bot")))
 
+    def test_prune_backups_keeps_recent_and_removes_old(self):
+        root = updater.backup_root(None)
+        root.mkdir(parents=True, exist_ok=True)
+        for ts in ("20260101-000000-1", "20260201-000000-2",
+                   "20260301-000000-3", "20260401-000000-4"):
+            (root / ts).mkdir()
+        (root.parent / "runtime.json").write_text("{}")
+        removed = updater.prune_backups(None, keep=2)
+        self.assertEqual(removed, 2, "应删掉 2 个最旧备份")
+        remaining = sorted(p.name for p in root.iterdir() if p.is_dir())
+        self.assertEqual(remaining,
+                         ["20260301-000000-3", "20260401-000000-4"])
+        self.assertTrue(root.exists(), "backup 父目录本身保留")
+        self.assertTrue((root.parent / "runtime.json").exists(),
+                        "运行数据根不被误删")
+
+    def test_prune_backups_keep_zero_removes_all(self):
+        root = updater.backup_root("wm-bot")
+        root.mkdir(parents=True, exist_ok=True)
+        for ts in ("20260101-000000-1", "20260201-000000-2"):
+            (root / ts).mkdir()
+        removed = updater.prune_backups("wm-bot", keep=0)
+        self.assertEqual(removed, 2)
+        self.assertEqual([p for p in root.iterdir() if p.is_dir()], [])
+        self.assertTrue(root.exists())
+
+    def test_prune_backups_negative_keep_treated_as_zero(self):
+        root = updater.backup_root("other")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "20260101-000000-1").mkdir()
+        removed = updater.prune_backups("other", keep=-1)
+        self.assertEqual(removed, 1)
+
     def test_sync_code_bootstraps_without_checkout(self):
         calls = []
 
