@@ -651,6 +651,9 @@ class OfficialBot:
         # 机器人自己的名字（GET /users/@me 自动取）；有的客户端把「@机器人」发成
         # 明文「@昵称」而不是占位符，没有它就没法判断「@ 的是不是我」。
         self.bot_name = ""
+        # 自身 openid（READY.user.id / /users/@me.id）：全量消息里「@机器人」还会
+        # 写成不带叹号的 <@openid>，只能靠它精确比对，别把 @普通成员也当成 @我。
+        self.bot_openid = ""
         self._self_tries = 0
 
     def stop(self):
@@ -856,10 +859,14 @@ class OfficialBot:
             return
         self._self_tries += 1
         ok, info = _api_get(token, self.appid, self.api_base, "/users/@me")
-        if ok and isinstance(info, dict) and info.get("username"):
-            self.bot_name = str(info["username"]).strip()
-            bot_config.echo("[official] 自身信息：昵称=%r" % self.bot_name)
-            flog(f"自身信息 昵称={self.bot_name!r}")
+        if ok and isinstance(info, dict):
+            if info.get("username") and not self.bot_name:
+                self.bot_name = str(info["username"]).strip()
+                bot_config.echo("[official] 自身信息：昵称=%r" % self.bot_name)
+                flog(f"自身信息 昵称={self.bot_name!r}")
+            if info.get("id") and not self.bot_openid:
+                self.bot_openid = str(info["id"]).strip()
+                flog(f"自身信息 openid={self.bot_openid!r}")
         elif not ok:
             flog(f"取自身资料失败（改用占位符/配置判定）: {info}")
 
@@ -936,6 +943,10 @@ class OfficialBot:
                 if pkt.get("t") in ("READY", "RESUMED"):
                     trace_chain("连接", "网关 %s：会话已就绪，开始接收群消息"
                                 % pkt.get("t"))
+                    d0 = pkt.get("d")
+                    u0 = d0.get("user") if isinstance(d0, dict) else None
+                    if isinstance(u0, dict) and u0.get("id") and not self.bot_openid:
+                        self.bot_openid = str(u0["id"]).strip()
                 self._on_event(conn, pkt, token)
 
     def _start_heartbeat(self, conn, interval):
@@ -1100,6 +1111,12 @@ class OfficialBot:
             elif _text_mentions_bot(raw, self.bot_name):
                 # 有的客户端 / 全量模式下「@机器人」是明文「@昵称」，没有叹号占位符。
                 # 认出来才算 @ 我；认出来就按 @ 消息处理（可以引用回复，不用普通群消息）。
+                ctx["at_me"] = True
+                ctx.pop("full_message", None)
+            elif (self.bot_openid
+                  and ("<@%s>" % self.bot_openid) in (raw or "")):
+                # 全量消息里 QQ 也会把 @机器人 写成不带叹号的 <@机器人openid>：
+                # 用 READY / users/@me 拿到的自身 openid 精确比对，@ 普通成员不误判。
                 ctx["at_me"] = True
                 ctx.pop("full_message", None)
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)

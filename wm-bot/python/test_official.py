@@ -493,6 +493,21 @@ class TestOnEvent(unittest.TestCase):
         self.bot._on_event(None, self._pkt_group_full("<@7A3B9C1D> 自检"), "TOK")
         self.assertEqual(self.calls, [])
 
+    def test_group_full_message_at_bot_plain_openid(self):
+        """线上真实样本：全量消息里 QQ 把 @机器人 写成不带叹号的
+        <@机器人openid>；用自身 openid 精确比对后，免前缀自检不能静默。"""
+        self.bot.bot_openid = "9700B570215F656CE30231EE174ED3C1"
+        self.bot._on_event(None, self._pkt_group_full(
+            "<@9700B570215F656CE30231EE174ED3C1> 自检"), "TOK")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("出图模式", self.calls[0][2])
+
+    def test_group_full_message_at_other_openid_still_silent(self):
+        """自身 openid 已知时，@ 别的成员（无叹号占位符）依旧静默，不抢话。"""
+        self.bot.bot_openid = "9700B570215F656CE30231EE174ED3C1"
+        self.bot._on_event(None, self._pkt_group_full("<@7A3B9C1D> 自检"), "TOK")
+        self.assertEqual(self.calls, [])
+
     def test_group_full_message_plain_text_at_bot(self):
         """有的客户端把「@机器人」发成明文「@昵称」（没有 <@!openid> 占位符）：
         自动取到昵称后要认出 at_me，免前缀指令不能静默。"""
@@ -521,6 +536,40 @@ class TestOnEvent(unittest.TestCase):
             self.assertEqual(self.bot.bot_name, "自动化服务查询_D/XX/", "只拉一次")
         finally:
             qq_official._api_get = orig
+
+    def test_fetch_self_fills_bot_openid(self):
+        """GET /users/@me 的 id 即机器人自身 openid，供 <@openid> 精确比对。"""
+        orig = qq_official._api_get
+        qq_official._api_get = lambda *a, **k: (
+            True, {"id": "9700B570215F656CE30231EE174ED3C1",
+                   "username": "自动化服务查询_D/XX/"})
+        try:
+            self.bot._fetch_self("TOK")
+            self.assertEqual(self.bot.bot_openid,
+                             "9700B570215F656CE30231EE174ED3C1")
+        finally:
+            qq_official._api_get = orig
+
+    def test_ready_fills_bot_openid(self):
+        """READY.user.id 是自身 openid 的兜底来源（/users/@me 没给 id 时）。"""
+        class FakeConn:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            def recv_message(self):
+                if self.frames:
+                    return self.frames.pop(0)
+                raise RuntimeError("no more frames")
+
+        frame = ("text", json.dumps({
+            "op": 0, "t": "READY", "s": 1,
+            "d": {"user": {"id": "9700B570215F656CE30231EE174ED3C1"},
+                  "session_id": "S1", "shard": [0, 1], "version": "1"},
+        }).encode("utf-8"))
+        with self.assertRaises(RuntimeError):
+            self.bot._loop(FakeConn([frame]), "TOK")
+        self.assertEqual(self.bot.bot_openid,
+                         "9700B570215F656CE30231EE174ED3C1")
 
     def test_image_reply_sends_tail_in_same_message(self):
         """WM 回复：图片 + /w 字符串合成一条图文混排消息，且不带 (wf.m ...) 备注。"""
