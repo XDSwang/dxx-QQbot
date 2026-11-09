@@ -526,7 +526,10 @@ def _load_groups_cached(cache, groups_file):
     cache 为单元素列表 [ (mtime_ns, size, set) ]，由调用方持有。
     """
     try:
-        p = Path(groups_file)
+        # 必须与 load_allowed_groups 用同一套解析：相对路径按【脚本所在目录】算，
+        # 不能按进程 cwd（服务端 cwd 是 wm-bot，会把 data/groups.txt 解析到不存在的
+        # 位置 → 空集 → 所有群被静默，而启动时加载却正常）。
+        p = resolve_path(groups_file)
         st = p.stat()
     except OSError:
         cache[0] = (0, 0, set())

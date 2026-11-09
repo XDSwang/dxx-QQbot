@@ -144,6 +144,28 @@ def main():
         if os.path.exists(gf):
             os.remove(gf)
 
+    # 3.10) 相对路径的 groups_file 必须按【脚本所在目录】解析，不能按进程 cwd。
+    #       服务端跑 bot 时 cwd 是 wm-bot（不是 python/），若按 cwd 解析会把
+    #       data/groups.txt 指到不存在的目录 → 空集 → 所有群静默（而启动日志却显示已加载）。
+    rel = "_test_groups_rel.txt"
+    rp = os.path.join(HERE, rel)
+    old_cwd = os.getcwd()
+    try:
+        with open(rp, "w", encoding="utf-8") as _f:
+            _f.write("REL1\n")
+        HR = q.make_handler(allowed_groups=None, allow_all=False, groups_file=rel)
+        os.chdir(os.path.dirname(HERE))          # 模拟「cwd 不是 python/」的真实运行环境
+        total += 1
+        ok += check("相对路径 groups_file：换 cwd 后仍按脚本目录解析（REL1 群可响应）",
+                    isinstance(HR("帮助", {"channel": "group", "group_id": "REL1"}), str))
+        total += 1
+        ok += check("相对路径 groups_file：白名单外的群仍静默",
+                    HR("帮助", {"channel": "group", "group_id": "REL2"}) is None)
+    finally:
+        os.chdir(old_cwd)
+        if os.path.exists(rp):
+            os.remove(rp)
+
     # 4) 世界状态 HELP_WORDS 不再含 帮助/help/?（避免与全局总览冲突）
     total += 1
     ok += check("世界状态 HELP_WORDS 不含 帮助/help/?",
