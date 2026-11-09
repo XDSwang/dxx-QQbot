@@ -119,73 +119,73 @@ class TestHandler(unittest.TestCase):
     def test_handler_mock(self):
         os.environ["WM_SOURCE"] = "mock"
         h = qq_bot.make_handler()   # 无参=宽松（所有群都回），便于本地直跑
-        # WM 查询现在必须带 D/XX/ 前缀，否则静默（防群聊误触发）
+        # WM 查询现在必须带 dxx  前缀，否则静默（防群聊误触发）
         self.assertIsNone(h("WM Boltor Prime", {}), "裸 WM 查询应静默")
-        reply = h("D/XX/WM Boltor Prime", {})
+        reply = h("dxx WM Boltor Prime", {})
         self.assertIn("boltor prime", reply.lower())
         self.assertIn("铂金", reply)
         # 非指令不回复
         self.assertIsNone(h("你好啊群友", {}))
-        # 报错 强制刷新也能走通（带 D/XX/ 前缀；报错是斜杠触发词，前缀前加 /）
-        reply2 = h("/D/XX/报错 WM Boltor Prime", {})
+        # 报错 强制刷新也能走通（带 dxx  前缀；报错是斜杠触发词，前缀前加 /）
+        reply2 = h("/dxx 报错 WM Boltor Prime", {})
         self.assertIn("boltor prime", reply2.lower())
 
     def test_group_whitelist(self):
         os.environ["WM_SOURCE"] = "mock"
         # 严格模式：仅白名单群 123456 才回复
         h = qq_bot.make_handler({"123456"}, allow_all=False)
-        # 白名单群内 WM 触发（带 D/XX/ 前缀） -> 回复
-        self.assertIsNotNone(h("D/XX/WM Boltor Prime",
+        # 白名单群内 WM 触发（带 dxx  前缀） -> 回复
+        self.assertIsNotNone(h("dxx WM Boltor Prime",
                                {"message_type": "group", "group_id": 123456}))
         # 非白名单群（即使带前缀）-> 静默
-        self.assertIsNone(h("D/XX/WM Boltor Prime",
+        self.assertIsNone(h("dxx WM Boltor Prime",
                             {"message_type": "group", "group_id": 999999}))
         # 非白名单群内非指令 -> 静默
         self.assertIsNone(h("闲聊一下",
                             {"message_type": "group", "group_id": 123456}))
         # 私聊不受白名单限制
-        self.assertIsNotNone(h("D/XX/ZK Tigris",
+        self.assertIsNotNone(h("dxx ZK Tigris",
                                {"message_type": "private", "user_id": 1}))
         # 空白名单 -> 所有群都静默（符合"没写就不监控"）
         h2 = qq_bot.make_handler(set(), allow_all=False)
-        self.assertIsNone(h2("D/XX/WM x", {"message_type": "group", "group_id": 123456}))
+        self.assertIsNone(h2("dxx WM x", {"message_type": "group", "group_id": 123456}))
 
     def test_query_prefix_gating(self):
-        """D/XX/ 前缀门槛：WM / 世界状态查询 / 监控开关 / 自检 都必须带 D/XX/ 前缀；
+        """dxx  前缀门槛：WM / 世界状态查询 / 监控开关 / 自检 都必须带 dxx  前缀；
         唯一例外是「帮助」类词（发两个字的「帮助」就出菜单，用户明确要求）；
         只有机器人主动推送（send_active）不在用户指令范畴，不受影响。"""
         os.environ["WM_SOURCE"] = "mock"
         h = qq_bot.make_handler()   # 宽松
-        # WM 查询：裸 -> 静默；带 D/XX/ -> 回复
+        # WM 查询：裸 -> 静默；带 dxx  -> 回复
         self.assertIsNone(h("wm Boltor", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("zk Tigris", {"channel": "group", "group_id": "g"}))
-        self.assertIsNotNone(h("D/XX/wm Boltor",
+        self.assertIsNotNone(h("dxx wm Boltor",
                                {"channel": "group", "group_id": "g"}))
-        self.assertIsNotNone(h("D/XX/zk Tigris",
+        self.assertIsNotNone(h("dxx zk Tigris",
                                {"channel": "group", "group_id": "g"}))
-        # 世界状态查询：也必须带 D/XX/ 前缀（防群聊误触发），裸 -> 静默
+        # 世界状态查询：也必须带 dxx  前缀（防群聊误触发），裸 -> 静默
         self.assertIsNone(h("平原", {"channel": "group", "group_id": "g"}))
-        self.assertIsNotNone(h("D/XX/平原", {"channel": "group", "group_id": "g"}))
-        # 监控控制：裸「监控」「监控全部」都静默；带 D/XX/ 才生效
+        self.assertIsNotNone(h("dxx 平原", {"channel": "group", "group_id": "g"}))
+        # 监控控制：裸「监控」「监控全部」都静默；带 dxx  才生效
         self.assertIsNone(h("监控", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("监控全部", {"channel": "group", "group_id": "g"}))
-        r = h("D/XX/监控", {"channel": "group", "group_id": "g"})
+        r = h("dxx 监控", {"channel": "group", "group_id": "g"})
         self.assertIsNotNone(r)
         self.assertIn("监控全部", r)   # 安全提示，不全开
-        self.assertIsNotNone(h("D/XX/监控全部", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("dxx 监控全部", {"channel": "group", "group_id": "g"}))
         # 帮助【例外】：发「帮助」两个字就出菜单，不要求前缀（用户明确要求）；
         # 自检仍需前缀
         r_bare_help = h("帮助", {"channel": "group", "group_id": "g"})
         self.assertIsNotNone(r_bare_help)
         self.assertIn("全部指令一览", r_bare_help)
-        self.assertIsNotNone(h("D/XX/帮助", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("dxx 帮助", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("?", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("自检", {"channel": "group", "group_id": "g"}))
-        self.assertIsNotNone(h("D/XX/自检", {"channel": "group", "group_id": "g"}))
+        self.assertIsNotNone(h("dxx 自检", {"channel": "group", "group_id": "g"}))
 
 
 class TestAtBot(unittest.TestCase):
-    """@ 机器人：允许不带 D/XX/ 前缀；回复与监控推送都 @ 发起人。"""
+    """@ 机器人：允许不带 dxx  前缀；回复与监控推送都 @ 发起人。"""
 
     @classmethod
     def setUpClass(cls):
@@ -220,7 +220,7 @@ class TestAtBot(unittest.TestCase):
         self.assertEqual(onebot._parse_message(mixed, "999"), ("wm Boltor", True))
 
     def test_at_allows_prefixless(self):
-        """@ 了机器人 = 明确对着我说的：不带 D/XX/ 也能用；没 @ 仍然静默。"""
+        """@ 了机器人 = 明确对着我说的：不带 dxx  也能用；没 @ 仍然静默。"""
         h = qq_bot.make_handler()
         at = {"channel": "group", "group_id": "G1", "user_id": "12345", "at_me": True}
         self.assertIsNotNone(h("wm Boltor", at))
@@ -339,7 +339,7 @@ class TestAtBot(unittest.TestCase):
         c._send_reply(FakeConn(), msg, "你好", at_me=True)
         self.assertEqual(sent[-1]["params"]["message"], "[CQ:at,qq=12345] 你好")
         sent.clear()
-        # 带 D/XX/ 前缀的普通指令：不 @ 人，避免群里刷屏
+        # 带 dxx  前缀的普通指令：不 @ 人，避免群里刷屏
         c._send_reply(FakeConn(), msg, "你好")
         self.assertEqual(sent[-1]["params"]["message"], "你好")
         sent.clear()
@@ -401,8 +401,8 @@ class TestIntegrationServer(unittest.TestCase):
             "message_type": "group",
             "group_id": 123456,
             "user_id": 999,
-            "message": "D/XX/WM Boltor Prime",
-            "raw_message": "D/XX/WM Boltor Prime",
+            "message": "dxx WM Boltor Prime",
+            "raw_message": "dxx WM Boltor Prime",
         }
         ws.send_text(json.dumps(event, ensure_ascii=False))
 
@@ -499,9 +499,9 @@ class TestEcho(unittest.TestCase):
     def test_recv_then_reply(self):
         """命中指令：先打 [reply] 行，再真的发出去。"""
         msg = {"post_type": "message", "message_type": "private", "user_id": 5,
-               "self_id": 9, "message": "D/XX/自检"}
+               "self_id": 9, "message": "dxx 自检"}
         out, sent = self._feed(lambda t, c: "好的", msg)
-        self.assertIn("[recv] 私聊 5 用户=5 @我=否 at=- self=9 文本='D/XX/自检'", out)
+        self.assertIn("[recv] 私聊 5 用户=5 @我=否 at=- self=9 文本='dxx 自检'", out)
         self.assertIn("[reply] 私聊 5", out)
         self.assertEqual(len(sent), 1)
 

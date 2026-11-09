@@ -345,9 +345,9 @@ def main():
             t("停止监控写回空 sessions", False)
 
         h = qq_common.make_handler({"G1"}, allow_all=False)
-        t("白名单内的群能设置开关", h("D/XX/活动=开启", ctx) is not None)
+        t("白名单内的群能设置开关", h("dxx 活动=开启", ctx) is not None)
         t("白名单外的群严格静默",
-          h("D/XX/活动=开启", {"channel": "group", "group_id": "G9"}) is None)
+          h("dxx 活动=开启", {"channel": "group", "group_id": "G9"}) is None)
         t("白名单外的群不会留下开关", ("group", "G9") not in M._switches)
 
     print("\n结果：通过 %d / 失败 %d" % (ok, total - ok))

@@ -41,24 +41,24 @@ def main():
     total += 1
     ok += check("总览有可随时复看提示", "随时发" in full)
 
-    # 3) handler 路由（交互指令必须带 D/XX/ 前缀）：帮助词 -> 总览；世界状态词 -> 世界专项
-    for w in ("D/XX/帮助", "D/XX/?", "D/XX/菜单", "D/XX/指令"):
+    # 3) handler 路由（交互指令必须带 dxx  前缀）：帮助词 -> 总览；世界状态词 -> 世界专项
+    for w in ("dxx 帮助", "dxx ?", "dxx 菜单", "dxx 指令"):
         r = H(w, PRIV)
         total += 1
         ok += check("handler %r 返回总览" % w, isinstance(r, str) and "全部指令一览" in r)
 
-    r_world = H("D/XX/世界", PRIV)
+    r_world = H("dxx 世界", PRIV)
     total += 1
-    ok += check("handler 'D/XX/世界' 返回世界专项（非总览）",
+    ok += check("handler 'dxx 世界' 返回世界专项（非总览）",
                 isinstance(r_world, str) and "世界状态查询" in r_world
                 and "全部指令一览" not in r_world)
 
-    r_query = H("D/XX/平原", PRIV)
+    r_query = H("dxx 平原", PRIV)
     total += 1
-    ok += check("handler 'D/XX/平原' 走查询（非帮助）",
+    ok += check("handler 'dxx 平原' 走查询（非帮助）",
                 isinstance(r_query, str) and "全部指令一览" not in r_query)
 
-    # 3.5) 裸「帮助」两个字就出菜单（不要求 D/XX/ 前缀）
+    # 3.5) 裸「帮助」两个字就出菜单（不要求 dxx  前缀）
     GRP = {"channel": "group", "group_id": "G1"}
     for w in ("帮助", "help", "菜单", "指令", "命令", "功能", "总览"):
         r = H(w, GRP)
@@ -68,10 +68,16 @@ def main():
     total += 1
     ok += check("裸「?」仍不触发（单字符易误触，需带前缀）", H("?", GRP) is None)
     total += 1
-    ok += check("带前缀 D/XX/? 仍可出总览",
-                isinstance(H("D/XX/?", GRP), str))
+    ok += check("带前缀 dxx ? 仍可出总览",
+                isinstance(H("dxx ?", GRP), str))
     total += 1
     ok += check("裸「帮助」不影响其它闲聊静默", H("今天打什么", GRP) is None)
+    total += 1
+    ok += check("带前缀 dxx 帮助 出总览",
+                isinstance(H("dxx 帮助", GRP), str))
+    total += 1
+    ok += check("旧前缀 D/XX/ 已不再生效（改前缀后必须静默）",
+                H("D/XX/ 帮助", GRP) is None)
 
     # 3.6) 帮助卡片配色：查询指令红、其它指令蓝
     cols = q.help_colors()
@@ -95,7 +101,7 @@ def main():
     ok += check("帮助卡片能渲染出图", bool(R.render(q.build_full_help(),
                                                     title="帮助", colors=cols)))
 
-    # 3b) 不带 D/XX/ 前缀：除「帮助」类词外，其它交互指令必须静默（防群聊误触发）
+    # 3b) 不带 dxx  前缀：除「帮助」类词外，其它交互指令必须静默（防群聊误触发）
     #     （「帮助」两个字就要出菜单，是用户明确要求的例外，见 3.5）
     for w in ("世界", "平原", "自检", "wm Boltor", "监控 裂缝", "你好啊"):
         r = H(w, PRIV)
@@ -105,8 +111,8 @@ def main():
     # 3c) 完整指令才算数：带前缀但没精确命中 → 一律静默（不猜、不提示）
     #     理由：模糊/子串/后缀匹配会撞上正常聊天（例如「希图思」这种错别字、
     #     或聊天里出现栏目字眼），机器人跑去接话比"没回复"更糟。
-    for w in ("D/XX/随便乱打", "D/XX/希图思", "D/XX/裂缝裂缝",
-              "D/XX/今天打什么", "D/XX/平原好玩吗我想去"):
+    for w in ("dxx 随便乱打", "dxx 希图思", "dxx 裂缝裂缝",
+              "dxx 今天打什么", "dxx 平原好玩吗我想去"):
         r = H(w, PRIV)
         total += 1
         ok += check("handler %r 未精确命中 → 静默（None）" % w, r is None)
@@ -178,9 +184,9 @@ def main():
     for w in ("平原", "WM boltor", "你好", "自检一下"):
         total += 1
         ok += check("非排障词不命中: %r" % w, not q.is_diagnostic(w))
-    r_diag = H("D/XX/自检", PRIV)
+    r_diag = H("dxx 自检", PRIV)
     total += 1
-    ok += check("handler 'D/XX/自检' 返回诊断文字",
+    ok += check("handler 'dxx 自检' 返回诊断文字",
                 isinstance(r_diag, str) and "机器人自检" in r_diag)
     total += 1
     ok += check("诊断文字含 render_card / Markdown / 出图模式",
@@ -211,10 +217,10 @@ def main():
 
     # 7) @ 标记兜底剥离：三种残留形式都要能被剥掉，且句中 @ 不受影响
     cases = [
-        ("[CQ:at,qq=123] D/XX/ 平原", "D/XX/ 平原"),
-        ("<@!A1B2C3> D/XX/ 平原", "D/XX/ 平原"),
-        ("@自动化服务查询 D/XX/ 平原", "D/XX/ 平原"),
-        ("@甲 @乙 D/XX/ 平原", "D/XX/ 平原"),
+        ("[CQ:at,qq=123] dxx  平原", "dxx  平原"),
+        ("<@!A1B2C3> dxx  平原", "dxx  平原"),
+        ("@自动化服务查询 dxx  平原", "dxx  平原"),
+        ("@甲 @乙 dxx  平原", "dxx  平原"),
         ("＠123 自检", "自检"),
     ]
     for raw, want in cases:
@@ -223,14 +229,14 @@ def main():
         ok += check("剥 @ 标记 %r -> %r" % (raw, want), got == want)
     total += 1
     ok += check("句中 @ 保持原样（不误删正文）",
-                q.strip_mentions("D/XX/ 我 @某人 打平原")[0] == "D/XX/ 我 @某人 打平原")
+                q.strip_mentions("dxx  我 @某人 打平原")[0] == "dxx  我 @某人 打平原")
     total += 1
     ok += check("剥 @ 标记同时回传被剥掉的标识",
-                [m["id"] for m in q.strip_mentions("@甲 @乙 D/XX/ 平原")[1]] == ["甲", "乙"])
-    # 7.01) 昵称本身带 D/XX/、用户又不打空格：按昵称长度切开，指令不能被一起吞掉
+                [m["id"] for m in q.strip_mentions("@甲 @乙 dxx  平原")[1]] == ["甲", "乙"])
+    # 7.01) 昵称本身带 dxx 、用户又不打空格：按昵称长度切开，指令不能被一起吞掉
     NAME = "自动化服务查询_D/XX/"
     for raw, want in [("@%s平原" % NAME, "平原"),
-                      ("@%sD/XX/平原" % NAME, "D/XX/平原"),
+                      ("@%sdxx 平原" % NAME, "dxx 平原"),
                       ("@%s 平原" % NAME, "平原")]:
         total += 1
         ok += check("昵称紧贴指令 %r -> %r" % (raw, want),
@@ -271,17 +277,17 @@ def main():
         os.environ.pop("WM_QQ_BOT_NAME", None)
     os.environ["WM_QQ_BOT_NAME"] = NAME
     try:
-        for raw in ("@%s自检" % NAME, "@%sD/XX/自检" % NAME):
+        for raw in ("@%s自检" % NAME, "@%sdxx 自检" % NAME):
             total += 1
-            ok += check("全称带 D/XX/ 时 %r 仍能出回复" % raw,
+            ok += check("全称带 dxx  时 %r 仍能出回复" % raw,
                         H(raw, dict(GAT)) is not None)
     finally:
         os.environ.pop("WM_QQ_BOT_NAME", None)
 
-    # 7.1) 「@机器人 + D/XX/ 指令」必须照常响应（线上故障：旧实现留着 CQ 码，前缀匹配失败）
-    for raw in ("@自动化服务查询 D/XX/自检",
-                "[CQ:at,qq=123]D/XX/自检",
-                "<@!123>D/XX/自检"):
+    # 7.1) 「@机器人 + dxx  指令」必须照常响应（线上故障：旧实现留着 CQ 码，前缀匹配失败）
+    for raw in ("@自动化服务查询 dxx 自检",
+                "[CQ:at,qq=123]dxx 自检",
+                "<@!123>dxx 自检"):
         total += 1
         r = H(raw, dict(GAT))
         ok += check("%r 带前缀仍响应" % raw, isinstance(r, str) and "出图模式" in r)

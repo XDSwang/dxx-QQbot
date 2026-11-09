@@ -68,7 +68,7 @@ class TestReplyAtTag(unittest.TestCase):
             '<qqbot-at-user id="MO1" />')
 
     def test_plain_prefix_command_no_tag(self):
-        # 带 D/XX/ 的普通指令（没人 @ 机器人）：不 @，与原来一致
+        # 带 dxx  的普通指令（没人 @ 机器人）：不 @，与原来一致
         self.assertEqual(
             qq_official.reply_at_tag({"member_openid": "MO1"}, "group"), "")
 
@@ -413,7 +413,7 @@ class TestOnEvent(unittest.TestCase):
                 "d": {"author": {"user_openid": openid}, "content": content, "id": mid}}
 
     def test_group_whitelisted_trigger(self):
-        self.bot._on_event(None, self._pkt_group("<@!bot> D/XX/wm boltor prime"), "TOK")
+        self.bot._on_event(None, self._pkt_group("<@!bot> dxx wm boltor prime"), "TOK")
         self.assertEqual(len(self.calls), 1)
         kind, gid, content = self.calls[0]
         self.assertEqual(kind, "group")
@@ -422,7 +422,7 @@ class TestOnEvent(unittest.TestCase):
         self.assertIn("铂金", content)
 
     def test_group_not_whitelisted_silent(self):
-        self.bot._on_event(None, self._pkt_group("<@!bot> D/XX/wm boltor", gid="GX"), "TOK")
+        self.bot._on_event(None, self._pkt_group("<@!bot> dxx wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
 
     def test_group_non_trigger_silent(self):
@@ -430,14 +430,14 @@ class TestOnEvent(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_c2c_not_limited(self):
-        # 单聊不受白名单限制（WM 查询需带 D/XX/ 前缀）
-        self.bot._on_event(None, self._pkt_c2c("D/XX/zk tigris"), "TOK")
+        # 单聊不受白名单限制（WM 查询需带 dxx  前缀）
+        self.bot._on_event(None, self._pkt_c2c("dxx zk tigris"), "TOK")
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][0], "user")
         self.assertIn("tigris", self.calls[0][2].lower())
 
     def test_passive_msg_id(self):
-        pkt = self._pkt_group("<@!bot> D/XX/wm boltor", mid="EVENT999")
+        pkt = self._pkt_group("<@!bot> dxx wm boltor", mid="EVENT999")
         self.bot._on_event(None, pkt, "TOK")
         # 被动回复须把事件 d.id 作为 msg_id 传入（不是 event_id）
         self.assertEqual(len(self.calls), 1)
@@ -445,8 +445,8 @@ class TestOnEvent(unittest.TestCase):
         self.assertEqual(self.msg_ids[0], "EVENT999")
 
     def test_group_full_message_no_mention(self):
-        # 群消息全量模式：不用 @，直接 "D/XX/wm boltor" 也要能触发（白名单内）
-        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor"), "TOK")
+        # 群消息全量模式：不用 @，直接 "dxx wm boltor" 也要能触发（白名单内）
+        self.bot._on_event(None, self._pkt_group_full("dxx wm boltor"), "TOK")
         self.assertEqual(len(self.calls), 1)
         kind, gid, content = self.calls[0]
         self.assertEqual(kind, "group")
@@ -454,14 +454,14 @@ class TestOnEvent(unittest.TestCase):
         self.assertIn("boltor", content.lower())
 
     def test_group_full_message_mention_placeholder(self):
-        # 全量模式里 @某人会变成 <@openid> 占位，剥掉后仍能命中 D/XX/ 前缀 + 触发词
-        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor <@7A3B9C1D>"), "TOK")
+        # 全量模式里 @某人会变成 <@openid> 占位，剥掉后仍能命中 dxx  前缀 + 触发词
+        self.bot._on_event(None, self._pkt_group_full("dxx wm boltor <@7A3B9C1D>"), "TOK")
         self.assertEqual(len(self.calls), 1)
         self.assertIn("boltor", self.calls[0][2].lower())
         self.assertNotIn("<@", self.calls[0][2])
 
     def test_group_full_message_not_whitelisted_silent(self):
-        self.bot._on_event(None, self._pkt_group_full("D/XX/wm boltor", gid="GX"), "TOK")
+        self.bot._on_event(None, self._pkt_group_full("dxx wm boltor", gid="GX"), "TOK")
         self.assertEqual(self.calls, [])
 
     def test_group_at_ctx_keeps_member_openid(self):
@@ -483,7 +483,7 @@ class TestOnEvent(unittest.TestCase):
 
     def test_group_full_message_at_bot_allows_prefixless(self):
         """全量模式里「@机器人 自检」也走这个事件：带叹号的占位符要认成 at_me，
-        否则免前缀的 @ 指令会被当闲聊静默（线上故障：@ 了没反应，带 D/XX/ 才有）。"""
+        否则免前缀的 @ 指令会被当闲聊静默（线上故障：@ 了没反应，带 dxx  才有）。"""
         self.bot._on_event(None, self._pkt_group_full("<@!bot_openid> 自检"), "TOK")
         self.assertEqual(len(self.calls), 1)
         self.assertIn("出图模式", self.calls[0][2])

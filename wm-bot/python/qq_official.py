@@ -769,7 +769,7 @@ class OfficialBot:
             bot_config.echo("[recv] 群@ %s 用户=%s 昵称=%s 原文=%r 剥离=%r"
                             % (group_openid, mo or uo, name or "-", raw, text))
             ctx = {"channel": "group", "group_id": group_openid,
-                   # 群 @ 事件：明确对着机器人说的，允许不带 D/XX/ 前缀；
+                   # 群 @ 事件：明确对着机器人说的，允许不带 dxx  前缀；
                    # member_openid 记下来，回复时用它 @ 回去、之后的监控推送也 @ 他
                    "at_me": True,
                    "user_id": mo or uo,
@@ -917,7 +917,7 @@ class OfficialBot:
             reply = f"⚠️ 处理出错：{e}"
             flog(f"handler 抛出异常: {e}")
         if not reply:
-            flog("handler 返回空（闲聊未带 D/XX/ 前缀 / 白名单外群静默），不回复")
+            flog("handler 返回空（闲聊未带 dxx  前缀 / 白名单外群静默），不回复")
             bot_config.echo("[silent] %s %s 文本=%r 没命中指令或群不在白名单，不回复"
                             % (kind, target_id, text))
             return
@@ -965,7 +965,7 @@ class OfficialBot:
         # 卡片 PNG + 可复制的 /w 指令字符串
         pngs = list(getattr(reply, "pngs", None) or [])
         tail = str(getattr(reply, "tail", "") or "").strip()
-        # 这条消息 @ 了机器人 → 回复也 @ 回去（与 D/XX/ 指令同一套处理，只多这一行）
+        # 这条消息 @ 了机器人 → 回复也 @ 回去（与 dxx  指令同一套处理，只多这一行）
         at_tag = reply_at_tag(ctx, kind)
         if (ctx or {}).get("at_me") and not at_tag:
             # 排查用：@ 了机器人却没生成 @ 回标签，说明事件里 member_openid/user_id 都是空。

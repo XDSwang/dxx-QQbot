@@ -38,13 +38,13 @@ SLASH_TRIGGERS = {"wm", "zk", "报错", "查询", "翻译", "translate", "trans"
 # 一次「要回复别人的查询」来处理；不带此前缀的普通闲聊一律静默，避免群友聊天
 # 意外触发机器人。监控控制（监控/停止监控/主推开关）与主动推送不受此限制。
 # 想换前缀：直接改下面这个常量即可（例如改成 "BOT/"）。
-QUERY_PREFIX = "D/XX/"
+QUERY_PREFIX = "dxx"
 
 
 # 全局「全部指令」查看词：发这些词返回合并总览（WM + 世界状态），不再是静默
 GLOBAL_HELP_WORDS = {"帮助", "help", "?", "菜单", "指令", "命令", "功能", "总览", "全部指令", "全部命令"}
-# 这些词【不】要求 D/XX/ 前缀：用户要求「发『帮助』两个字就出菜单」。
-# 「?」故意不放进来（单字符太容易误触），要它仍可发 D/XX/? 。
+# 这些词【不】要求 dxx  前缀：用户要求「发『帮助』两个字就出菜单」。
+# 「?」故意不放进来（单字符太容易误触），要它仍可发 dxx ? 。
 BARELESS_HELP_WORDS = GLOBAL_HELP_WORDS - {"?"}
 
 # 指令识别原则（别再"猜"）：只认【完整词】——整句命中或首词精确命中关键词表，
@@ -199,7 +199,7 @@ def strip_mentions(text, bot_name=None):
       angle → 官方占位符，带叹号的是【机器人】（<@!bot>），成员是 <@openid>；
       text  → 被当正文发来的 "@昵称"，id 是昵称。
     两个传输层正常已经剥过（onebot._parse_message 剥 CQ 码、qq_official.strip_mention
-    剥 <@!openid>），但个别实现会把 @ 标记直接当正文塞进来：此时 "D/XX/" 前缀匹配
+    剥 <@!openid>），但个别实现会把 @ 标记直接当正文塞进来：此时 "dxx " 前缀匹配
     不上，表现出来的就是「@机器人 + 带前缀指令」没反应、裸前缀却有反应。
     只剥开头的连续标记，句子中间的（"我 @某人 打平原"）保持原样，避免误删正文。
 
@@ -469,13 +469,13 @@ def is_wm_command(text):
 
 
 def strip_query_prefix(text):
-    """若以 QUERY_PREFIX（默认 D/XX/，大小写不敏感，可选前导斜杠）开头，剥掉前缀
+    """若以 QUERY_PREFIX（默认 dxx ，大小写不敏感，可选前导斜杠）开头，剥掉前缀
     返回剩余文本；否则返回 None（表示这不是带前缀的显式查询）。
 
     前导斜杠会原样保留，这样「/报错」「/查询」这类纯斜杠触发词在剥掉前缀后仍然有效：
-      例：D/XX/wm Boltor   → "wm Boltor"
-          /D/XX/报错 WM x  → "/报错 WM x"（保留斜杠语义）
-          /D/XX/平原        → "/平原"
+      例：dxx wm Boltor   → "wm Boltor"
+          /dxx 报错 WM x  → "/报错 WM x"（保留斜杠语义）
+          /dxx 平原        → "/平原"
           普通「你好」        → None
     """
     t = (text or "").strip()
@@ -594,7 +594,7 @@ def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
                 # 不自动写入 groups.txt（否则等于监控所有群，违反"只监控白名单群"的铁律）。
                 return None
         # 先兜底剥掉开头残留的 @ 标记（CQ 码 / <@!id> / 明文 "@昵称"）：
-        # 有的实现不单发 at 段而是把 @ 混进正文，不剥就会让 D/XX/ 前缀匹配失败。
+        # 有的实现不单发 at 段而是把 @ 混进正文，不剥就会让 dxx  前缀匹配失败。
         # 顺带一句：@ 的正是自己的话，也算「对着我说」，等价于 ctx["at_me"]。
         sid = str(ctx.get("self_id") or "").strip()
         # 昵称优先用传输层自动问到的（OneBot get_login_info），再退回配置兜底
@@ -603,7 +603,7 @@ def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
         at_me = bool(ctx.get("at_me")) or mentioned_me(at_marks, sid, bot_name)
         # 「图 xxx」/「文字 xxx」前缀：强制出图 / 强制只发文字（默认一律出图）
         body, force_img, force_txt = split_style_prefix(body)
-        # —— 所有「交互指令」必须带 D/XX/ 前缀，防群聊闲聊误触发 ——
+        # —— 所有「交互指令」必须带 dxx  前缀，防群聊闲聊误触发 ——
         # 例外：机器人主动推送（send_active）是机器人外发，不是用户指令，不受影响。
         # 因此 WM 查价 / 世界状态查询 / 监控开关 / 帮助 / 自检 全部收进前缀；
         # 只有「主推信息」（机器人主动推出来的监控）不受限。
@@ -614,7 +614,7 @@ def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
             if bare in BARELESS_HELP_WORDS:
                 q = bare
             elif at_me:
-                # 例外 2：@ 了机器人 —— 这句话本来就是对着我说的，允许不带 D/XX/
+                # 例外 2：@ 了机器人 —— 这句话本来就是对着我说的，允许不带 dxx
                 # （@ 本身已是明确意图，群里闲聊不会误触；仍要求是完整指令才会回）
                 q = (body or "").strip().lstrip("/").strip()
                 if not q:

@@ -489,7 +489,7 @@ class OneBotClient:
         if post_type != "message":
             return
         # @ 机器人 = 这句话是明确对着我说的：ctx.at_me 亮起来，qq_common 就允许
-        # 不带 D/XX/ 前缀；同时把发送者放进 ctx，回复和后续推送都 @ 他。
+        # 不带 dxx  前缀；同时把发送者放进 ctx，回复和后续推送都 @ 他。
         self_id = _bot_self_id(msg, self.self_id)
         text, at_me = _parse_message(msg.get("message", ""), self_id)
         ats = _at_targets(msg.get("message", ""))
@@ -531,7 +531,7 @@ class OneBotClient:
         message_type = msg.get("message_type")
         pngs = list(getattr(reply, "pngs", None) or [])
         tail = str(getattr(reply, "tail", "") or "").strip()
-        # 这条消息 @ 了机器人，回复就 @ 回去（谁 @ 我我回谁）；带 D/XX/ 的普通指令
+        # 这条消息 @ 了机器人，回复就 @ 回去（谁 @ 我我回谁）；带 dxx  的普通指令
         # 不 @ 人 —— 两种入口走的是同一套处理，只在发送时多这一行。私聊没有 @ 概念。
         at_qq = (str(msg.get("user_id") or "")
                  if (message_type == "group" and at_me) else "")
