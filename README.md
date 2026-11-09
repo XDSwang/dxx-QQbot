@@ -170,3 +170,24 @@ python bootstrap.py
   但同一 AppID 只能有一条长连接，换手机跑之前先关掉电脑上那个 `run.py`。
 
 <font color="red"><b>查日志：在 `wm-bot/python/` 跑 `python view_flow_log.py [日期]` 打印当天/指定日期，`--list` 列日期，`--tail 30` 看末尾，`--log bot|trace|updater` 选日志；独立零依赖，手机可用。</b></font>
+
+### 查日志：可直接复制的命令
+
+在 `wm-bot/python/` 下跑，脚本零依赖、不 import 项目任何模块，整个文件夹拷到哪都能用：
+
+```bash
+python view_flow_log.py                                # 当天 bot_flow.log
+python view_flow_log.py 2026-11-09                     # 指定日期（位置参数，不是 --date）
+python view_flow_log.py 2026-11-09 --log bot --tail 80
+python view_flow_log.py 2026-11-09 --log trace --tail 80
+python view_flow_log.py 2026-11-09 --log updater --tail 80
+python view_flow_log.py --list --log updater           # 列出有记录的日期（含当天）
+```
+
+- `--log` 三选一：`bot`（收发，默认）/ `trace`（自检链路）/ `updater`（更新器）；
+  `--tail N` 只打印末尾 N 行；`--list` 列有记录的日期。
+- 当天读固定文件，往前的日子读按天归档：`bot_flow-YYYY-MM-DD.log`、
+  `selfcheck_trace-YYYY-MM-DD.log` 在 `wm-bot/python/data/`，
+  `updater_flow-YYYY-MM-DD.log` 在仓库根 `data/`；保留天数由 `WM_FLOW_LOG_DAYS` 控制。
+- 指定日期报「没有记录」时先跑 `--list`：按天归档上线之前是覆盖式单文件，
+  更早的日期没有归档文件属正常，不是命令写错。

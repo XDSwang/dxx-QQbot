@@ -91,7 +91,7 @@ FAILED_RETRY_SECONDS = 300          # 失败版本重新给机会的时间窗口
 FAILED_MAX_ROUNDS = 3               # 一个窗口内最多 3 轮，守住规范 1.1
 FAILED_LONG_PAUSE_SECONDS = 3600    # 3 轮全失败后的长退避，不无限静默轰炸
 CRASH_WINDOW_SECONDS = 3600         # 崩溃重启预算的时间窗口
-CODE_CHECK_EVERY = 6                # 公共库版本检查降频：约 1 分钟一轮
+CODE_CHECK_EVERY = 1                # 公共库版本检查每轮都做：push 后一个轮询周期即发现
 SELF_FILES = (HERE / "run.py", HERE / "updater.py", HERE / "services.json")
 
 
@@ -977,7 +977,7 @@ def main():
                 gbase, gsig = None, None
             # 私有库根目录的 update.cfg 也是数据：改了要同步到本机并重新装配，
             # 跟 services/wm-bot/config.txt 的热更新一个待遇。复用本轮拷贝结果，
-            # 只降频检查，不额外发 GIT 网络请求。
+            # 每轮检查，不额外发 GIT 网络请求。
             if gbase is not None and (tick == 1 or tick % CODE_CHECK_EVERY == 0):
                 applied_update_cfg_hash = sync_update_cfg(
                     gbase, applied_update_cfg_hash, bots)
