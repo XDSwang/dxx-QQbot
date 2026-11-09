@@ -70,5 +70,33 @@ class TestBroadcast(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TestReplyAtTag(unittest.TestCase):
+    """回复 @ 回去：只在「群里 + 这条消息 @ 了机器人」时给标签。"""
+
+    def test_no_tag_when_not_at_me(self):
+        self.assertEqual(qq_official.reply_at_tag(
+            {"channel": "group", "member_openid": "M1"}, "group"), "",
+            "没 @ 机器人就不该 @ 回去")
+
+    def test_no_tag_in_private(self):
+        self.assertEqual(qq_official.reply_at_tag(
+            {"at_me": True, "member_openid": "M1"}, "user"), "",
+            "私聊不加 @ 标签")
+
+    def test_tag_uses_member_openid(self):
+        self.assertEqual(qq_official.reply_at_tag(
+            {"at_me": True, "member_openid": "M1", "user_id": "U1"}, "group"),
+            '<qqbot-at-user id="M1" />')
+
+    def test_fallback_to_user_id(self):
+        # 真实事件里 member_openid 偶发为空：回退 user_id，否则「@ 了机器人却不 @ 我」
+        self.assertEqual(qq_official.reply_at_tag(
+            {"at_me": True, "member_openid": "", "user_id": "U1"}, "group"),
+            '<qqbot-at-user id="U1" />')
+
+    def test_empty_when_no_ids(self):
+        self.assertEqual(qq_official.reply_at_tag({"at_me": True}, "group"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

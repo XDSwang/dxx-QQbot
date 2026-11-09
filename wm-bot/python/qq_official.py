@@ -411,7 +411,10 @@ def reply_at_tag(ctx, kind):
     """
     if kind != "group" or not (ctx or {}).get("at_me"):
         return ""
-    mid = str((ctx or {}).get("member_openid") or "").strip()
+    c = ctx or {}
+    # 官方 @ 标签只认 member_openid；但个别事件里它可能为空（只剩 user_openid），
+    # 此时回退到入站时记下的 user_id，否则就会出现「@ 了机器人，回复却不 @ 我」。
+    mid = str(c.get("member_openid") or c.get("user_id") or "").strip()
     return ('<qqbot-at-user id="%s" />' % mid) if mid else ""
 
 
@@ -964,6 +967,10 @@ class OfficialBot:
         tail = str(getattr(reply, "tail", "") or "").strip()
         # 这条消息 @ 了机器人 → 回复也 @ 回去（与 D/XX/ 指令同一套处理，只多这一行）
         at_tag = reply_at_tag(ctx, kind)
+        if (ctx or {}).get("at_me") and not at_tag:
+            # 排查用：@ 了机器人却没生成 @ 回标签，说明事件里 member_openid/user_id 都是空。
+            flog(f"⚠️ @ 了机器人但拿不到 @ 回标签（member_openid/user_id 均空）: "
+                 f"{kind} {target_id}")
 
         # ① 默认 Markdown 消息（msg_type=2）：图片 + 图下两条 /w（图里已有正文，不重复）
         #    config.txt: WM_QQ_MARKDOWN = native；设为 0 可关。
