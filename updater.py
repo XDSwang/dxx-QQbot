@@ -1254,6 +1254,16 @@ def push_runtime(store, runtime, schema=None, service=None,
     """
     schema = schema or {}
     text = json.dumps(runtime, ensure_ascii=False, indent=2) + "\n"
+    # 内容与云端一致就跳过：否则每轮都会造一个「updater: runtime.json」新提交，
+    # commit 时间戳不同 → sha 不同 → 下一轮被判成「有新数据」→ 无限重启循环。
+    try:
+        current = store.read(RUNTIME_NAME)
+    except Exception:
+        current = None
+    if current is not None and current.strip() == text.strip():
+        flog("[%s] 运行数据无变化，跳过回写（避免空提交触发更新循环）"
+             % (service or "default"))
+        return True
     last_err = ""
     for attempt in range(max_attempts):
         t0 = time.time()

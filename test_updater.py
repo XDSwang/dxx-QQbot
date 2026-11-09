@@ -2109,5 +2109,56 @@ class TestTextRuntimeMerge(unittest.TestCase):
                          "运行记录落在私有库 data/ 子目录，末尾补换行")
 
 
+class TestPushRuntimeSkip(unittest.TestCase):
+    """内容没变时不能造空提交——否则会触发「更新→回写→再更新」无限重启。"""
+
+    class _Store(object):
+        def __init__(self, current=None, fail_read=False):
+            self.current = current
+            self.fail_read = fail_read
+            self.writes = []
+
+        def read(self, name):
+            if self.fail_read:
+                raise RuntimeError("boom")
+            return self.current
+
+        def write(self, name, text):
+            self.writes.append((name, text))
+            self.current = text
+
+        def refresh(self):
+            return None
+
+    def test_same_content_skips_write(self):
+        data = {"ws_switches.json": {"a": 1}}
+        text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        s = self._Store(current=text)
+        self.assertTrue(updater.push_runtime(s, data, service="t"))
+        self.assertEqual(s.writes, [], "内容一致不应产生新提交")
+
+    def test_same_content_ignores_surrounding_blank(self):
+        data = {"a": 1}
+        s = self._Store(current="\n"
+                        + json.dumps(data, ensure_ascii=False, indent=2) + "\n\n")
+        updater.push_runtime(s, data, service="t")
+        self.assertEqual(s.writes, [], "首尾空白差异不算内容变化")
+
+    def test_changed_content_writes(self):
+        s = self._Store(current=json.dumps({"a": 1}))
+        self.assertTrue(updater.push_runtime(s, {"a": 2}, service="t"))
+        self.assertEqual(len(s.writes), 1)
+
+    def test_missing_cloud_file_writes(self):
+        s = self._Store(current=None)
+        updater.push_runtime(s, {"a": 1}, service="t")
+        self.assertEqual(len(s.writes), 1, "云端没有该文件时要正常写入")
+
+    def test_read_failure_still_writes(self):
+        s = self._Store(fail_read=True)
+        updater.push_runtime(s, {"a": 1}, service="t")
+        self.assertEqual(len(s.writes), 1, "读失败不能当成内容一致而跳过")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
