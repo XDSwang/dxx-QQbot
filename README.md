@@ -75,9 +75,11 @@ python run.py
   锁所在文件系统不支持 `flock`（手机共享存储常见）时会降级为无锁并记异常日志，
   不会因此拒绝启动。
 - 流程日志 `data/updater_flow.log`、异常日志 `data/updater_error.log`、
-  机器人收发日志 `wm-bot/python/data/bot_flow.log`（当天追加、重启不清空；
-  跨天归档成同目录 `bot_flow-YYYY-MM-DD.log`，保留天数由 `WM_FLOW_LOG_DAYS` 设定，
-  单位天，可填 7 / 3 / 1，超期归档自动清理，0 = 不清理）。
+  机器人收发日志 `wm-bot/python/data/bot_flow.log`、
+  链路日志 `wm-bot/python/data/selfcheck_trace.log`。三份流程日志都是当天追加、
+  重启不清空，跨天归档成同目录 `<名字>-YYYY-MM-DD.log`；异常日志仍是覆盖式
+  （只留最近一次异常）。保留天数由 `WM_FLOW_LOG_DAYS` 统一设定（单位天，
+  可填 7 / 3 / 1，超期归档自动清理，0 = 不清理），不会无限增长。
 
 ### 无人值守（搬到手机上不管了）
 
@@ -167,4 +169,4 @@ python bootstrap.py
 - 换设备时凭证与群 openid 跟着机器人 AppID 走、不用改值；
   但同一 AppID 只能有一条长连接，换手机跑之前先关掉电脑上那个 `run.py`。
 
-<font color="red"><b>查流程日志：在 `wm-bot/python/` 下跑 `python view_flow_log.py` 打印当天记录，`python view_flow_log.py 2026-11-08` 打印指定日期，`--list` 列出有记录的日期，`--tail 30` 看末尾 30 行；独立零依赖，手机直接可用。</b></font>
+<font color="red"><b>查日志：在 `wm-bot/python/` 跑 `python view_flow_log.py [日期]` 打印当天/指定日期，`--list` 列日期，`--tail 30` 看末尾，`--log bot|trace|updater` 选日志；独立零依赖，手机可用。</b></font>

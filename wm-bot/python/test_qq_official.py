@@ -428,5 +428,87 @@ class TestFlowLogRotation(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
 
 
+class TestTraceLogRotation(unittest.TestCase):
+    """selfcheck_trace.log 与 bot_flow 共用保留天数，但归档前缀互相隔离。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.path = os.path.join(self.dir, "selfcheck_trace.log")
+        for name, value in (("LOG_DIR", self.dir), ("TRACE_LOG_PATH", self.path),
+                            ("_flow_log_day", None), ("_trace_log_day", None)):
+            p = patch.object(qq_official, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.today = time.strftime("%Y-%m-%d")
+        self.noon = time.mktime(
+            time.strptime(self.today + " 12:00:00", "%Y-%m-%d %H:%M:%S"))
+
+    def _write(self, name, text=""):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read(self, name="selfcheck_trace.log"):
+        with open(os.path.join(self.dir, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_trace_prefix_is_separate_from_bot_flow(self):
+        name = qq_official.flow_log_archive_name(
+            "2026-11-09", qq_official.TRACE_LOG_PREFIX)
+        self.assertEqual(name, "selfcheck_trace-2026-11-09.log")
+        self.assertEqual(qq_official.flow_log_archived_day(
+            name, qq_official.TRACE_LOG_PREFIX), "2026-11-09")
+        self.assertEqual(qq_official.flow_log_archived_day(name), "")
+        bot = qq_official.flow_log_archive_name("2026-11-09")
+        self.assertEqual(qq_official.flow_log_archived_day(
+            bot, qq_official.TRACE_LOG_PREFIX), "")
+
+    def test_prune_trace_never_touches_bot_flow_archives(self):
+        for day in ("2026-11-01", "2026-11-08"):
+            self._write(qq_official.flow_log_archive_name(
+                day, qq_official.TRACE_LOG_PREFIX))
+            self._write(qq_official.flow_log_archive_name(day))
+        removed = qq_official.flow_log_prune(
+            self.dir, "2026-11-09", 3, qq_official.TRACE_LOG_PREFIX)
+        self.assertEqual(removed, ["selfcheck_trace-2026-11-01.log"])
+        self.assertTrue(os.path.exists(os.path.join(
+            self.dir, "bot_flow-2026-11-01.log")))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.dir, "selfcheck_trace-2026-11-08.log")))
+
+    def test_trace_chain_same_day_appends(self):
+        with patch.dict(os.environ, {"WM_FLOW_LOG_DAYS": "7"}):
+            self.assertTrue(qq_official.trace_chain("收到", "第一条"))
+            qq_official._trace_log_day = None     # 模拟当天重启
+            self.assertTrue(qq_official.trace_chain("已发送", "第二条"))
+        text = self._read()
+        self.assertIn("第一条", text)
+        self.assertIn("第二条", text)
+        self.assertEqual(len(text.strip().splitlines()), 2)
+
+    def test_trace_chain_cross_day_archives_and_prunes(self):
+        yesterday = time.strftime(
+            "%Y-%m-%d", time.localtime(self.noon - 86400))
+        old = time.strftime("%Y-%m-%d", time.localtime(self.noon - 10 * 86400))
+        self._write("selfcheck_trace.log", "昨天的链路\n")
+        os.utime(self.path, (self.noon - 86400, self.noon - 86400))
+        self._write(qq_official.flow_log_archive_name(
+            old, qq_official.TRACE_LOG_PREFIX))
+        with patch.dict(os.environ, {"WM_FLOW_LOG_DAYS": "3"}):
+            self.assertTrue(qq_official.trace_chain(
+                "已发送", "今天的链路", raw="![img](https://example.com/a.png)"))
+        archive = qq_official.flow_log_archive_name(
+            yesterday, qq_official.TRACE_LOG_PREFIX)
+        self.assertIn("昨天的链路", self._read(archive))
+        current = self._read()
+        self.assertIn("今天的链路", current)
+        self.assertIn("![img](https://example.com/a.png)", current)
+        self.assertNotIn("昨天的链路", current)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.dir, qq_official.flow_log_archive_name(
+                old, qq_official.TRACE_LOG_PREFIX))))
+
+
 if __name__ == "__main__":
     unittest.main()

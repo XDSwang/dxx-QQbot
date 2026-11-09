@@ -700,7 +700,10 @@ def _broadcast_update(text, cfg_path, data_dir):
             appid, secret, api_base, groups, text)
         updater.flog("广播[%s] 成功=%d 失败=%d" % (text, sent, failed))
     except Exception as e:
+        # 异常日志是覆盖式（会被下一次异常冲掉），流程日志同步留一条：
+        # 以后查「群里为什么没收到两条更新消息」直接翻按天归档即可。
         updater.elog("广播异常（不影响更新）", str(e))
+        updater.flog("广播异常（不影响更新）：%s" % e)
 
 
 def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
@@ -1017,6 +1020,9 @@ def main():
                     new_code = bool(pre_sha and post_sha
                                     and pre_sha.strip() != post_sha.strip()
                                     and pre_c == 0 and post_c == 0)
+                    # 排查「没收到两条更新广播」：先确认这轮有没有跑、HEAD 有没有变。
+                    updater.flog("[global] 公共库新代码=%s（仅 True 才广播两条更新消息）"
+                                 % new_code)
                     plan = [(s, service_stores[s.name], bots[s.name],
                              trigger_sig, False, new_code) for s in services]
                     st = updater.load_state(target_key)

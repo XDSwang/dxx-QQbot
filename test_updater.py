@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -2158,6 +2159,103 @@ class TestPushRuntimeSkip(unittest.TestCase):
         s = self._Store(fail_read=True)
         updater.push_runtime(s, {"a": 1}, service="t")
         self.assertEqual(len(s.writes), 1, "读失败不能当成内容一致而跳过")
+
+
+class TestUpdaterFlowLogRotation(unittest.TestCase):
+    """updater_flow.log 按天归档 + 保留天数清理（全在临时目录，不碰真实 data/）。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.path = self.dir / "updater_flow.log"
+        self.err = self.dir / "updater_error.log"
+        p = mock.patch.multiple(
+            updater, FLOW_LOG=self.path, ERROR_LOG=self.err,
+            BOT_CONFIG_FILE=self.dir / "no_config.txt", _flow_log_day=None)
+        p.start()
+        self.addCleanup(p.stop)
+        self.today = time.strftime("%Y-%m-%d")
+        self.noon = time.mktime(
+            time.strptime(self.today + " 12:00:00", "%Y-%m-%d %H:%M:%S"))
+        self.keep_key = updater.FLOW_LOG_KEEP_KEY
+
+    def _write(self, name, text=""):
+        (self.dir / name).write_text(text, encoding="utf-8")
+
+    def _read(self, name="updater_flow.log"):
+        return (self.dir / name).read_text(encoding="utf-8")
+
+    def test_archive_name_roundtrip_and_foreign_files(self):
+        name = updater.flow_log_archive_name("2026-11-09")
+        self.assertEqual(name, "updater_flow-2026-11-09.log")
+        self.assertEqual(updater.flow_log_archived_day(name), "2026-11-09")
+        for other in ("updater_flow.log", "groups.txt", "updater_flow-bad.log",
+                      "updater_flow-2026-13-01.log", "bot_flow-2026-11-09.log",
+                      "updater_flow-2026-11-09.txt"):
+            self.assertEqual(updater.flow_log_archived_day(other), "")
+
+    def test_keep_days_values(self):
+        for raw, expected in (("7", 7), ("3", 3), ("1", 1), ("0", 0),
+                              ("abc", 7), ("-1", 7)):
+            with mock.patch.dict(os.environ, {self.keep_key: raw}):
+                self.assertEqual(updater.flow_log_keep_days(), expected, raw)
+
+    def test_keep_days_falls_back_to_bot_config_file(self):
+        cfg = self.dir / "bot_config.txt"
+        cfg.write_text("# 注释\nWM_FLOW_LOG_DAYS = 3\n", encoding="utf-8")
+        with mock.patch.object(updater, "BOT_CONFIG_FILE", cfg), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(updater.flow_log_keep_days(), 3)
+
+    def test_prune_only_expired_archives(self):
+        self.assertEqual(updater.flow_log_cutoff("2026-11-09", 3), "2026-11-07")
+        for day in ("2026-11-01", "2026-11-06", "2026-11-07", "2026-11-08"):
+            self._write(updater.flow_log_archive_name(day))
+        for name in ("updater_flow.log", "groups.txt", "bot_flow-2026-11-01.log"):
+            self._write(name)
+        removed = updater.flow_log_prune(self.dir, "2026-11-09", 3)
+        self.assertEqual(removed, ["updater_flow-2026-11-01.log",
+                                   "updater_flow-2026-11-06.log"])
+        for name in ("updater_flow.log", "groups.txt",
+                     "bot_flow-2026-11-01.log",
+                     "updater_flow-2026-11-07.log",
+                     "updater_flow-2026-11-08.log"):
+            self.assertTrue((self.dir / name).exists(), name)
+        self.assertEqual(updater.flow_log_prune(self.dir, "2026-11-09", 0), [])
+
+    def test_same_day_restart_appends_instead_of_truncating(self):
+        with mock.patch.dict(os.environ, {self.keep_key: "7"}):
+            updater.flog("上午的记录")
+            updater._flow_log_day = None       # 模拟当天重启
+            updater.flog("下午的记录")
+        text = self._read()
+        self.assertIn("上午的记录", text)
+        self.assertIn("下午的记录", text)
+        self.assertEqual(len(text.strip().splitlines()), 2)
+
+    def test_cross_day_archives_and_prunes(self):
+        yesterday = time.strftime(
+            "%Y-%m-%d", time.localtime(self.noon - 86400))
+        old = time.strftime("%Y-%m-%d", time.localtime(self.noon - 10 * 86400))
+        self._write("updater_flow.log", "昨天的记录\n")
+        os.utime(self.path, (self.noon - 86400, self.noon - 86400))
+        self._write(updater.flow_log_archive_name(old))
+        with mock.patch.dict(os.environ, {self.keep_key: "3"}):
+            updater.flog("今天的记录")
+        self.assertIn("昨天的记录", self._read(
+            updater.flow_log_archive_name(yesterday)))
+        current = self._read()
+        self.assertIn("今天的记录", current)
+        self.assertNotIn("昨天的记录", current)
+        self.assertFalse((self.dir / updater.flow_log_archive_name(old)).exists())
+
+    def test_error_log_still_overwrites(self):
+        updater.elog("第一次异常", "x")
+        updater.elog("第二次异常", "y")
+        text = self.err.read_text(encoding="utf-8")
+        self.assertNotIn("第一次异常", text)
+        self.assertIn("第二次异常", text)
 
 
 if __name__ == "__main__":

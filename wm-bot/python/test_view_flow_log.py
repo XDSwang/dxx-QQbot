@@ -111,6 +111,46 @@ class TestViewFlowLog(unittest.TestCase):
         self.assertIn("2026-11-08", out.getvalue())
         self.assertIn("当天", out.getvalue())
 
+    def test_log_spec_kinds(self):
+        self.assertEqual(v.log_spec("bot")[0], self.dir)   # patch 生效
+        self.assertEqual(v.log_spec("bot")[1], "bot_flow.log")
+        self.assertEqual(v.log_spec("trace")[1], "selfcheck_trace.log")
+        self.assertEqual(v.log_spec("trace")[2], "selfcheck_trace-")
+        self.assertEqual(v.log_spec("updater")[1], "updater_flow.log")
+        self.assertEqual(v.log_spec("updater")[2], "updater_flow-")
+        with self.assertRaises(ValueError):
+            v.log_spec("unknown")
+
+    def test_main_log_updater_reads_only_updater_archives(self):
+        self._write("updater_flow-2026-11-08.log", "更新器昨天的记录\n")
+        self._write("bot_flow-2026-11-08.log", "机器人昨天的记录\n")
+        spec = (self.dir, "updater_flow.log", "updater_flow-")
+        with patch.object(v, "log_spec", return_value=spec):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = v.main(["2026-11-08", "--log", "updater"],
+                              today=self.today)
+        self.assertEqual(code, 0)
+        self.assertIn("更新器昨天的记录", out.getvalue())
+        self.assertNotIn("机器人昨天的记录", out.getvalue())
+
+    def test_main_log_trace_current_file(self):
+        self._write("selfcheck_trace.log", "收到 | 自检\n")
+        spec = (self.dir, "selfcheck_trace.log", "selfcheck_trace-")
+        with patch.object(v, "log_spec", return_value=spec):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = v.main(["--log", "trace"], today=self.today)
+        self.assertEqual(code, 0)
+        self.assertIn("收到 | 自检", out.getvalue())
+
+    def test_main_log_unknown_kind_rejected(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                v.main(["--log", "unknown"], today=self.today)
+        self.assertEqual(ctx.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

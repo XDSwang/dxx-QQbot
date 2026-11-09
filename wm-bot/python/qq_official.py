@@ -126,16 +126,16 @@ def flow_log_day(timestamp):
     return time.strftime("%Y-%m-%d", time.localtime(timestamp))
 
 
-def flow_log_archive_name(day):
-    """某天的归档文件名：统一入口，别处不许自己拼。"""
-    return "%s%s%s" % (FLOW_LOG_PREFIX, day, FLOW_LOG_SUFFIX)
+def flow_log_archive_name(day, prefix=FLOW_LOG_PREFIX):
+    """某天的归档文件名：统一入口，别处不许自己拼；prefix 区分不同日志。"""
+    return "%s%s%s" % (prefix, day, FLOW_LOG_SUFFIX)
 
 
-def flow_log_archived_day(name):
+def flow_log_archived_day(name, prefix=FLOW_LOG_PREFIX):
     """从归档名取日期串；不是本程序生成的归档返回空串，避免误删别的文件。"""
-    if not (name.startswith(FLOW_LOG_PREFIX) and name.endswith(FLOW_LOG_SUFFIX)):
+    if not (name.startswith(prefix) and name.endswith(FLOW_LOG_SUFFIX)):
         return ""
-    day = name[len(FLOW_LOG_PREFIX):-len(FLOW_LOG_SUFFIX)]
+    day = name[len(prefix):-len(FLOW_LOG_SUFFIX)]
     if len(day) != 10:
         return ""
     try:
@@ -160,14 +160,14 @@ def flow_log_cutoff(today, keep_days):
     return (d - datetime.timedelta(days=int(keep_days) - 1)).isoformat()
 
 
-def flow_log_prune(directory, today, keep_days):
-    """删除超期归档，返回删掉的文件名列表；只认本程序生成的归档名。"""
+def flow_log_prune(directory, today, keep_days, prefix=FLOW_LOG_PREFIX):
+    """删除超期归档，返回删掉的文件名列表；只认本组生成的对应前缀归档名。"""
     if int(keep_days) <= 0 or not os.path.isdir(directory):
         return []
     cutoff = flow_log_cutoff(today, keep_days)
     removed = []
     for name in sorted(os.listdir(directory)):
-        day = flow_log_archived_day(name)
+        day = flow_log_archived_day(name, prefix)
         if day and day < cutoff:
             try:
                 os.remove(os.path.join(directory, name))
@@ -222,16 +222,38 @@ def flog(msg, now=None):
 
 
 # ---------------- 消息链路记录（主链三层 + 网关辅助层） ----------------
-# 独立于 bot_flow.log 的单份固定记录：手机熄屏冻结 / 进程被结束时，要能看出
+# 独立于 bot_flow.log 的链路记录：手机熄屏冻结 / 进程被结束时，要能看出
 # 「到底卡在哪一层」。故每条单独开写、立刻 flush + fsync，不进 logging 缓冲。
 # 主链三层（收到/组装/已发送）顺序固定；「连接」「静默」是辅助诊断层：
 # 网关假死时主链一条都没有，靠连接层才能区分「进程没起来」和「网关不推事件」。
-# ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（第三个固定日志文件） |
-# 原因：用户明确要求链路记录单独一个文件、逐条落盘；非临时实现，但同按 1.4 锁进本函数 |
-# 隔离：仅本函数内，参数进返回值出。
+# 同样按天归档成 selfcheck_trace-YYYY-MM-DD.log，与 bot_flow 共用 WM_FLOW_LOG_DAYS。
+# ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（按日期滚动生成多份日志） |
+# 原因：用户明确要求链路记录单独成文件、逐条落盘且不能无限增长；同按 1.4 锁进本组函数 |
+# 隔离：仅本组函数内，归档命名 / 日期判定 / 清理都由统一入口提供。
 TRACE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "data", "selfcheck_trace.log")
 TRACE_STAGES = ("收到", "组装", "已发送", "连接", "静默")
+TRACE_LOG_PREFIX = "selfcheck_trace-"
+_trace_log_day = None
+
+
+def _trace_log_rotate(now):
+    """链路日志跨天归档 + 超期清理：与 bot_flow 同参数、同命名规则，只换前缀。"""
+    global _trace_log_day
+    today = flow_log_day(now)
+    with _flow_log_lock:
+        if _trace_log_day == today:
+            return today
+        directory = os.path.dirname(TRACE_LOG_PATH)
+        os.makedirs(directory, exist_ok=True)
+        if os.path.isfile(TRACE_LOG_PATH):
+            old_day = flow_log_day(os.path.getmtime(TRACE_LOG_PATH))
+            if old_day != today:
+                _flow_log_archive(TRACE_LOG_PATH, os.path.join(
+                    directory, flow_log_archive_name(old_day, TRACE_LOG_PREFIX)))
+        flow_log_prune(directory, today, flow_log_keep_days(), TRACE_LOG_PREFIX)
+        _trace_log_day = today
+    return today
 
 # 网关会话健康（2026-11-09 手机实测：进程活着、主动广播正常，但一下午收不到
 # 任何群消息；时好时坏）。根因：读循环只有 sock.settimeout(90) 兜底，而心跳
@@ -271,6 +293,10 @@ def trace_chain(stage, detail, raw=None):
     if raw is not None:
         head += "---- 完整内容（代码层原样，未渲染）----\n" \
                 + str(raw) + "\n---- 完整内容结束 ----\n"
+    try:
+        _trace_log_rotate(time.time())
+    except Exception:
+        pass                       # 归档失败也要照常写当天记录，绝不丢链路证据
     try:
         with open(TRACE_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(head)

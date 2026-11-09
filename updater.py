@@ -18,6 +18,7 @@
 同域名连续访问间隔固定 3.5 秒（规范 1.8 的 3~5 秒区间），状态落盘跨进程共享。
 """
 import base64
+import datetime
 import json
 import os
 import re
@@ -70,16 +71,142 @@ CONFIG_KV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
 # ------------------------------ 日志双轨（规范 1.3） ------------------------------
+# 流程日志按天保留：当天追加，跨天归档成 updater_flow-YYYY-MM-DD.log，超期归档
+# 按 WM_FLOW_LOG_DAYS（单位天，缺省 7；7 / 3 / 1 都行，0 = 永不清理）自动删除。
+# 异常日志仍是覆盖式（只留最近一次异常），本来就不会无限增长。
+# ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（按日期滚动生成多份日志） |
+# 原因：用户明确要求流程日志都按天保留、不能无限增长；同按 1.4 锁进本组函数 |
+# 隔离：仅本组函数内，归档命名 / 日期判定 / 清理都由统一入口提供，不扩散到业务代码。
+FLOW_LOG_PREFIX = "updater_flow-"
+FLOW_LOG_SUFFIX = ".log"
+FLOW_LOG_KEEP_KEY = "WM_FLOW_LOG_DAYS"
+FLOW_LOG_KEEP_DAYS = 7
+BOT_CONFIG_FILE = HERE / "wm-bot" / "python" / "data" / "config.txt"
+_flow_log_lock = threading.Lock()
+_flow_log_day = None
+
+
+def flow_log_day(timestamp):
+    """时间戳归属的本地日期串 YYYY-MM-DD（走 datetime，不受 time 被 mock 影响）。"""
+    return datetime.date.fromtimestamp(timestamp).isoformat()
+
+
+def flow_log_archive_name(day):
+    """某天的归档文件名：统一入口，别处不许自己拼。"""
+    return "%s%s%s" % (FLOW_LOG_PREFIX, day, FLOW_LOG_SUFFIX)
+
+
+def flow_log_archived_day(name):
+    """从归档名取日期串；不是本程序生成的归档返回空串，避免误删别的文件。"""
+    if not (name.startswith(FLOW_LOG_PREFIX) and name.endswith(FLOW_LOG_SUFFIX)):
+        return ""
+    day = name[len(FLOW_LOG_PREFIX):-len(FLOW_LOG_SUFFIX)]
+    if len(day) != 10:
+        return ""
+    try:
+        datetime.date(int(day[0:4]), int(day[5:7]), int(day[8:10]))
+    except ValueError:
+        return ""
+    return day
+
+
+def flow_log_keep_days():
+    """保留天数（单位天）：环境变量 > 机器人 data/config.txt > 缺省 7；0=不清理。"""
+    raw = os.environ.get(FLOW_LOG_KEEP_KEY)
+    if raw is None:
+        try:
+            with open(str(BOT_CONFIG_FILE), "r", encoding="utf-8") as f:
+                for line in f:
+                    m = CONFIG_KV.match(line.strip())
+                    if m and m.group(1) == FLOW_LOG_KEEP_KEY:
+                        raw = m.group(2).strip()
+                        break
+        except (OSError, UnicodeError):
+            pass
+    try:
+        days = int(str(FLOW_LOG_KEEP_DAYS if raw is None else raw).strip())
+    except (TypeError, ValueError):
+        return FLOW_LOG_KEEP_DAYS
+    return days if days >= 0 else FLOW_LOG_KEEP_DAYS
+
+
+def flow_log_cutoff(today, keep_days):
+    """保留窗口的起始日期串（含当天），早于它的归档算超期。"""
+    d = datetime.date(int(today[0:4]), int(today[5:7]), int(today[8:10]))
+    return (d - datetime.timedelta(days=int(keep_days) - 1)).isoformat()
+
+
+def flow_log_prune(directory, today, keep_days):
+    """删除超期归档，返回删掉的文件名列表；只认本程序生成的归档名。"""
+    directory = str(directory)
+    if int(keep_days) <= 0 or not os.path.isdir(directory):
+        return []
+    cutoff = flow_log_cutoff(today, keep_days)
+    removed = []
+    for name in sorted(os.listdir(directory)):
+        day = flow_log_archived_day(name)
+        if day and day < cutoff:
+            try:
+                os.remove(os.path.join(directory, name))
+                removed.append(name)
+            except OSError:
+                pass
+    return removed
+
+
+def _flow_log_archive(path, archive):
+    """把未归档日志并入归档文件；同名归档已存在时追加而不覆盖。"""
+    path, archive = str(path), str(archive)
+    try:
+        if os.path.isfile(archive):
+            with open(path, "rb") as src, open(archive, "ab") as dst:
+                dst.write(b"\n")
+                dst.write(src.read())
+            os.remove(path)
+        else:
+            os.replace(path, archive)
+    except OSError:
+        pass
+
+
+def _flow_log_rotate(today=None):
+    """跨天归档 + 超期清理；基于当前 FLOW_LOG（离线测试可 patch 到临时目录）。
+
+    日期一律走 datetime / 文件 mtime，不额外调用 time 模块：模块级 time 在
+    离线测试里会被整个替换成 Mock，日志写入不能因此改变被测流程的调用次数。
+    """
+    global _flow_log_day
+    today = today or datetime.date.today().isoformat()
+    with _flow_log_lock:
+        if _flow_log_day == today:
+            return today
+        directory = os.path.dirname(str(FLOW_LOG)) or "."
+        os.makedirs(directory, exist_ok=True)
+        if os.path.isfile(str(FLOW_LOG)):
+            old_day = flow_log_day(os.path.getmtime(str(FLOW_LOG)))
+            if old_day != today:
+                _flow_log_archive(
+                    FLOW_LOG, os.path.join(directory,
+                                           flow_log_archive_name(old_day)))
+        flow_log_prune(directory, today, flow_log_keep_days())
+        _flow_log_day = today
+    return today
+
+
 def _log(path, level, msg, extra=""):
     line = "%s | %s | %s%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), level,
                                  msg, (" | " + extra) if extra else "")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = str(path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         if level == "ERROR":
-            path.write_text(line, encoding="utf-8")          # 覆盖式，只留最近一次异常
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(line)                          # 覆盖式，只留最近一次异常
         else:
-            with path.open("a", encoding="utf-8") as f:
+            _flow_log_rotate()
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
+                f.flush()
     except Exception as e:
         print("[updater] 日志写入失败: %s" % e, file=sys.stderr)
 
