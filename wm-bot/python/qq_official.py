@@ -63,6 +63,7 @@ qq_official.py — 把 WM 查询接入【官方 QQ 机器人】（q.qq.com，无
   WM_QQ_ALLOW_ALL_GROUPS 0 = 只监控白名单群（正式）；1 = 临时监控所有群（仅调试）
   WM_QQ_INTENTS          事件订阅位掩码（默认 33554432 = 1<<25，已含上面全部事件，
                          免 @ / 主动发言是群资料页开关，不需要改这里）
+  WM_FLOW_LOG_DAYS       流程日志保留天数（单位天，默认 7；可填 3 / 1，0 = 不清理）
 
 群白名单：
   - 默认不监控任何群；只有 data/groups.txt 里写进的 group_openid 才回复；
@@ -101,42 +102,165 @@ except ImportError:        # pragma: no cover - 取决于部署文件是否齐�
 import drops
 import wm
 
-# ---------------- 覆盖式运行流程日志 ----------------
-# 每次启动清空重写（FileHandler mode="w"），便于排查"连上但没回复"等问题。
-# 日志路径：脚本同目录 data/bot_flow.log（基于 __file__，手机任意路径可用）
-import logging
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot_flow.log")
-os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)   # 全新拷贝时 data/ 可能还不存在
-_flow_logger = logging.getLogger("wm_qq_flow")
-_flow_logger.setLevel(logging.DEBUG)
-_flow_logger.propagate = False
-if not _flow_logger.handlers:
-    _fh = logging.FileHandler(_LOG_PATH, mode="w", encoding="utf-8")
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
-    _flow_logger.addHandler(_fh)
+# ---------------- 按天保留的运行流程日志 ----------------
+# 当天仍写固定 data/bot_flow.log，但改成追加（重启不再清空，下午的证据不丢）；
+# 跨天把旧文件归档成 data/bot_flow-YYYY-MM-DD.log，超出保留天数的归档自动清理。
+# 参数 WM_FLOW_LOG_DAYS：单位「天」，可填 7 / 3 / 1；0 = 永不清理；缺省 7。
+# ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（流程日志按日期滚动生成多份） |
+# 原因：用户明确要求按天保留、可设保留天数；非临时实现，同按 1.4 锁进本组函数 |
+# 隔离：仅本组函数内，归档命名 / 日期判定 / 清理都由统一入口提供，不扩散到业务代码。
+import datetime
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_LOG_PATH = os.path.join(LOG_DIR, "bot_flow.log")
+os.makedirs(LOG_DIR, exist_ok=True)   # 全新拷贝时 data/ 可能还不存在
+FLOW_LOG_PREFIX = "bot_flow-"
+FLOW_LOG_SUFFIX = ".log"
+FLOW_LOG_KEEP_DAYS = 7
+FLOW_LOG_KEEP_KEY = "WM_FLOW_LOG_DAYS"
+_flow_log_lock = threading.Lock()
+_flow_log_day = None
 
 
-def flog(msg):
-    """写流程日志（覆盖式落盘到 data/bot_flow.log）。"""
+def flow_log_day(timestamp):
+    """时间戳归属的本地日期串 YYYY-MM-DD。"""
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def flow_log_archive_name(day):
+    """某天的归档文件名：统一入口，别处不许自己拼。"""
+    return "%s%s%s" % (FLOW_LOG_PREFIX, day, FLOW_LOG_SUFFIX)
+
+
+def flow_log_archived_day(name):
+    """从归档名取日期串；不是本程序生成的归档返回空串，避免误删别的文件。"""
+    if not (name.startswith(FLOW_LOG_PREFIX) and name.endswith(FLOW_LOG_SUFFIX)):
+        return ""
+    day = name[len(FLOW_LOG_PREFIX):-len(FLOW_LOG_SUFFIX)]
+    if len(day) != 10:
+        return ""
     try:
-        _flow_logger.info(msg)
+        datetime.date(int(day[0:4]), int(day[5:7]), int(day[8:10]))
+    except ValueError:
+        return ""
+    return day
+
+
+def flow_log_keep_days():
+    """保留天数（单位天）：非法值 / 负数回退缺省 7，0 = 不清理。"""
+    try:
+        days = int(str(bot_config.get(FLOW_LOG_KEEP_KEY, FLOW_LOG_KEEP_DAYS)).strip())
+    except (TypeError, ValueError):
+        return FLOW_LOG_KEEP_DAYS
+    return days if days >= 0 else FLOW_LOG_KEEP_DAYS
+
+
+def flow_log_cutoff(today, keep_days):
+    """保留窗口的起始日期串（含当天），早于它的归档算超期。"""
+    d = datetime.date(int(today[0:4]), int(today[5:7]), int(today[8:10]))
+    return (d - datetime.timedelta(days=int(keep_days) - 1)).isoformat()
+
+
+def flow_log_prune(directory, today, keep_days):
+    """删除超期归档，返回删掉的文件名列表；只认本程序生成的归档名。"""
+    if int(keep_days) <= 0 or not os.path.isdir(directory):
+        return []
+    cutoff = flow_log_cutoff(today, keep_days)
+    removed = []
+    for name in sorted(os.listdir(directory)):
+        day = flow_log_archived_day(name)
+        if day and day < cutoff:
+            try:
+                os.remove(os.path.join(directory, name))
+                removed.append(name)
+            except OSError:
+                pass
+    return removed
+
+
+def _flow_log_archive(path, archive):
+    """把未归档日志并入归档文件；同名归档已存在时追加而不覆盖。"""
+    try:
+        if os.path.exists(archive):
+            with open(path, "rb") as src, open(archive, "ab") as dst:
+                dst.write(b"\n")
+                dst.write(src.read())
+            os.remove(path)
+        else:
+            os.replace(path, archive)
+    except OSError:
+        pass
+
+
+def _flow_log_rotate(now):
+    """跨天归档 + 超期清理；每次 flog 调用，同一天只做一次目录扫描。"""
+    global _flow_log_day
+    today = flow_log_day(now)
+    with _flow_log_lock:
+        if _flow_log_day == today:
+            return today
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if os.path.isfile(_LOG_PATH):
+            old_day = flow_log_day(os.path.getmtime(_LOG_PATH))
+            if old_day != today:
+                _flow_log_archive(
+                    _LOG_PATH, os.path.join(LOG_DIR, flow_log_archive_name(old_day)))
+        flow_log_prune(LOG_DIR, today, flow_log_keep_days())
+        _flow_log_day = today
+    return today
+
+
+def flog(msg, now=None):
+    """写流程日志：当天追加、跨天归档；每条写完立即 flush，程序被冻结也不丢。"""
+    try:
+        now = time.time() if now is None else now
+        _flow_log_rotate(now)
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S", time.localtime(now)), msg))
+            f.flush()
     except Exception:
         pass
 
 
-# ---------------- 消息链路三层记录（收到 / 组装 / 已发送） ----------------
+# ---------------- 消息链路记录（主链三层 + 网关辅助层） ----------------
 # 独立于 bot_flow.log 的单份固定记录：手机熄屏冻结 / 进程被结束时，要能看出
 # 「到底卡在哪一层」。故每条单独开写、立刻 flush + fsync，不进 logging 缓冲。
+# 主链三层（收到/组装/已发送）顺序固定；「连接」「静默」是辅助诊断层：
+# 网关假死时主链一条都没有，靠连接层才能区分「进程没起来」和「网关不推事件」。
 # ⭐异常规范代码 | 用户：dxx | 日期：2026-11-09 | 违反：通用规范 1.3（第三个固定日志文件） |
 # 原因：用户明确要求链路记录单独一个文件、逐条落盘；非临时实现，但同按 1.4 锁进本函数 |
 # 隔离：仅本函数内，参数进返回值出。
 TRACE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "data", "selfcheck_trace.log")
-TRACE_STAGES = ("收到", "组装", "已发送")
+TRACE_STAGES = ("收到", "组装", "已发送", "连接", "静默")
+
+# 网关会话健康（2026-11-09 手机实测：进程活着、主动广播正常，但一下午收不到
+# 任何群消息；时好时坏）。根因：读循环只有 sock.settimeout(90) 兜底，而心跳
+# Timer 每约 45s 发 op1、服务端回 op11 ACK —— 只要 ACK 还在，读超时永远不触发；
+# 服务端「还回 ACK 但不再推事件」时连接永久假死，run.py 的 alive() 也看不出来。
+# 两道自愈：① 连续 N 个心跳周期无任何帧/ACK → 主动断开重连；
+#          ② 会话超过上限秒数主动软重连，兜底「只回 ACK 不推事件」。
+GATEWAY_STALE_FACTOR = 2.0         # 允许连续几个心跳周期收不到 ACK / 任意帧
+GATEWAY_SESSION_MAX_SECONDS = 600  # 会话最长存活秒数（软重连），WM_QQ_SESSION_MAX 可覆盖，0=关
+GATEWAY_PROOF_SECONDS = 300        # 网关存活存证写入间隔（证明进程活着、网关有帧）
+
+
+def gateway_is_stale(last_frame_at, last_ack_at, now, interval, factor):
+    """参数进返回值出：连续 factor 个心跳周期没收到任何帧 / ACK 即判假死。
+
+    还没收到过任何帧（时间戳为 0）时不判死，避免刚连上就被误杀。
+    """
+    last = max(float(last_frame_at or 0.0), float(last_ack_at or 0.0))
+    return last > 0 and (now - last) > float(interval) * float(factor)
+
+
+def session_expired(started_at, now, max_seconds):
+    """会话是否到期需要软重连；max_seconds<=0 表示该机制已关闭。"""
+    return float(max_seconds) > 0 and float(started_at) > 0 \
+        and (now - float(started_at)) > float(max_seconds)
 
 
 def trace_chain(stage, detail, raw=None):
-    """链路三层记录，逐条追加、立刻刷盘；异常静默返回 False，绝不卡住消息主流程。
+    """链路记录，逐条追加、立刻刷盘；异常静默返回 False，绝不卡住消息主流程。
 
     raw 是「代码层原样、未被客户端渲染处理」的完整内容（图片链接原样、不截断、
     不做展示层替换），单独成块写出，方便整段复制出来验证链接与拼接。
@@ -479,6 +603,18 @@ class OfficialBot:
         self._stop = threading.Event()
         self._seq = None
         self._hb_timer = None
+        # 网关会话健康状态（读循环单线程写、心跳线程只读；浮点赋值本身原子）
+        self._hb_generation = 0       # 心跳链代次：重连后旧链按代次自行退出
+        self._last_frame_at = 0.0     # 最后一次收到服务端任意帧
+        self._last_ack_at = 0.0       # 最后一次收到心跳 ACK
+        self._last_event_at = 0.0     # 最后一次收到 op0 dispatch 消息事件
+        self._session_started_at = 0.0
+        self._last_proof_at = 0.0     # 上一次写存活存证
+        try:
+            self._session_max = float(os.environ.get(
+                "WM_QQ_SESSION_MAX", GATEWAY_SESSION_MAX_SECONDS))
+        except (TypeError, ValueError):
+            self._session_max = float(GATEWAY_SESSION_MAX_SECONDS)
         # 用户查询的异步处理：每个会话一条串行队列 + 一个工作线程。
         # 只有真的跑起网关主循环（_loop）时才开启；测试里直接调 _dispatch_reply
         # 仍是同步执行，断言不受影响。
@@ -493,9 +629,20 @@ class OfficialBot:
 
     def stop(self):
         self._stop.set()
-        if self._hb_timer:
+        self._cancel_heartbeat()
+
+    def _cancel_heartbeat(self):
+        """取消当前心跳 Timer，并让旧链在下次触发时按代次自行退出。
+
+        旧链若不收干净，会一直持有上一次连接的 conn，每 45s 往死 socket 发帧
+        （异常被吞）并无限续期；重连次数越多僵尸线程越多。
+        """
+        self._hb_generation += 1
+        t = self._hb_timer
+        self._hb_timer = None
+        if t is not None:
             try:
-                self._hb_timer.cancel()
+                t.cancel()
             except Exception:
                 pass
 
@@ -616,12 +763,17 @@ class OfficialBot:
         return bool(ok)
 
     def run_forever(self):
+        # 启动即落一条追加式存证：日志里连这行都没有 = 进程没起来 / 被冻结，
+        # 有这行但一直没有「收到」= 网关没推事件，两者一眼分开。
+        trace_chain("连接", "进程已启动，进入 run_forever（准备连接网关）")
         try:
             while not self._stop.is_set():
                 try:
                     self._connect_loop()
                 except Exception as e:
                     print(f"[official] 连接/处理出错: {e}", file=sys.stderr)
+                    flog(f"连接/处理出错，准备重连: {e}")
+                    trace_chain("连接", "连接异常，准备重连: %s" % str(e)[:200])
                 if self._stop.wait(5):
                     break
         except KeyboardInterrupt:
@@ -651,7 +803,21 @@ class OfficialBot:
         conn = WSConn(sock, client_mask=True, initial=leftover)   # 客户端→服务端 发帧需掩码
         print(f"[official] 已连网关 {host}{path}", file=sys.stderr)
         flog(f"已连网关 {host}{path}")
-        self._loop(conn, token)
+        now = time.time()
+        self._session_started_at = now
+        self._last_frame_at = now
+        self._last_ack_at = now
+        trace_chain("连接", "已连网关 %s%s，会话开始" % (host, path))
+        try:
+            self._loop(conn, token)
+        finally:
+            # 每次会话结束都收干净：旧心跳链、旧 socket，否则重连会越堆越僵尸。
+            self._cancel_heartbeat()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            trace_chain("连接", "会话结束，准备重连")
 
     def _fetch_self(self, token):
         """拉一次机器人自己的资料（GET /users/@me），username 就是群里显示的昵称。
@@ -689,8 +855,11 @@ class OfficialBot:
                 typ, payload = conn.recv_message()
             except Exception as e:
                 raise RuntimeError(f"网关读取失败: {e}")
+            now = time.time()
+            self._last_frame_at = now      # 任意帧都算「网关还活着」的证据
             if typ == "close":
                 flog("收到 close 帧，关闭连接")
+                trace_chain("连接", "收到 close 帧，会话结束")
                 try:
                     conn.send_close()
                 except Exception:
@@ -711,7 +880,16 @@ class OfficialBot:
                 self._start_heartbeat(conn, interval)
                 self._identify(conn, token)
             elif op == 11:  # Heartbeat ACK
+                self._last_ack_at = now
                 flog("心跳 ACK（op11）已确认")
+                # 会话到期软重连：服务端「只回 ACK、不推事件」时读超时永远不触发，
+                # 只有主动重建会话才能恢复收消息（否则就是一下午全静默）。
+                # 特意放在 ACK 帧上判断，不拦在消息事件前面，避免正好到点时丢一条。
+                if session_expired(self._session_started_at, now, self._session_max):
+                    flog(f"网关会话已存活 {now - self._session_started_at:.0f}s，主动软重连")
+                    trace_chain("连接", "会话到期（上限 %ds），主动断开重建会话"
+                                % int(self._session_max))
+                    return
             elif op == 1:   # 服务器心跳探测：必须立即回一个心跳，否则服务器可能停止推事件
                 try:
                     conn.send_text(json.dumps({"op": 1, "d": self._seq}))
@@ -728,17 +906,61 @@ class OfficialBot:
                 return
             elif op == 0:   # Dispatch 事件
                 self._seq = pkt.get("s")
+                self._last_event_at = now
+                if pkt.get("t") in ("READY", "RESUMED"):
+                    trace_chain("连接", "网关 %s：会话已就绪，开始接收群消息"
+                                % pkt.get("t"))
                 self._on_event(conn, pkt, token)
 
     def _start_heartbeat(self, conn, interval):
+        """一条心跳链只服务本次连接：重连后旧链按代次自行退出，不再往死 socket 发帧。"""
+        self._cancel_heartbeat()
+        generation = self._hb_generation
+        self._last_ack_at = time.time()
+
         def hb():
-            if self._stop.is_set():
+            if self._stop.is_set() or generation != self._hb_generation:
+                return
+            now = time.time()
+            # ① 看门狗：连续 N 个心跳周期没收到任何帧 / ACK，主动断开让外层重连。
+            # socket 的 90s 读超时只在「一个字节都没有」时触发，且没有明确证据；
+            # 这里额外留下一条可查的假死记录。
+            if gateway_is_stale(self._last_frame_at, self._last_ack_at, now,
+                                interval, GATEWAY_STALE_FACTOR):
+                flog(f"⚠️ 网关看门狗：{now - max(self._last_frame_at, self._last_ack_at):.0f}s "
+                     f"没收到任何帧/ACK，主动断开重连")
+                trace_chain("连接", "看门狗触发：连续无帧/ACK，主动断开重连")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            # ② 会话到期也由心跳线程兜底：读循环万一卡在 recv 里执行不到检查，
+            #    这条独立线程仍能强制断连，让外层重建会话恢复收消息。
+            if session_expired(self._session_started_at, now, self._session_max):
+                flog(f"心跳线程：网关会话已存活 {now - self._session_started_at:.0f}s，"
+                     f"主动软重连")
+                trace_chain("连接", "心跳线程检测到会话到期，主动断开重建会话")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 return
             try:
                 conn.send_text(json.dumps({"op": 1, "d": self._seq}))
                 flog(f"发送心跳(op1) seq={self._seq}")
             except Exception as e:
                 flog(f"发送心跳失败: {e}")
+            # ③ 存活存证：群里安静时日志也不空，能区分「进程被冻结」和
+            #    「网关还回 ACK 但就是不推消息事件」。
+            if now - self._last_proof_at >= GATEWAY_PROOF_SECONDS:
+                self._last_proof_at = now
+                trace_chain("连接", "网关存活存证：心跳正常，最后帧=%.0fs前，"
+                            "最后消息事件=%.0fs前" % (
+                                now - self._last_frame_at,
+                                (now - self._last_event_at) if self._last_event_at else -1))
+            if generation != self._hb_generation:
+                return
             self._hb_timer = threading.Timer(interval, hb)
             self._hb_timer.daemon = True
             self._hb_timer.start()
@@ -994,6 +1216,10 @@ class OfficialBot:
             flog("handler 返回空（闲聊未带 dxx  前缀 / 白名单外群静默），不回复")
             bot_config.echo("[silent] %s %s 文本=%r 没命中指令或群不在白名单，不回复"
                             % (kind, target_id, text))
+            # 有「收到」没「组装」时，这条能证明事件确实到了，只是被判定静默。
+            trace_chain("静默", "事件已收到但 handler 返回空：%s %s 文本=%r "
+                        "（白名单外 / 未命中指令 / 判定闲聊）"
+                        % (kind, target_id, text))
             return
         # 全量群消息（没 @ 机器人）：优先【不带 msg_id】发一条普通群消息，
         # 不 @ 任何人、也不显示「引用某条消息」；@ 消息才走被动引用回复。

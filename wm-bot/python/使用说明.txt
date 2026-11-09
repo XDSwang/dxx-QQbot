@@ -97,8 +97,9 @@ dxx 日历                         1999 日历当季挑战与增益
 1. 先关掉电脑上还在跑的 python qq_bot.py：同一个 AppID 只能有一个在线连接，
    两端同时开就会互相顶掉、群里收不到回复。
 2. data/config.txt 和 data/groups.txt 都不用改：凭证、群 openid 跟机器人 AppID 走，换设备不变。
-3. 整个文件夹拷过去即可；测试文件、__pycache__、bot_flow.log、
-   data/items_index.json（旧版全站索引残留）、data/cache.json.mockbak 不用带，代码都不读。
+3. 整个文件夹拷过去即可；测试文件、__pycache__、bot_flow.log 和
+   bot_flow-YYYY-MM-DD.log 归档、data/items_index.json（旧版全站索引残留）、
+   data/cache.json.mockbak 不用带，代码都不读。
 4. 手机开自动校时；Termux 挂机先执行 termux-wake-lock，避免锁屏被杀掉长连接。
 5. 手机要能访问 api.bot.qq.com 和 api.warframe.market；群里发指令仍要从 @ 列表点选机器人。
 

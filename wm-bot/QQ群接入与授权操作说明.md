@@ -131,7 +131,7 @@
 - [ ] 发一句闲聊，机器人不回（静默规则正常）
 - [ ] 在另一个没写进白名单的群 @ 它，不回（白名单隔离正常）
 - [ ] 私聊机器人发 `WM Boltor Prime`，能回（私聊不受白名单限制）
-- [ ] `data/bot_flow.log` 里没有 AppSecret（日志每次启动覆盖重写，本来就不记录 secret）
+- [ ] `data/bot_flow.log` 里没有 AppSecret（本来就不记录 secret；日志按天归档保留，重启不再清空）
 
 ---
 
