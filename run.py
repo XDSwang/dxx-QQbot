@@ -706,11 +706,14 @@ def _broadcast_update(text, cfg_path, data_dir):
         updater.flog("广播异常（不影响更新）：%s" % e)
 
 
-def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
+def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False,
+              data_sha=None):
     """执行一个服务的一轮更新；无论成败都在 finally 里把该服务拉起来。
 
     svc 为空时退回单服务默认路径（离线测试 / 旧调用）；pull=False 用于全局信号
     已经统一 pull 过一次、后面多个服务只做迁移的场景。
+    data_sha 是本轮私有库拷贝的 HEAD：服务 state 只记它，不记触发信号的指纹，
+    否则公共库代码指纹与私有库数据指纹会互相覆盖，下一轮必然误判「内容更新」。
     """
     data_dir = Path(svc.data_dir) if svc else BOT_DATA_DIR
     cfg_path = Path(svc.config_file) if svc else BOT_CONFIG
@@ -818,7 +821,11 @@ def do_update(cfg, store, bot, sig, svc=None, pull=True, code_updated=False):
                 updater.elog("[%s] 运行数据回写失败（服务端本地已迁移完成）"
                              % (service or "default"), str(e))
         st = updater.load_state(service)
-        st.update({"last_signal": sig.fingerprint, "signal_name": sig.name,
+        # 服务级 last_signal 只认私有库本轮版本：全局/代码信号触发时传进来的 sig
+        # 属于 __global__ / __code__，写进去会与服务自己派生的信号互相覆盖，
+        # 下一轮必然又判成「内容更新」→ 反复停服 / 迁移 / 重启。
+        st.update({"last_signal": data_sha or sig.fingerprint,
+                   "signal_name": sig.name,
                    "schema_version": schema.get("version"),
                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "failed_signal": "", "failed_rounds": 0,
@@ -1023,8 +1030,10 @@ def main():
                     # 排查「没收到两条更新广播」：先确认这轮有没有跑、HEAD 有没有变。
                     updater.flog("[global] 公共库新代码=%s（仅 True 才广播两条更新消息）"
                                  % new_code)
+                    data_sha = gbase["sha"] if gbase else None
                     plan = [(s, service_stores[s.name], bots[s.name],
-                             trigger_sig, False, new_code) for s in services]
+                             trigger_sig, False, new_code, data_sha)
+                            for s in services]
                     st = updater.load_state(target_key)
                     st.update({"last_signal": trigger_sig.fingerprint,
                                "failed_signal": "", "failed_rounds": 0,
@@ -1042,7 +1051,7 @@ def main():
                         crashes[n] = 0
                         crash_since[n] = now
             # 各服务独立信号：只更新被点名的那个，不惊动其他服务
-            planned = {s.name for s, _, _, _, _, _ in plan}
+            planned = {s.name for s, _, _, _, _, _, _ in plan}
             for s in services:
                 if s.name in planned:
                     continue
@@ -1057,10 +1066,11 @@ def main():
                         or sig.fingerprint == st.get("last_signal")
                         or _blocked_by_failure(st, sig.fingerprint)):
                     continue
-                plan.append((s, service_stores[s.name], bots[s.name], sig, True, False))
-            for s, store, bot, sig, pull, new_code in plan:
+                plan.append((s, service_stores[s.name], bots[s.name], sig,
+                             True, False, gbase["sha"] if gbase else None))
+            for s, store, bot, sig, pull, new_code, data_sha in plan:
                 do_update(cfg, store, bot, sig, svc=s, pull=pull,
-                          code_updated=new_code)
+                          code_updated=new_code, data_sha=data_sha)
             # 私有库配置热更新（账号本人在网站 / git 改了 config）：只处理本轮没被
             # 代码更新碰过的服务，避免重复重启；检测哈希变化即按模板迁移 + 热重载。
             if not _off(cfg.get("UPDATER_SYNC_PRIVATE_CONFIG", "1")):

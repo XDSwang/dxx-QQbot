@@ -656,6 +656,20 @@ class TestMultiService(_Base):
         self.assertTrue(ok)
         gp.assert_not_called()
 
+    def test_do_update_records_data_sha_for_service_state(self):
+        """全局/代码信号触发时，服务 state 记本轮私有库版本，两条指纹不互相串味。"""
+        svc = self._svc("wm-bot", self.root)
+        svc.data_dir.mkdir(parents=True, exist_ok=True)
+        store = self._remote_service()
+        sig = store.signal()
+        with mock.patch.object(run, "git_pull") as gp:
+            ok = run.do_update({"UPDATER_PUSH_RUNTIME": "0"}, store, FakeBot(),
+                               sig, svc=svc, pull=False, data_sha="private-sha")
+        self.assertTrue(ok)
+        gp.assert_not_called()
+        self.assertEqual(updater.load_state("wm-bot")["last_signal"],
+                         "private-sha")
+
 
 class TestSignalSeparation(_Base):
     """判断恒为 GIT 双源拷贝；runN 只是底层旧能力，旧配置盖不回去。"""
