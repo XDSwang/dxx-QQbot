@@ -127,6 +127,12 @@ def test_parse():
     c_all = ws.parse_ws_command("监控全部")
     check("监控全部 -> 全量监控", c_all["action"] == "monitor"
           and len(c_all["types"]) == len(ws.TYPES))
+    c_all2 = ws.parse_ws_command("监控所有")
+    check("监控所有 -> 全量监控（与「监控全部」等价）", c_all2["action"] == "monitor"
+          and len(c_all2["types"]) == len(ws.TYPES))
+    c_all3 = ws.parse_ws_command("监控 所有")
+    check("监控 所有(带空格) -> 全量监控", c_all3["action"] == "monitor"
+          and len(c_all3["types"]) == len(ws.TYPES))
     check("monitor(英文)裸 -> 安全提示",
           ws.parse_ws_command("monitor")["action"] == "monitor_hint")
     check("闲聊不触发", not qq_common.is_ws_command("今天天气不错")

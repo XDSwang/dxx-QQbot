@@ -2555,8 +2555,8 @@ def parse_ws_command(text):
 
 def _parse_monitor(rest):
     low = rest.lower()
-    # 显式「全部 / all / 全」才全量监控；裸「监控」或不认识的内容都给提示，绝不静默全开
-    if low in ("全部", "all", "全"):
+    # 显式「全部 / 所有 / all / 全」才全量监控；裸「监控」或不认识的内容都给提示，绝不静默全开
+    if low in ("全部", "所有", "all", "全"):
         return {"action": "monitor", "types": list(TYPES.keys())}
     if low == "":
         return {"action": "monitor_hint"}
