@@ -642,6 +642,14 @@ def make_handler(allowed_groups=None, allow_all=False, groups_file=None):
                 q = (body or "").strip().lstrip("/").strip()
                 if not q:
                     return None
+            elif str(channel or "").lower() in ("private", "c2c"):
+                # 例外 3：私聊（单聊 / C2C）是一对一对话，不存在「群里闲聊误触」，
+                # 本来就该免前缀。否则用户按直觉发「监控 警报」会被静默 ——
+                # 看起来就是「既没回复、监控也没开」，完全不像在跟机器人说话。
+                # 仍需是完整指令：解析不出来的内容在下面照旧静默（不猜、不提示）。
+                q = (body or "").strip().lstrip("/").strip()
+                if not q:
+                    return None
             else:
                 # 没带前缀：普通闲聊，静默不回复（监控 / 主动推送照常工作）
                 return None

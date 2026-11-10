@@ -96,19 +96,53 @@ def main():
         first = len(calls)
         M.push_once()
     total += 1
-    ok += check("失败一次后记录探测时刻", M._next_probe > time.time())
+    ok += check("失败一次后记录本会话探测时刻",
+                M._probe_until.get(KA, 0.0) > time.time())
     total += 1
     ok += check("退避期内不再调用主动接口（%d 次）" % first, len(calls) == first == 1)
     total += 1
     ok += check("退避期内内容照样攒着", M.pending_count() == 1)
     # 退避到期后必须重新尝试（不能被每轮推后变成永远不试）
-    M._next_probe = time.time() - 1
+    M._probe_until.clear()
     with patch.object(ws, "ensure_fresh", lambda: {}), \
          patch.object(ws, "format_for", lambda t: "🔥 裂缝"), \
          patch.object(ws, "activity_touch", lambda: None):
         M.push_once()
     total += 1
     ok += check("退避到期后会重新尝试主动发送", len(calls) == first + 1)
+
+    # ---------- 2.6) 退避按【会话】隔离：一个群发不出去，不能拖住私聊 ----------
+    print("[退避按会话隔离，私聊不被群拖累]")
+    M.clear_pending()
+    M._monitors.clear()
+    M._probe_until.clear()
+    M._next_probe = 0.0
+    G_BAD, P_OK = ("group", "G_BAD"), ("private", "U_OK")
+    M._monitors[G_BAD] = {"fissures"}
+    M._monitors[P_OK] = {"fissures"}
+
+    def _sender_split(ch, tid, text):
+        # 群 G_BAD 永远失败（模拟没开主动消息 40034105）；私聊永远成功
+        return (ch, tid) != G_BAD
+
+    sent_priv = []
+    def _sender_split4(ch, tid, text, at_user=None):
+        okv = _sender_split(ch, tid, text)
+        if okv and ch == "private":
+            sent_priv.append(text)
+        return okv
+
+    M.set_sender(_sender_split4)
+    with patch.object(ws, "ensure_fresh", lambda: {}), \
+         patch.object(ws, "format_for", lambda t: "🔥 裂缝（共 1）\n  1. 地球 · 生存"), \
+         patch.object(ws, "activity_touch", lambda: None):
+        M.push_once()
+    total += 1
+    ok += check("群失败被单独记账", M._probe_until.get(G_BAD, 0.0) > time.time())
+    total += 1
+    ok += check("私聊不被群的失败拖住（已推送）", len(sent_priv) >= 1)
+    total += 1
+    ok += check("私聊没有被打上退避", P_OK not in M._probe_until)
 
     # ---------- 3) 随查询附带：首次给、紧接再取为空（限频） ----------
     print("[随查询附带的限频]")

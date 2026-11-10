@@ -101,12 +101,22 @@ def main():
     ok += check("帮助卡片能渲染出图", bool(R.render(q.build_full_help(),
                                                     title="帮助", colors=cols)))
 
-    # 3b) 不带 dxx  前缀：除「帮助」类词外，其它交互指令必须静默（防群聊误触发）
+    # 3b) 群聊里不带 dxx  前缀：除「帮助」类词外，其它交互指令必须静默（防闲聊误触发）
     #     （「帮助」两个字就要出菜单，是用户明确要求的例外，见 3.5）
+    #     注意：用【群】ctx 验证——私聊是一对一，本来就免前缀（见 3b2），
+    #     不该拿私聊来证明「群聊闲聊会误触」。
     for w in ("世界", "平原", "自检", "wm Boltor", "监控 裂缝", "你好啊"):
-        r = H(w, PRIV)
+        r = H(w, GRP)
         total += 1
-        ok += check("handler %r 无前缀静默（None）" % w, r is None)
+        ok += check("群聊 handler %r 无前缀静默（None）" % w, r is None)
+
+    # 3b2) 私聊免前缀：一对一对话不存在「群里闲聊误触」，直接发指令就该生效
+    r_priv = H("监控 裂缝", PRIV)
+    total += 1
+    ok += check("私聊 '监控 裂缝' 免前缀也能开监控",
+                isinstance(r_priv, str) and "已开始监控" in r_priv)
+    total += 1
+    ok += check("私聊 '你好啊' 仍静默（不是完整指令不猜）", H("你好啊", PRIV) is None)
 
     # 3c) 完整指令才算数：带前缀但没精确命中 → 一律静默（不猜、不提示）
     #     理由：模糊/子串/后缀匹配会撞上正常聊天（例如「希图思」这种错别字、

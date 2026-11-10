@@ -76,7 +76,11 @@ _last_sent = {}                      # (channel, target_id) -> {类型键: (该�
                                         # 只有内容变化的栏目才重发，避免每条都刷屏。
 _seen_priority = {}                  # (channel, target_id) -> {type: set(条目键)}  主推基线
 _priority_sent_at = {}               # (channel, target_id) -> 上次主推成功时刻
-_next_probe = 0.0                    # 下次允许尝试主动发送的时刻（失败后退避探测）
+_next_probe = 0.0                    # 全局强制退避（通道级；set_sender / 开关事件可清）
+# 按会话的失败退避：某群发送失败（如未开主动消息 40034105）只停它自己，
+# 不能把别的群、更不该把私聊一起拖住 5 分钟 —— 否则一个没配好的群
+# 就能让「个人监控」永远不推，表现成「监控数据更新了却不推」。
+_probe_until = {}                    # (channel, target_id) -> 下次允许尝试时刻
 _lock = threading.RLock()
 _push_thread = None
 _stop = threading.Event()
@@ -781,6 +785,7 @@ def set_sender(fn):
     global _sender, _next_probe
     _sender = fn
     _next_probe = 0.0
+    _probe_until.clear()         # 换通道：所有会话的失败退避一起作废
     _sender_at[0] = None         # 换了通道，重新探测它收不收 at_user
     with _lock:
         _last_sent.clear()
@@ -1060,6 +1065,9 @@ def notify_active_ready(channel, target_id):
         return 0
     key = (channel, str(target_id))
     with _lock:
+        # 只解除【本会话】的失败退避（别的群没开主动消息，不该拦着这个会话）；
+        # 全局强制退避也一并清掉：开关是刚刚被用户亲手打开的，值得立刻试一次。
+        _probe_until.pop(key, None)
         _next_probe = 0.0
         _last_sent.pop(key, None)
         _pending.pop(key, None)
@@ -1334,12 +1342,12 @@ def _push_priority(ch, tid, key, state, prio, now):
         x = body + ("\n\n（新增 %d 条 · 即时推送，不等周期；发「停止监控」可关闭）"
                     % total_added)
         ok = False
-        if _sender is not None and now >= _next_probe:
+        if _sender is not None and _probe_allowed(key, now):
             try:
                 ok = bool(_send_one(ch, tid, x, at_users_for(ch, tid, t)))
             except Exception:
                 ok = False          # 被频控 / 网络抖动都不致命，下个周期再试
-            _note_probe(ok)
+            _note_probe(ok, key)
         if ok:
             sent_types.append(t)
             sent_any = True
@@ -1473,12 +1481,12 @@ def push_once():
             if rec and now - rec[1] < active_min_gap():
                 continue                    # 该栏目刚推过，太频繁，跳过
             ok = False
-            if _sender is not None and now >= _next_probe:
+            if _sender is not None and _probe_allowed(key, now):
                 try:
                     ok = bool(_send_one(ch, tid, x, at_users_for(ch, tid, t)))
                 except Exception:
                     ok = False              # 被频控 / 网络抖动都不致命，下个周期再试
-                _note_probe(ok)             # 只有真去试了才更新探测时刻
+                _note_probe(ok, key)        # 只有真去试了才更新探测时刻
             with _lock:
                 ls = _last_sent.setdefault(key, {})
                 if ok:
@@ -1520,11 +1528,26 @@ def push_once():
     return sent
 
 
-def _note_probe(ok):
+def _note_probe(ok, key=None):
     """记录主动通道的探测结果：通了就每轮都发，不通则退避 5 分钟再试。
 
     官方机器人未开通主动消息配额时，每次都会返回 40034105；如果每 10 秒空打一次，
     长期跑等于持续骚扰接口。退避后权限一开通，最多 5 分钟内自动恢复。
+
+    退避按【会话】记账（key=(channel,target_id)）：某个群没开主动消息，
+    只该停它自己，不能把私聊 / 其它群的推送一起拖住 5 分钟。
     """
     global _next_probe
-    _next_probe = 0.0 if ok else time.time() + PROBE_GAP
+    if key is None:
+        _next_probe = 0.0 if ok else time.time() + PROBE_GAP
+        return
+    if ok:
+        _probe_until.pop(tuple(key), None)
+    else:
+        _probe_until[tuple(key)] = time.time() + PROBE_GAP
+
+
+def _probe_allowed(key, now=None):
+    """本会话此刻是否允许尝试主动发送（全局强制退避 + 本会话退避都过了才行）。"""
+    now = time.time() if now is None else now
+    return now >= _next_probe and now >= _probe_until.get(tuple(key), 0.0)
