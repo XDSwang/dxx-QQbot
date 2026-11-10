@@ -8,6 +8,7 @@
 import base64
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -1647,12 +1648,13 @@ class TestUnattended(_Base):
     def test_git_cmd_auto_paces_only_network_commands(self):
         """V3：fetch / push 自动过闸，本地 show 不排队。"""
         # 本类默认把 git_cmd 整个 mock 掉（离线测试禁联网）；这里临时恢复真实函数，
-        # 只把底层 subprocess.run 换成假对象，才能验证闸门这一层。
+        # 只把底层 Popen 换成假对象，才能验证闸门这一层。
         self._git_cmd_patch.stop()
         try:
             with mock.patch.object(updater, "pace_gate") as gate, \
-                 mock.patch.object(updater.subprocess, "run") as sp:
-                sp.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                 mock.patch.object(updater.subprocess, "Popen") as sp:
+                sp.return_value = mock.Mock(
+                    returncode=0, **{"communicate.return_value": ("", "")})
                 updater.git_cmd(["fetch", "--no-tags",
                                  "https://github.com/me/p.git", "main"])
                 updater.git_cmd(["push", "git@gitee.com:me/p.git",
@@ -1970,15 +1972,15 @@ class TestPlatformCompat(_Base):
 
     def test_git_cmd_forces_utf8_decoding(self):
         """git 输出显式按 UTF-8 解码并容错，不再吃 Windows 默认 GBK。"""
-        import types
         self._git_cmd_patch.stop()
         try:
-            fake = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
-            with mock.patch.object(updater.subprocess, "run",
-                                   return_value=fake) as sr:
+            fake = mock.Mock(returncode=0,
+                             **{"communicate.return_value": ("ok", "")})
+            with mock.patch.object(updater.subprocess, "Popen",
+                                   return_value=fake) as pp:
                 rc, out, _ = updater.git_cmd(["status"])
             self.assertEqual((rc, out), (0, "ok"))
-            kw = sr.call_args[1]
+            kw = pp.call_args[1]
             self.assertEqual(kw.get("encoding"), "utf-8")
             self.assertEqual(kw.get("errors"), "replace")
         finally:
@@ -2270,6 +2272,79 @@ class TestUpdaterFlowLogRotation(unittest.TestCase):
         text = self.err.read_text(encoding="utf-8")
         self.assertNotIn("第一次异常", text)
         self.assertIn("第二次异常", text)
+
+
+class TestGitCmdGuard(unittest.TestCase):
+    """git 出口加固回归：超时整组杀干净、失败短退避、成功清零。全离线。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        for p in (mock.patch.object(updater, "PACE_FILE", self.dir / "pace.json"),
+                  mock.patch.object(updater, "ERROR_LOG", self.dir / "error.log"),
+                  mock.patch.object(updater, "pace_gate")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.url = "https://github.com/me/private.git"
+
+    @staticmethod
+    def _fake_proc(out="", err="", code=0, timeout_once=False):
+        proc = mock.Mock(returncode=code)
+        if timeout_once:
+            proc.communicate.side_effect = [
+                subprocess.TimeoutExpired(["git", "fetch"], 0.1), ("", "")]
+        else:
+            proc.communicate.return_value = (out, err)
+        return proc
+
+    def test_backoff_delay_ladder(self):
+        self.assertEqual(
+            [updater.git_backoff_delay(n) for n in (0, 1, 2, 3, 4, 9)],
+            [0, 60, 180, 420, 3600, 3600])
+
+    def test_failure_blocks_then_success_clears(self):
+        updater.git_backoff_record(self.url, False, now=1000.0)
+        blocked, remain = updater.git_backoff_check(self.url, now=1010.0)
+        self.assertTrue(blocked)
+        self.assertAlmostEqual(remain, 50.0)
+        self.assertFalse(updater.git_backoff_check(self.url, now=2000.0)[0])
+        updater.git_backoff_record(self.url, True, now=2000.0)
+        self.assertFalse(updater.git_backoff_check(self.url, now=2000.0)[0])
+
+    def test_timeout_kills_tree_and_enters_backoff(self):
+        proc = self._fake_proc(timeout_once=True)
+        with mock.patch.object(updater.subprocess, "Popen",
+                               return_value=proc) as pp, \
+             mock.patch.object(updater, "_kill_git_tree") as kill:
+            code, out, err = updater.git_cmd(
+                ["fetch", "--no-tags", self.url, "main"], timeout=0.1)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("超时", err)
+        self.assertTrue(kill.called, "超时必须连孙进程一起杀，否则管道不关")
+        self.assertTrue(updater.git_backoff_check(self.url)[0])
+        self.assertEqual(pp.call_args[1].get("start_new_session"),
+                         os.name == "posix")
+
+    def test_failed_fetch_skips_next_round(self):
+        proc = self._fake_proc(err="authentication failed", code=1)
+        with mock.patch.object(updater.subprocess, "Popen",
+                               return_value=proc) as pp:
+            first = updater.git_cmd(["fetch", "--no-tags", self.url, "main"])
+            second = updater.git_cmd(["fetch", "--no-tags", self.url, "main"])
+        self.assertEqual(first[0], 1)
+        self.assertEqual(second[0], 1)
+        self.assertIn("退避", second[2])
+        self.assertEqual(pp.call_count, 1,
+                         "退避窗口内不得再打同一个不通的地址")
+
+    def test_local_commands_never_backoff(self):
+        proc = self._fake_proc(out="ok", code=1)
+        with mock.patch.object(updater.subprocess, "Popen",
+                               return_value=proc):
+            updater.git_cmd(["status"])
+            updater.git_cmd(["status"])
+        self.assertFalse(updater.git_backoff_check(self.url)[0])
 
 
 if __name__ == "__main__":

@@ -264,6 +264,10 @@ def _trace_log_rotate(now):
 GATEWAY_STALE_FACTOR = 2.0         # 允许连续几个心跳周期收不到 ACK / 任意帧
 GATEWAY_SESSION_MAX_SECONDS = 600  # 会话最长存活秒数（软重连），WM_QQ_SESSION_MAX 可覆盖，0=关
 GATEWAY_PROOF_SECONDS = 300        # 网关存活存证写入间隔（证明进程活着、网关有帧）
+# 2026-11-10 手机实测：Android 熄屏冻结后 Timer 心跳子线程静默断链，进程活着、
+# 每次重连都能 READY，却一条 op1 都不发，60s 后必被网关关连接。只有阻塞在
+# socket 上的读循环会被网络事件唤醒，所以由它在收到任意帧时校验并补发。
+GATEWAY_HEARTBEAT_GRACE = 8.0     # 间隔 + 8s 仍没发出 op1 = 心跳链断了（< 网关 60s 踢线）
 
 
 def gateway_is_stale(last_frame_at, last_ack_at, now, interval, factor):
@@ -273,6 +277,17 @@ def gateway_is_stale(last_frame_at, last_ack_at, now, interval, factor):
     """
     last = max(float(last_frame_at or 0.0), float(last_ack_at or 0.0))
     return last > 0 and (now - last) > float(interval) * float(factor)
+
+
+def heartbeat_overdue(last_hb_at, now, interval, grace=GATEWAY_HEARTBEAT_GRACE):
+    """参数进返回值出：本次会话的心跳链是否已超时没发出 op1。
+
+    last_hb_at 是最近一次「成功发出」心跳的时间；Hello 时会先写入会话起点，
+    所以刚连上不会被误判。重连后若 Timer 仍不工作，读循环收到任意帧即可据此
+    补发并重建心跳链，不再出现「连上 READY、零心跳、60s 被踢」的静默死链。
+    """
+    return float(last_hb_at) > 0 \
+        and (now - float(last_hb_at)) > float(interval) + float(grace)
 
 
 def session_expired(started_at, now, max_seconds):
@@ -665,6 +680,8 @@ class OfficialBot:
         self._last_event_at = 0.0     # 最后一次收到 op0 dispatch 消息事件
         self._session_started_at = 0.0
         self._last_proof_at = 0.0     # 上一次写存活存证
+        self._last_hb_at = 0.0        # 最近一次成功发出 op1 的时间
+        self._hb_interval = 0.0       # 当前会话心跳间隔（Hello 下发）
         try:
             self._session_max = float(os.environ.get(
                 "WM_QQ_SESSION_MAX", GATEWAY_SESSION_MAX_SECONDS))
@@ -940,6 +957,11 @@ class OfficialBot:
                 raise RuntimeError(f"网关读取失败: {e}")
             now = time.time()
             self._last_frame_at = now      # 任意帧都算「网关还活着」的证据
+            # 重连后校验心跳是否真发出：Timer 链在冻结恢复后可能没续上，
+            # 收到任意帧就由主线程补一次，别让新会话又是「零心跳」。
+            if self._hb_interval > 0 and heartbeat_overdue(
+                    self._last_hb_at, now, self._hb_interval):
+                self._kick_heartbeat(conn, now)
             if typ == "close":
                 flog("收到 close 帧，关闭连接")
                 trace_chain("连接", "收到 close 帧，会话结束")
@@ -1003,58 +1025,85 @@ class OfficialBot:
         """一条心跳链只服务本次连接：重连后旧链按代次自行退出，不再往死 socket 发帧。"""
         self._cancel_heartbeat()
         generation = self._hb_generation
-        self._last_ack_at = time.time()
+        now0 = time.time()
+        self._last_ack_at = now0
+        self._hb_interval = float(interval)
+        self._last_hb_at = now0   # 新链基线：给 Timer 一个完整周期去发第一次 op1
 
         def hb():
             if self._stop.is_set() or generation != self._hb_generation:
                 return
-            now = time.time()
-            # ① 看门狗：连续 N 个心跳周期没收到任何帧 / ACK，主动断开让外层重连。
-            # socket 的 90s 读超时只在「一个字节都没有」时触发，且没有明确证据；
-            # 这里额外留下一条可查的假死记录。
-            if gateway_is_stale(self._last_frame_at, self._last_ack_at, now,
-                                interval, GATEWAY_STALE_FACTOR):
-                flog(f"⚠️ 网关看门狗：{now - max(self._last_frame_at, self._last_ack_at):.0f}s "
-                     f"没收到任何帧/ACK，主动断开重连")
-                trace_chain("连接", "看门狗触发：连续无帧/ACK，主动断开重连")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
-            # ② 会话到期也由心跳线程兜底：读循环万一卡在 recv 里执行不到检查，
-            #    这条独立线程仍能强制断连，让外层重建会话恢复收消息。
-            if session_expired(self._session_started_at, now, self._session_max):
-                flog(f"心跳线程：网关会话已存活 {now - self._session_started_at:.0f}s，"
-                     f"主动软重连")
-                trace_chain("连接", "心跳线程检测到会话到期，主动断开重建会话")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
+            renew = True
             try:
-                conn.send_text(json.dumps({"op": 1, "d": self._seq}))
-                flog(f"发送心跳(op1) seq={self._seq}")
-            except Exception as e:
-                flog(f"发送心跳失败: {e}")
-            # ③ 存活存证：群里安静时日志也不空，能区分「进程被冻结」和
-            #    「网关还回 ACK 但就是不推消息事件」。
-            if now - self._last_proof_at >= GATEWAY_PROOF_SECONDS:
-                self._last_proof_at = now
-                trace_chain("连接", "网关存活存证：心跳正常，最后帧=%.0fs前，"
-                            "最后消息事件=%.0fs前" % (
-                                now - self._last_frame_at,
-                                (now - self._last_event_at) if self._last_event_at else -1))
-            if generation != self._hb_generation:
-                return
-            self._hb_timer = threading.Timer(interval, hb)
-            self._hb_timer.daemon = True
-            self._hb_timer.start()
+                now = time.time()
+                # ① 看门狗：连续 N 个心跳周期没收到任何帧 / ACK，主动断开让外层重连。
+                # socket 的 90s 读超时只在「一个字节都没有」时触发，且没有明确证据；
+                # 这里额外留下一条可查的假死记录。
+                if gateway_is_stale(self._last_frame_at, self._last_ack_at, now,
+                                    interval, GATEWAY_STALE_FACTOR):
+                    flog(f"⚠️ 网关看门狗：{now - max(self._last_frame_at, self._last_ack_at):.0f}s "
+                         f"没收到任何帧/ACK，主动断开重连")
+                    trace_chain("连接", "看门狗触发：连续无帧/ACK，主动断开重连")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    renew = False
+                    return
+                # ② 会话到期也由心跳线程兜底：读循环万一卡在 recv 里执行不到检查，
+                #    这条独立线程仍能强制断连，让外层重建会话恢复收消息。
+                if session_expired(self._session_started_at, now, self._session_max):
+                    flog(f"心跳线程：网关会话已存活 {now - self._session_started_at:.0f}s，"
+                         f"主动软重连")
+                    trace_chain("连接", "心跳线程检测到会话到期，主动断开重建会话")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    renew = False
+                    return
+                try:
+                    conn.send_text(json.dumps({"op": 1, "d": self._seq}))
+                    self._last_hb_at = now
+                    flog(f"发送心跳(op1) seq={self._seq}")
+                except Exception as e:
+                    flog(f"发送心跳失败: {e}")
+                # ③ 存活存证：群里安静时日志也不空，能区分「进程被冻结」和
+                #    「网关还回 ACK 但就是不推消息事件」。
+                if now - self._last_proof_at >= GATEWAY_PROOF_SECONDS:
+                    self._last_proof_at = now
+                    trace_chain("连接", "网关存活存证：心跳正常，最后帧=%.0fs前，"
+                                "最后消息事件=%.0fs前" % (
+                                    now - self._last_frame_at,
+                                    (now - self._last_event_at) if self._last_event_at else -1))
+            finally:
+                # Timer 是一次性的：hb() 里只要抛一次异常（含日志 / 存证），整条链
+                # 就再也不续期。用 finally 保证正常路径一定排下一个 Timer，冻结恢复
+                # 后心跳链能自己接上。
+                if renew and not self._stop.is_set() \
+                        and generation == self._hb_generation:
+                    self._hb_timer = threading.Timer(interval, hb)
+                    self._hb_timer.daemon = True
+                    self._hb_timer.start()
 
         self._hb_timer = threading.Timer(interval, hb)
         self._hb_timer.daemon = True
         self._hb_timer.start()
+
+    def _kick_heartbeat(self, conn, now):
+        """读循环兜底：校验到心跳链超时未发 op1，直接由主线程补发并重建链。
+
+        冻结恢复后 Timer 子线程可能已静默死掉，只有被 socket 事件唤醒的读循环
+        还活着；不补发就会一直「READY → 60s socket closed → 重连」循环。
+        """
+        try:
+            conn.send_text(json.dumps({"op": 1, "d": self._seq}))
+            self._last_hb_at = now
+            flog(f"读循环兜底：心跳链超时未发，主线程补发 op1 seq={self._seq}")
+            trace_chain("连接", "心跳链校验：Timer 超时未发 op1，读循环主线程补发并重建心跳链")
+        except Exception as e:
+            flog(f"读循环兜底补发心跳失败: {e}")
+        self._start_heartbeat(conn, self._hb_interval)
 
     def _identify(self, conn, token):
         payload = {

@@ -1015,5 +1015,85 @@ class TestConnectIdentify(unittest.TestCase):
         self.assertEqual(got.get("intents"), qq_official.DEFAULT_INTENTS)
 
 
+class TestHeartbeatGuard(unittest.TestCase):
+    """2026-11-10 手机冻结实测回归：Timer 心跳链静默断掉时由读循环兜底。"""
+
+    @staticmethod
+    def _bot():
+        bot = qq_official.OfficialBot("appid", "secret", lambda *a, **k: None)
+        bot._session_max = 0.0      # 关掉会话到期软重连，隔离本用例
+        return bot
+
+    def test_overdue_baseline_not_sent_yet(self):
+        self.assertFalse(qq_official.heartbeat_overdue(0.0, 1000.0, 45.0))
+
+    def test_overdue_within_grace(self):
+        self.assertFalse(qq_official.heartbeat_overdue(1000.0, 1052.0, 45.0))
+
+    def test_overdue_after_grace(self):
+        self.assertTrue(qq_official.heartbeat_overdue(1000.0, 1060.0, 45.0))
+
+    def test_read_loop_kicks_heartbeat_when_timer_dead(self):
+        class FakeConn:
+            def __init__(self):
+                self.frames = [("text", b'{"op": 11}')]
+                self.sent = []
+
+            def recv_message(self):
+                if not self.frames:
+                    raise RuntimeError("end-of-frames")
+                return self.frames.pop(0)
+
+            def send_text(self, text):
+                self.sent.append(json.loads(text))
+
+            def send_close(self):
+                pass
+
+            def close(self):
+                pass
+
+        bot = self._bot()
+        conn = FakeConn()
+        bot._hb_interval = 45.0
+        bot._last_hb_at = time.time() - 120.0   # Timer 链已死：两分钟没发过 op1
+        with patch.object(qq_official, "trace_chain", return_value=False), \
+             patch.object(qq_official, "flog"), \
+             patch.object(bot, "_start_heartbeat") as restart:
+            with self.assertRaises(RuntimeError):
+                bot._loop(conn, "FAKETOKEN")
+        self.assertTrue(any(p.get("op") == 1 for p in conn.sent),
+                        "读循环必须自己补发一次 op1")
+        self.assertTrue(restart.called, "补发后要重建心跳链")
+        self.assertAlmostEqual(bot._last_hb_at, time.time(), delta=2.0)
+
+    def test_heartbeat_chain_renews_after_exception(self):
+        """hb() 里任何未捕获异常都不能让一次性 Timer 整条链断掉。"""
+        bot = self._bot()
+        funcs = []
+
+        class FakeTimer:
+            def __init__(self, interval, fn):
+                self.fn = fn
+                self.daemon = False
+
+            def start(self):
+                funcs.append(self.fn)
+
+            def cancel(self):
+                pass
+
+        with patch.object(qq_official.threading, "Timer", FakeTimer), \
+             patch.object(qq_official, "gateway_is_stale",
+                          side_effect=ValueError("boom")), \
+             patch.object(qq_official, "flog"), \
+             patch.object(qq_official, "trace_chain", return_value=False):
+            bot._start_heartbeat(object(), 45.0)
+            self.assertEqual(len(funcs), 1)
+            with self.assertRaises(ValueError):
+                funcs[0]()
+        self.assertEqual(len(funcs), 2, "hb 抛异常也必须排下一个 Timer")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

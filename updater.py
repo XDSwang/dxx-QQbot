@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -67,6 +68,11 @@ DATA_ANOMALY = "数据拉取异常"           # 主库与备用库全失败的�
 FAILOVER_MAX_ATTEMPTS = 3                 # 规范 1.1：静默重试最多 3 轮
 FAILOVER_WINDOW = 5.0                    # 单轮超 5 秒视为窗口过长，回到第一步重拉
 GIT_SYNC_TIMEOUT = 20                     # 网络 IO 超时：超时明确报错，不是静默等待（规范 1.2）
+# 接口连续失败后的短退避：1 / 3 / 7 分钟，三次用尽改 1 小时长退避（规范 1.1）。
+# 手机端私有库认证不通时，若每轮轮询都重打，会不断产生卡死的 git 子进程。
+GIT_BACKOFF_STEPS = (60, 180, 420)
+GIT_BACKOFF_MAX_SECONDS = 3600
+GIT_BACKOFF_FILE = "updater_git_backoff.json"   # 与节流状态同目录，落盘跨进程共享
 CONFIG_KV = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
@@ -894,6 +900,83 @@ def _git_net_url(args):
     return None
 
 
+def _kill_git_tree(proc):
+    """超时后连 git 派生的 git-remote-https 一起终止。
+
+    只 kill 直接子进程时，孙进程仍握着 stdout 管道，communicate() 会一直等 EOF；
+    手机端私有库地址不通时 preflight 就永久卡在 do_sys_poll（2026-11-10 实测）。
+    POSIX 用独立进程组整组 kill，Windows 退回只 kill 主进程 + 短收尾超时。
+    """
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def git_backoff_delay(fail_count):
+    """连续失败第 n 次后该冷多久；超过阶梯用长退避（参数进返回值出）。"""
+    if fail_count <= 0:
+        return 0
+    if fail_count <= len(GIT_BACKOFF_STEPS):
+        return GIT_BACKOFF_STEPS[fail_count - 1]
+    return GIT_BACKOFF_MAX_SECONDS
+
+
+def _git_backoff_path():
+    """退避状态文件由统一入口给，禁止各调用点自己拼名字（规范 1.5）。"""
+    return PACE_FILE.with_name(GIT_BACKOFF_FILE)
+
+
+def _git_backoff_read():
+    state = _read_json(_git_backoff_path(), {})
+    return state if isinstance(state, dict) else {}
+
+
+def git_backoff_check(host, now=None):
+    """某 host 是否还在失败退避窗口内 → (blocked, 剩余秒数)。"""
+    rec = _git_backoff_read().get(normalize_host(host)) or {}
+    now = time.time() if now is None else now
+    try:
+        until = float(rec.get("not_before", 0) or 0)
+    except (TypeError, ValueError):
+        until = 0.0
+    return (now < until, max(0.0, until - now))
+
+
+def git_backoff_record(host, ok, now=None):
+    """成功清零、失败累加并写下下次可试时间；用尽阶梯写异常日志，不无限静默重试。"""
+    key = normalize_host(host)
+    if not key:
+        return
+    now = time.time() if now is None else now
+    path = _git_backoff_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = _git_backoff_read()
+        if ok:
+            state.pop(key, None)
+        else:
+            rec = state.get(key) or {}
+            try:
+                count = int(rec.get("fail_count", 0) or 0) + 1
+            except (TypeError, ValueError):
+                count = 1
+            delay = git_backoff_delay(count)
+            state[key] = {"fail_count": count, "not_before": now + delay}
+            if count > len(GIT_BACKOFF_STEPS):
+                elog("git 接口连续失败，进入长退避",
+                     "host=%s 连续 %d 次，%d 秒后再试" % (key, count, delay))
+        _atomic_write(path, json.dumps(state, ensure_ascii=False))
+    except Exception as e:
+        elog("git 失败退避状态写入失败", str(e))
+
+
 def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
     """跑一条 git 指令，返回 (returncode, stdout, stderr)；失败不抛，交给编排层判。
 
@@ -901,9 +984,14 @@ def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
     strip=False 用于 git show 取文件内容，保留首尾空白与末尾换行。
     fetch / push / clone / pull 都是地址访问：统一在这里自动过同域名闸门，
     调用点不必各自记得 pace_gate，判断层 / 代码同步 / 数据读写都不会漏。
+    连续失败的接口短退避，且超时后整组杀干净，避免 preflight 永久卡死。
     """
     url = _git_net_url(args)
     if url:
+        blocked, remain = git_backoff_check(url)
+        if blocked:
+            return 1, "", "git 接口失败退避中，%.0fs 后再试（%s）" % (
+                remain, normalize_host(url))
         pace_gate(url)
     try:
         run_env = dict(os.environ)
@@ -912,13 +1000,32 @@ def git_cmd(args, cwd=None, timeout=GIT_SYNC_TIMEOUT, env=None, strip=True):
         run_env["GIT_TERMINAL_PROMPT"] = "0"
         if env:
             run_env.update(env)
-        r = subprocess.run(["git"] + list(args), cwd=str(cwd) if cwd else None,
-                           capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace", env=run_env)
-        out = r.stdout or ""
-        return r.returncode, (out.strip() if strip else out), (r.stderr or "").strip()
+        # 独立进程组：超时后能连 git-remote-https 一起杀，否则孙进程握着管道，
+        # communicate() 等 EOF 会让主循环永久卡死（Android 熄屏恢复后实测）。
+        proc = subprocess.Popen(
+            ["git"] + list(args), cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", env=run_env,
+            start_new_session=(os.name == "posix"))
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_git_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=3)
+            except Exception:
+                out, err = "", ""
+            code, out = 1, ""
+            err = "git 超时 %ss，已终止进程组：%s" % (
+                timeout, " ".join(str(a) for a in args[:2]))
+        out = out or ""
+        err = err or ""
     except Exception as e:
-        return 1, "", str(e)
+        code, out, err = 1, "", str(e)
+    if url:
+        git_backoff_record(url, code == 0)
+    return code, (out.strip() if strip else out), err.strip()
 
 
 class GitSignalStore(object):
