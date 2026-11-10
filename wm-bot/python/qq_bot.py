@@ -60,6 +60,8 @@ def _run_onebot():
     )
     import ws_monitor
     ws_monitor.set_sender(client.send_active)
+    ws_monitor.restore_last_sent()
+    ws_monitor.restore_seen_priority()
     saved_n = ws_monitor.load_switches()
     saved_f = ws_monitor.load_filters()
     if saved_n:

@@ -56,6 +56,7 @@ import worldstate as ws
 HERE = Path(__file__).resolve().parent
 DEFAULT_SWITCH_FILE = HERE / "data" / "ws_switches.json"
 LAST_SENT_FILE = HERE / "data" / "ws_last_sent.json"   # 按栏目去重记录（落盘，防重启重发）
+SEEN_PRIORITY_FILE = HERE / "data" / "ws_seen_priority.json"  # 主推基线（落盘，重启后仍能识别「新增」）
 DEFAULT_FILTER_FILE = HERE / "data" / "ws_filters.json"  # 裂缝维度过滤（落盘，重启后恢复）
 DEFAULT_AT_FILE = HERE / "data" / "ws_at_users.json"     # 谁发的监控指令（推送时 @ 他）
 DEFAULT_SUB_FILE = HERE / "data" / "ws_subs.json"        # 成员级订阅：谁开了哪些栏目
@@ -75,6 +76,7 @@ _last_sent = {}                      # (channel, target_id) -> {类型键: (该�
                                         # 周期推送按栏目拆分后，去重粒度细化到单个栏目：
                                         # 只有内容变化的栏目才重发，避免每条都刷屏。
 _seen_priority = {}                  # (channel, target_id) -> {type: set(条目键)}  主推基线
+_seen_saved = [""]                   # 主推基线最近一次落盘的原文（内容没变就不重写）
 _priority_sent_at = {}               # (channel, target_id) -> 上次主推成功时刻
 _next_probe = 0.0                    # 全局强制退避（通道级；set_sender / 开关事件可清）
 # 按会话的失败退避：某群发送失败（如未开主动消息 40034105）只停它自己，
@@ -343,6 +345,7 @@ def set_switch(channel, target_id, types, on):
         _save_subs()
         if not on and _fissure_filters:
             _save_filters()
+        _save_seen_priority()        # 关栏目时基线也剥掉了，同步落盘
     if on:
         ws.ensure_active()
         _ensure_push_thread()
@@ -785,6 +788,66 @@ def stable_sig(text):
     return _sig(_DURATION.sub("<T>", text or ""))
 
 
+def _save_seen_priority():
+    """把主推基线落盘（原子写，内容没变就不写）。
+
+    以前 `_seen_priority` 只在内存里：重启后一律清空，首轮又把当前所有条目
+    当「基线」重新记一遍 —— 停机期间新出现的警报就这么被静默吞掉了，
+    用户看到的就是「警报数据早就更新了，却一条都没推」。落盘后重启能续上：
+    停机期间没变的照旧不推，真正新增的仍会被识别为「新增」并推送。
+    """
+    try:
+        with _lock:
+            data = {"%s|%s" % (ch, tid): {t: sorted(keys) for t, keys in m.items()}
+                    for (ch, tid), m in _seen_priority.items() if m}
+        raw = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        if raw == _seen_saved[0]:
+            return
+        SEEN_PRIORITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEEN_PRIORITY_FILE.with_name(SEEN_PRIORITY_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.replace(tmp, SEEN_PRIORITY_FILE)
+        _seen_saved[0] = raw
+    except Exception as e:
+        _flog("主推基线落盘失败（忽略）: %s" % e)
+
+
+def restore_seen_priority():
+    """启动时恢复主推基线（须在 set_sender / load_subs 之后调用）。
+
+    恢复的是「上次已经算过的条目集合」，不含推送成功状态；因此重启后
+    只对真正新增的条目推送，不会把整份现状重发一遍。
+    """
+    try:
+        if not SEEN_PRIORITY_FILE.exists():
+            return 0
+        raw = SEEN_PRIORITY_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw or "{}")
+    except Exception as e:
+        _flog("读取主推基线失败（当作全新启动）: %s" % e)
+        return 0
+    restored = {}
+    try:
+        for key, m in (data or {}).items():
+            if "|" not in key or not isinstance(m, dict):
+                continue
+            ch, tid = key.split("|", 1)
+            got = {}
+            for t, keys in m.items():
+                if t in ws.TYPES and isinstance(keys, list):
+                    got[t] = {str(k) for k in keys}
+            if got:
+                restored[(ch, tid)] = got
+    except Exception as e:
+        _flog("主推基线内容坏掉（当作全新启动）: %s" % e)
+        return 0
+    with _lock:
+        _seen_priority.update(restored)
+    _seen_saved[0] = raw
+    return len(restored)
+
+
 def set_sender(fn):
     """注入主动发送回调（QQ 后端启动时调用）。
 
@@ -944,6 +1007,7 @@ def stop_monitor(channel, target_id, types=None, user=None, everyone=False):
             changed = removed or had_switch or had_filter or had_at or had_sub
         if changed:
             _save_last_sent()        # 把「已移除该会话」的去重记录落盘
+            _save_seen_priority()    # 主推基线同步落盘，别让重启又「恢复」已停的会话
         return changed
 
     with _lock:
@@ -1023,6 +1087,7 @@ def clear_pending():
         _last_sent.clear()
         _seen_priority.clear()
         _priority_sent_at.clear()
+    _save_seen_priority()             # 基线清空也要落盘，否则重启又「恢复」回来
 
 
 def auto_start_priority(groups):
@@ -1320,6 +1385,7 @@ def _push_priority(ch, tid, key, state, prio, now):
         # 之后出现新条目才推。
         with _lock:
             _seen_priority[key] = fresh
+        _save_seen_priority()
         return 0
     added_by_type = {t: fresh[t] - seen.get(t, set()) for t in prio}
     changed = [t for t in prio if added_by_type[t]]
@@ -1327,6 +1393,7 @@ def _push_priority(ch, tid, key, state, prio, now):
         # 没有新增：静默消化已结束的条目，不推「活动结束」刷屏
         with _lock:
             _seen_priority[key] = fresh
+        _save_seen_priority()
         return 0
     with _lock:
         last_at = _priority_sent_at.get(key, 0.0)
@@ -1371,28 +1438,31 @@ def _push_priority(ch, tid, key, state, prio, now):
             if sent_any:
                 _priority_sent_at[key] = now
                 _pending.pop(key, None)
-            return 1 if sent_any else 0
-        # 部分/全部失败：只有发成功的栏目推进基线，失败栏目保留旧基线，
-        # 下轮仍判定为「新增」自动重试，不会把新警报悄悄吞掉。
-        prev_seen = dict(_seen_priority.get(key) or {})
-        for t in sent_types:
-            prev_seen[t] = fresh[t]
-        _seen_priority[key] = prev_seen
-        if sent_any:
-            _priority_sent_at[key] = now
-        prev = _pending.get(key) or {}
-        merged = list(prev.get("parts") or []) if prev.get("priority") else []
-        have = {t for t, _ in merged}
-        merged.extend((t, body) for t, body in failed_parts if t not in have)
-        _pending[key] = {
-            "text": "\n\n".join(b for _, b in merged),
-            "at": now,
-            "fails": int(prev.get("fails") or 0) + 1,
-            "types": {t for t, _ in merged},
-            "parts": merged,
-            "priority": True,         # 标记：别被周期推送的成功/失败覆盖掉
-        }
-        return -1
+            result = 1 if sent_any else 0
+        else:
+            # 部分/全部失败：只有发成功的栏目推进基线，失败栏目保留旧基线，
+            # 下轮仍判定为「新增」自动重试，不会把新警报悄悄吞掉。
+            prev_seen = dict(_seen_priority.get(key) or {})
+            for t in sent_types:
+                prev_seen[t] = fresh[t]
+            _seen_priority[key] = prev_seen
+            if sent_any:
+                _priority_sent_at[key] = now
+            prev = _pending.get(key) or {}
+            merged = list(prev.get("parts") or []) if prev.get("priority") else []
+            have = {t for t, _ in merged}
+            merged.extend((t, body) for t, body in failed_parts if t not in have)
+            _pending[key] = {
+                "text": "\n\n".join(b for _, b in merged),
+                "at": now,
+                "fails": int(prev.get("fails") or 0) + 1,
+                "types": {t for t, _ in merged},
+                "parts": merged,
+                "priority": True,         # 标记：别被周期推送的成功/失败覆盖掉
+            }
+            result = -1
+    _save_seen_priority()             # 基线变了就落盘，重启后不再把现状当「新增」重推
+    return result
 
 
 def _ensure_push_thread():

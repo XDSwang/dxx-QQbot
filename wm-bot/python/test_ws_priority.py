@@ -159,8 +159,56 @@ def main():
     t("警报基线 1 条", len(M._seen_priority[KA]["alerts"]) == 1)
     t("活动基线 1 条", len(M._seen_priority[KA]["events"]) == 1)
 
+    # ---------- 3.5) 主推基线落盘：重启后仍能认出「停机期间新增」 ----------
+    # 以前基线只在内存里，重启一律清空 → 停机期间新增的警报被当基线静默吞掉
+    # （用户看到的就是「警报数据早就更新了却一条都没推」）。
+    print("[主推基线落盘]")
+    M.SEEN_PRIORITY_FILE = _P(_tf.gettempdir()) / "ws_seen_testprio.json"
+    if M.SEEN_PRIORITY_FILE.exists():
+        M.SEEN_PRIORITY_FILE.unlink()
+    calls = []
+    bind(calls)
+    once(mk([A1], [E1]))                  # 建立并落盘基线
+    t("基线已写盘", M.SEEN_PRIORITY_FILE.exists())
+    saved = M.SEEN_PRIORITY_FILE.read_text(encoding="utf-8")
+    t("盘上有警报基线", "alerts" in saved)
+
+    # 模拟重启：内存基线清空，再从盘上恢复
+    M._seen_priority.clear()
+    M._seen_saved[0] = ""
+    n = M.restore_seen_priority()
+    t("重启后恢复到 1 个会话", n == 1)
+    t("恢复出的警报基线是 1 条", len(M._seen_priority[KA]["alerts"]) == 1)
+
+    # 停机期间新增了一条警报：重启后必须识别为新增并补推
+    calls.clear()
+    sent = once(mk([A1, A2], [E1]))
+    t("停机期间新增的警报重启后补推", sent == 1 and len(calls) == 1)
+    t("补推的确实是新条目", "火星/Wahiba" in calls[0])
+
+    # 内容没变时重启不该重推
+    M._seen_priority.clear()
+    M._seen_saved[0] = ""
+    M.restore_seen_priority()
+    calls.clear()
+    M._priority_sent_at.pop(KA, None)
+    sent = once(mk([A1, A2], [E1]))
+    t("内容没变时重启不重推", sent == 0 and calls == [])
+
+    # 收尾：停止监控要连盘上的基线一起清，否则重启又「恢复」回来。
+    # 注意这会把本会话清掉，所以放在第 4 段之前先重新绑定监控。
+    M.stop_monitor("group", "G1", everyone=True)
+    M._seen_priority.clear()
+    M._seen_saved[0] = ""
+    n = M.restore_seen_priority()
+    t("停止监控后盘上基线已清空", n == 0)
+
     # ---------- 4) 新警报立刻推，绕过 300 秒周期限频 ----------
     print("[新增警报立即推]")
+    calls = []
+    bind(calls)                       # 上一段 stop_monitor 清过注册表，这里重新绑定
+    t("重新绑定后基线为空（stop 已清）", M._seen_priority.get(KA) is None)
+    once(mk([A1], [E1]))              # 重新建立基线
     M._last_sent[KA] = ("周期刚推过", time.time())  # 模拟周期通道刚发过
     sent = once(mk([A1, A2], [E1]))
     t("新增一条警报 → sent=1", sent == 1)

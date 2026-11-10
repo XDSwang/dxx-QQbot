@@ -1551,6 +1551,12 @@ def main():
         bot.send_active(kind, tid, text, at_user=at_user))
     # 恢复上次的去重记录：重启后只要内容没变，就不再重发首轮监控（防刷屏 / 重复）
     ws_monitor.restore_last_sent()
+    # 恢复主推基线：停机期间新出现的警报要能被识别成「新增」并补推；
+    # 只恢复内存基线，不落盘任何「已推送」状态，所以不会把现状整份重发。
+    saved_p = ws_monitor.restore_seen_priority()
+    if saved_p:
+        print(f"[official] 已恢复 {saved_p} 个会话的主推基线"
+              "（停机期间新增的警报会补推）", file=sys.stderr)
     # 先恢复聊天指令保存的开关（「活动=开启」等），再按配置补自动注册；
     # 两者都只合并栏目，不覆盖对方 / 用户手动开的监控范围。
     saved_n = ws_monitor.load_switches()
