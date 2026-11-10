@@ -811,6 +811,23 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
                    "（想重新开启，发「活动=开启」或「监控 警报」即可）。")
         return finalize(msg, ctx, force_image=force_image, force_text=force_text,
                         attach=False, title="星际战甲 · 世界状态监控")
+    if action == "monitor_status":
+        ch, tid = _ctx_ids(ctx)
+        if ch is None:
+            return finalize("（无法识别会话，无法查看监控；群聊需在白名单内）", ctx,
+                            force_image=force_image, force_text=force_text,
+                            attach=False, title="星际战甲 · 监控状态")
+        # 群内不带 @（或纯全量消息）→ 看本群概览；@ 了机器人 / 私聊 → 看@的人自己的
+        at_me = bool((ctx or {}).get("at_me"))
+        if at_me or ch == "private":
+            user = ((ctx.get("user_id") or ctx.get("sender_id"))
+                    if ch == "group" else tid)
+            return finalize(ws_monitor.my_monitor_text(ch, tid, user), ctx,
+                            force_image=force_image, force_text=force_text,
+                            attach=False, title="星际战甲 · 我的监控")
+        return finalize(ws_monitor.group_monitor_text(ch, tid), ctx,
+                        force_image=force_image, force_text=force_text,
+                        attach=False, title="星际战甲 · 本群监控")
     if action == "monitor":
         ch, tid = _ctx_ids(ctx)
         if ch is None:
@@ -827,10 +844,16 @@ def handle_ws(text, ctx=None, force_image=False, force_text=False):
         ws_monitor.start_monitor(ch, tid, set(cmd["types"]), filters=filters,
                                  at_user=at_user)
         names = "、".join(worldstate.TYPES[t][0] for t in cmd["types"] if t in worldstate.TYPES)
-        msg = ("✅ 已开始监控：%s\n每 %d 秒检查一次，内容有变化才推送"
-               "（周期最小间隔 %d 秒，倒计时跳动不算变化）。"
-               % (names, int(worldstate.WS_PUSH_SECONDS),
-                  int(ws_monitor.active_min_gap())))
+        # 监控所有：明确点出「全部 N 个栏目」并列出清单，避免只回一句含糊确认
+        if len(cmd["types"]) >= len(worldstate.TYPES):
+            msg = ("✅ 已开启本群全部 %d 个栏目的监控：\n%s\n"
+                   % (len(worldstate.TYPES), names))
+        else:
+            msg = ("✅ 已开始监控：%s\n" % names)
+        msg += ("每 %d 秒检查一次，内容有变化才推送"
+                "（周期最小间隔 %d 秒，倒计时跳动不算变化）。"
+                % (int(worldstate.WS_PUSH_SECONDS),
+                   int(ws_monitor.active_min_gap())))
         if filters:
             if filters.get("bounty"):
                 msg += ("\n🔎 只看赏金里的 %s（其余集团已忽略）。"

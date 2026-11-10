@@ -166,12 +166,14 @@ class TestHandler(unittest.TestCase):
         # 世界状态查询：也必须带 dxx  前缀（防群聊误触发），裸 -> 静默
         self.assertIsNone(h("平原", {"channel": "group", "group_id": "g"}))
         self.assertIsNotNone(h("dxx 平原", {"channel": "group", "group_id": "g"}))
-        # 监控控制：裸「监控」「监控全部」都静默；带 dxx  才生效
+        # 监控控制：裸「监控」「监控全部」都静默（需带 dxx 前缀）；带 dxx 才生效
         self.assertIsNone(h("监控", {"channel": "group", "group_id": "g"}))
         self.assertIsNone(h("监控全部", {"channel": "group", "group_id": "g"}))
+        # 群内不带 @ 发「dxx 监控」→ 本群监控总览（不误开监控）
         r = h("dxx 监控", {"channel": "group", "group_id": "g"})
         self.assertIsNotNone(r)
-        self.assertIn("监控全部", r)   # 安全提示，不全开
+        self.assertIn("本群", r)
+        self.assertNotIn("已开始监控", r)
         self.assertIsNotNone(h("dxx 监控全部", {"channel": "group", "group_id": "g"}))
         # 帮助【例外】：发「帮助」两个字就出菜单，不要求前缀（用户明确要求）；
         # 自检仍需前缀

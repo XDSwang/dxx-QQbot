@@ -667,6 +667,96 @@ def switch_status_text(channel, target_id):
     return "\n".join(lines)
 
 
+def group_monitor_text(channel, target_id):
+    """「监控」（群内不带 @）的回复正文：本群监控状态总览。
+
+    列出本群在监控哪些栏目、各栏目订阅人数（区分具体人 / 会话级）、主推栏目、
+    维度过滤与发起人；空群也如实说明，不瞎编。
+    """
+    if channel is None or target_id in (None, ""):
+        return "（无法识别会话，无法查看监控；群聊需在白名单内）"
+    key = (channel, str(target_id))
+    with _lock:
+        mon = set(_monitors.get(key) or ())
+        subs = {t: set(us) for t, us in (_subs.get(key) or {}).items()}
+        ff = {c: list(toks) for c, toks in (_fissure_filters.get(key) or {}).items() if toks}
+        at_uid = _at_users.get(key)
+    types = effective_types(key, mon)
+    prio = effective_priority(key, types)
+    type_names = [ws.TYPES[t][0] for t in ws.TYPES if t in types]
+    lines = ["📊 本群世界状态监控状态", ""]
+    if not type_names:
+        lines.append("（本群当前没有任何监控栏目）")
+    else:
+        lines.append("监控栏目（共 %d）：%s" % (len(type_names), "、".join(type_names)))
+    if prio:
+        lines.append("主推栏目：%s" % "、".join(ws.TYPES[t][0] for t in prio))
+    # 各栏目订阅人数：区分「具体人」与「会话级（主推开关带来的，无具体人）」
+    if subs:
+        lines.append("")
+        lines.append("各栏目订阅人数：")
+        for t in ws.TYPES:
+            us = subs.get(t)
+            if not us:
+                continue
+            real = sorted(u for u in us if u)
+            sess = "" in us
+            parts = []
+            if real:
+                parts.append("%d 人" % len(real))
+            if sess:
+                parts.append("会话级")
+            lines.append("  · %s：%s" % (ws.TYPES[t][0], " + ".join(parts) if parts else "0 人"))
+    if ff:
+        parts = []
+        for c, toks in ff.items():
+            cn = ws.TYPES.get(c, (c,))[0]
+            parts.append("%s %s" % (cn, " ".join(toks)))
+        lines.append("")
+        lines.append("维度过滤：%s" % "；".join(parts))
+    if at_uid:
+        lines.append("监控发起人：已记录（推送时 @）")
+    lines.append("")
+    lines.append("· 发「监控 警报」等继续添加栏目")
+    lines.append("· 发「停止监控」停你自己的；「停止全部监控」清本群所有人")
+    return "\n".join(lines)
+
+
+def my_monitor_text(channel, target_id, user):
+    """「@机器人 监控」的回复正文：查看@的人（发指令者）自己的监控信息。
+
+    user 为空（拿不到发指令的人）时如实说明、不瞎编。
+    """
+    if not user:
+        return "（无法识别你是谁，无法查看你的监控；请 @ 机器人 再试一次）"
+    uid = str(user)
+    subs, ff = {}, {}
+    if channel:
+        key = (channel, str(target_id))
+        with _lock:
+            subs = {t: set(us) for t, us in (_subs.get(key) or {}).items()}
+            ff = {c: list(toks) for c, toks in (_fissure_filters.get(key) or {}).items() if toks}
+    my = [t for t in ws.TYPES if uid in (subs.get(t) or ())]
+    names = [ws.TYPES[t][0] for t in my]
+    lines = ["👤 你的世界状态监控（本%s）" % ("群" if channel == "group" else "私聊"), ""]
+    if not names:
+        lines.append("（你还没有开启任何监控）")
+    else:
+        lines.append("你订阅了 %d 个栏目：%s" % (len(names), "、".join(names)))
+    my_ff = {c: toks for c, toks in ff.items() if c in my}
+    if my_ff:
+        cols = "、".join(ws.TYPES[c][0] for c in my_ff)
+        parts = []
+        for c, toks in my_ff.items():
+            cn = ws.TYPES.get(c, (c,))[0]
+            parts.append("%s %s" % (cn, " ".join(toks)))
+        lines.append("本会话维度过滤（影响你订阅的%s）：%s" % (cols, "；".join(parts)))
+    lines.append("")
+    lines.append("· 发「监控 警报」等继续添加")
+    lines.append("· 发「停止监控」停你名下全部；「停止监控 警报」只停警报")
+    return "\n".join(lines)
+
+
 def _sig(text):
     """内容签名：用来判断「世界状态有没有变化」，变了才有必要主动推。"""
     return hashlib.sha1((text or "").encode("utf-8", "ignore")).hexdigest()

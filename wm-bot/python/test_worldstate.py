@@ -119,9 +119,10 @@ def test_parse():
           and set(c["types"]) == {"alerts", "fissures"})
     check("解析 停止监控", ws.parse_ws_command("停止监控")["action"] == "stop")
     check("解析 计划", ws.parse_ws_command("计划")["action"] == "plan")
-    # 监控安全化：裸「监控」/「监控 不认识的词」不再静默全开，给提示；只有「监控全部」全量
-    check("裸 监控 -> 安全提示(monitor_hint)",
-          ws.parse_ws_command("监控")["action"] == "monitor_hint")
+    # 监控安全化：裸「监控」改为查看监控状态（monitor_status）；
+    # 「监控 不认识的词」仍给提示（monitor_hint），绝不静默全开；只有「监控全部」全量
+    check("裸 监控 -> 查看监控状态(monitor_status)",
+          ws.parse_ws_command("监控")["action"] == "monitor_status")
     check("监控 乱码 -> 安全提示(monitor_hint)",
           ws.parse_ws_command("监控 不认识的东西")["action"] == "monitor_hint")
     c_all = ws.parse_ws_command("监控全部")
@@ -133,8 +134,8 @@ def test_parse():
     c_all3 = ws.parse_ws_command("监控 所有")
     check("监控 所有(带空格) -> 全量监控", c_all3["action"] == "monitor"
           and len(c_all3["types"]) == len(ws.TYPES))
-    check("monitor(英文)裸 -> 安全提示",
-          ws.parse_ws_command("monitor")["action"] == "monitor_hint")
+    check("monitor(英文)裸 -> 查看监控状态(monitor_status)",
+          ws.parse_ws_command("monitor")["action"] == "monitor_status")
     check("闲聊不触发", not qq_common.is_ws_command("今天天气不错")
           and not qq_common.is_ws_command("wm boltor"))
     check("12 个查询指令全部能被触发词识别",
@@ -1053,6 +1054,35 @@ def test_arbitration():
         check("仲裁进入到期队列", any(q["label"] == "仲裁" for q in ws.build_queue(st, time.time())))
 
 
+def test_monitor_status_view():
+    print("[监控状态查看：dxx监控=本群概览 / @机器人监控=自己]")
+    with isolated():
+        ws.refresh_once()
+        ctx_grp = {"channel": "group", "group_id": "GX"}
+        ctx_at = {"channel": "group", "group_id": "GX", "at_me": True, "user_id": "U1"}
+        # 先让 U1 开监控：警报 + 裂缝，U2 只开 裂缝
+        ws_monitor.start_monitor("group", "GX", {"alerts", "fissures"}, at_user="U1")
+        ws_monitor.start_monitor("group", "GX", {"fissures"}, at_user="U2")
+        # 群内不带 @：本群总览
+        g = qq_common.handle_ws("监控", ctx_grp)
+        check("dxx监控(无@) 回本群总览", "本群" in g and "监控栏目" in g)
+        check("本群总览含订阅栏目", "警报" in g and "裂缝" in g)
+        check("本群总览含订阅人数", "订阅人数" in g)
+        check("本群总览不误开监控", "已开始监控" not in g)
+        # @ 了机器人：看@的人（U1）自己的
+        p = qq_common.handle_ws("监控", ctx_at)
+        check("@机器人监控 回个人视图", "你的" in p and "订阅了" in p)
+        check("个人视图含 U1 的栏目", "警报" in p and "裂缝" in p)
+        # 个人视图只认订阅者：U9 没开任何监控
+        p9 = ws_monitor.my_monitor_text("group", "GX", "U9")
+        check("无订阅者 回未开启", "还没有开启任何监控" in p9)
+        # 维度过滤也会在个人视图里体现
+        ws_monitor.start_monitor("group", "GX", {"fissures"},
+                                filters={"fissures": ["后纪"]}, at_user="U1")
+        p1 = ws_monitor.my_monitor_text("group", "GX", "U1")
+        check("个人视图含维度过滤", "维度过滤" in p1 and "后纪" in p1)
+
+
 if __name__ == "__main__":
     test_parse()
     test_one_request()
@@ -1067,6 +1097,7 @@ if __name__ == "__main__":
     test_migrate()
     test_query_and_plan()
     test_monitor_and_trigger()
+    test_monitor_status_view()
     test_plan_no_data()
     test_no_data_backoff()
     test_multi_source_failover()

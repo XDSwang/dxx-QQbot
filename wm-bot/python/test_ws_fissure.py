@@ -153,7 +153,8 @@ def main():
             t("监控 %-16s -> %s %s" % (text, ty, toks),
               c["action"] == "monitor" and c["types"] == ty
               and sorted(sum(c["fissure_filter"].values(), [])) == sorted(toks))
-        t("裸「监控」仍回提示", ws._parse_monitor("")["action"] == "monitor_hint")
+        t("裸「监控」改为查看监控状态(monitor_status)",
+          ws._parse_monitor("")["action"] == "monitor_status")
         t("不认识的词回提示", ws._parse_monitor("不认识的词")["action"] == "monitor_hint")
         c = ws._parse_monitor("裂缝 警报")
         t("「裂缝 警报」两类都监控且无过滤",
