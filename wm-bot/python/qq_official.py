@@ -706,8 +706,12 @@ class OfficialBot:
             except Exception:
                 pass
 
-    def send_active(self, kind, target_id, text):
+    def send_active(self, kind, target_id, text, at_user=None):
         """主动推送（不带 msg_id）：用于世界状态定时监控。
+
+        at_user：发起监控的人（member_openid，可为单个或列表）。群聊推送时在
+        卡片最前面 @ 他 —— 官方 @ 标签 `<qqbot-at-user id="..." />` 只在原生
+        Markdown 里生效，因此只在 Markdown 通道加；私聊 / 纯文本回退不加（会变原文）。
 
         前提：群管理员 / 用户在机器人资料页打开「机器人主动在群聊内发言」开关
         （对应 GROUP_MSG_RECEIVE / C2C_MSG_RECEIVE 事件），否则固定 40034105。
@@ -728,6 +732,15 @@ class OfficialBot:
             label = monitor_label(text)
         except Exception:
             label = ""
+        # 推送时 @ 发起监控的人（只群聊；私聊没有 @ 概念）。at_user 可能是单个
+        # member_openid 或列表（同栏目多人订阅时逐个 @）。官方 @ 标签只在原生
+        # Markdown 里生效，所以只在 Markdown 通道加，纯文本回退不加（否则原文外露）。
+        at_tag = ""
+        if kind == "group" and at_user:
+            uids = (at_user if isinstance(at_user, (list, tuple, set))
+                    else [at_user])
+            at_tag = "".join('<qqbot-at-user id="%s" />' % str(u).strip()
+                             for u in uids if str(u).strip())
         try:
             token = self.token_mgr.get_token()
         except Exception as e:
@@ -742,7 +755,8 @@ class OfficialBot:
                 pngs = None
             if pngs:
                 # 单条 Markdown：文字标签在上、卡片图在下（与交易卡反过来，占一条消息）
-                if self._send_active_markdown(token, kind, target_id, pngs, label):
+                if self._send_active_markdown(token, kind, target_id, pngs, label,
+                                              at_tag=at_tag):
                     _active_fail_at[0] = 0.0
                     flog(f"主动推送(单条Markdown·字在上)成功: {kind} {target_id} "
                          f"{label or '【监控信息如下】'} 张数={len(pngs)}")
@@ -787,7 +801,8 @@ class OfficialBot:
             flog(f"主动推送文本成功: {kind} {target_id}")
         return ok
 
-    def _send_active_markdown(self, token, kind, target_id, pngs, label):
+    def _send_active_markdown(self, token, kind, target_id, pngs, label,
+                              at_tag=""):
         """单条 Markdown 主动推送：文字标签在上、卡片图在下（与交易卡反过来）。
 
         复用 qq_markdown 的原生 Markdown 通道（msg_type=2）：内容里先写标签文字、
@@ -809,8 +824,9 @@ class OfficialBot:
         except Exception as e:
             flog(f"主动推送 Markdown 取图失败: {e}")
             return False
-        # 文字在上、图在下：原生 Markdown 先写标签，再写图片标签
-        md = ((label.strip() + "\n\n") if label and label.strip() else "") \
+        # @ 标签在最前（原生 Markdown 生效），随后文字在上、图在下
+        md = ((at_tag.strip() + "\n") if at_tag and at_tag.strip() else "") \
+            + ((label.strip() + "\n\n") if label and label.strip() else "") \
             + "\n".join(tags)
         try:
             ok, info = qq_markdown.send(token, self.appid, self.api_base, kind,
@@ -1528,7 +1544,11 @@ def main():
     handler = qq_common.make_monitor_aware_handler(base_handler)
 
     import ws_monitor
-    ws_monitor.set_sender(lambda kind, tid, text: bot.send_active(kind, tid, text))
+    # 第四参 at_user：监控推送时 @ 发起监控的人（ws_monitor 用 _sender_takes_at()
+    # 探测本回调是否收这个参数；不收则推送全程不 @ 人 —— 之前只写 3 参就是这样漏的）。
+    ws_monitor.set_sender(
+        lambda kind, tid, text, at_user=None:
+        bot.send_active(kind, tid, text, at_user=at_user))
     # 恢复上次的去重记录：重启后只要内容没变，就不再重发首轮监控（防刷屏 / 重复）
     ws_monitor.restore_last_sent()
     # 先恢复聊天指令保存的开关（「活动=开启」等），再按配置补自动注册；

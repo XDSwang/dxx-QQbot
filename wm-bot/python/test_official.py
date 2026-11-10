@@ -803,6 +803,68 @@ class TestNotifySwitchAndActivePush(unittest.TestCase):
             ok = self.bot.send_active("group", "G1", "监控内容")
         self.assertTrue(ok)
 
+    def test_send_active_at_tag_in_markdown(self):
+        """主动推送要 @ 发起监控的人：群聊 Markdown 最前面带 <qqbot-at-user>，
+        多人订阅时逐个 @。线上故障：推送卡片不 @ 人（只有首条确认回复 @ 了）。"""
+        sent = {}
+
+        def fake_md(tok, appid, api_base, kind, tid, md_obj, msg_id=None):
+            sent["content"] = md_obj.get("content", "")
+            return (True, {})
+
+        import qq_markdown as qmd
+        with patch("render_card.render", lambda *a, **k: [b"\x89PNG"]), \
+             patch.object(qmd, "enabled", lambda: True), \
+             patch.object(qmd, "resolve_image_url",
+                          lambda pngs, *a, **k: "https://x/card.png"), \
+             patch.object(qmd, "image_markup_size", lambda pngs: "#600px #800px"), \
+             patch.object(qmd, "send", fake_md):
+            ok = self.bot.send_active("group", "G1", "警报\n任务A",
+                                      at_user=["MO1", "MO2"])
+        self.assertTrue(ok)
+        content = sent.get("content", "")
+        self.assertIn('<qqbot-at-user id="MO1" />', content)
+        self.assertIn('<qqbot-at-user id="MO2" />', content)
+        # @ 标签必须在最前面（在文字标签之前）
+        self.assertTrue(content.startswith('<qqbot-at-user id="MO1" />'), content)
+        img_pos = content.find("![img")
+        self.assertLess(content.find("MO1"), img_pos, "@ 标签应在图片之前")
+
+    def test_send_active_no_at_for_private(self):
+        """私聊推送不加 @ 标签（私聊没有 @ 概念，加了会原文外露）。"""
+        sent = {}
+
+        def fake_md(tok, appid, api_base, kind, tid, md_obj, msg_id=None):
+            sent["content"] = md_obj.get("content", "")
+            return (True, {})
+
+        import qq_markdown as qmd
+        with patch("render_card.render", lambda *a, **k: [b"\x89PNG"]), \
+             patch.object(qmd, "enabled", lambda: True), \
+             patch.object(qmd, "resolve_image_url",
+                          lambda pngs, *a, **k: "https://x/card.png"), \
+             patch.object(qmd, "image_markup_size", lambda pngs: "#600px #800px"), \
+             patch.object(qmd, "send", fake_md):
+            ok = self.bot.send_active("user", "U1", "警报\n任务A",
+                                      at_user=["MO1"])
+        self.assertTrue(ok)
+        self.assertNotIn("qqbot-at-user", sent.get("content", ""))
+
+    def test_sender_lambda_takes_at(self):
+        """注入的 sender 回调必须收 at_user 第四参，否则 _sender_takes_at 判 False，
+        推送就不 @ 人（线上根因：set_sender 的 lambda 只写了 3 参）。"""
+        import ws_monitor
+        saved = (ws_monitor._sender, ws_monitor._sender_at[0])
+        try:
+            ws_monitor._sender = lambda kind, tid, text, at_user=None: True
+            ws_monitor._sender_at[0] = None
+            self.assertTrue(ws_monitor._sender_takes_at(), "带 at_user 的回调应判 True")
+            ws_monitor._sender = lambda kind, tid, text: True
+            ws_monitor._sender_at[0] = None
+            self.assertFalse(ws_monitor._sender_takes_at(), "3 参旧回调应判 False")
+        finally:
+            ws_monitor._sender, ws_monitor._sender_at[0] = saved
+
     def test_passive_failure_retries_without_msg_id(self):
         """@ 消息被动回复若被拒，自动去掉 msg_id 走主动通道。"""
         calls = []
