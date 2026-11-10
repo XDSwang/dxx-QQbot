@@ -552,12 +552,16 @@ class _ImageSendResult:
 #   <@!bot_id>   @机器人（GROUP_AT_MESSAGE_CREATE）
 #   <@//id/>     @机器人（GROUP_MESSAGE_CREATE 全量消息里的新形态，斜杠包裹）
 # 注意 \w 匹配不到 "/"，所以 `<@//id/>` 必须单独列一支，否则既剥不掉也认不出。
-_MENTION_RE = re.compile(r"<@//[^>]*/>|<@!?\w+>")
-# 「这条消息 @ 的是不是机器人」：带叹号的，或全量消息里的 <@//id/> 形态。
-# 后者按实测样本（@机器人 必带此形态）判定；若将来发现它也用于 @成员，
-# 再改成用机器人自身 openid 精确比对（at_me 只影响免前缀与是否 @ 回去，
-# 不影响白名单，误判不会让白名单外的群被回复）。
-_BOT_MENTION_RE = re.compile(r"<@//[^>]*/>|<@!\w+>")
+# 剥离所有 @ 占位符（群 @ / 全量 @ / @全体成员）。QQ 各版本占位形态不一：
+# 有的带叹号 <@!id>、有的斜杠包裹 <@//id/>、有的缺结尾斜杠 <@//id>、有的干脆
+# 无斜杠无叹号 <@id>；openid 还可能含连字符等 \w 匹配不到的字符。一律用 [^>]*
+# 而非 \w+，确保各种形态都能剥干净，不残留到指令文本里。
+_MENTION_RE = re.compile(r"<@!?[^>]*>")
+# 「这条消息 @ 的是不是机器人」：覆盖官方全部 @机器人 占位形态——
+#   <@!bot_id>  /  <@//bot_openid/>  /  <@//bot_openid>（缺结尾斜杠）  /  <@bot_id>（无斜杠无叹号），
+#   openid 含连字符等 \w 匹配不到的字符也兼容。误判只影响「免前缀」「是否 @ 回去」，
+#   不影响白名单，危害有限；更稳的判定见 GROUP_MESSAGE_CREATE 里基于自身 openid 的精确比对。
+_BOT_MENTION_RE = re.compile(r"<@//[^>]*>|<@![^>]*>")
 
 
 def strip_mention(text):
@@ -583,6 +587,25 @@ def _text_mentions_bot(raw, bot_name):
         return False
     t = (raw or "").lstrip()
     return t.startswith("@" + bot_name) or t.startswith("＠" + bot_name)
+
+
+def _is_at_bot(raw, bot_openid, bot_name):
+    """全量群消息里，这条消息是否 @ 了机器人（决定 at_me）。
+
+    覆盖官方全部 @机器人 占位形态：
+      <@!bot_id>  /  <@//bot_openid/>  /  <@//bot_openid>（缺结尾斜杠）  /
+      <@bot_id>（无斜杠无叹号，QQ 版本差异）；openid 含连字符等 \\w 匹配不到的
+      字符也兼容。bot_openid 已知时优先精确比对，绝不会误判 @普通成员（成员
+      id 与机器人 id 不同）；bot_openid 未知才退到宽匹配 + 明文昵称兜底。
+    """
+    raw = raw or ""
+    if bot_openid and re.search(r"<@!?/?%s!?/?>" % re.escape(bot_openid), raw):
+        return True
+    if _BOT_MENTION_RE.search(raw):
+        return True
+    if _text_mentions_bot(raw, bot_name):
+        return True
+    return False
 
 
 def _sender_ids(author):
@@ -1102,23 +1125,18 @@ class OfficialBot:
                    "user_id": mo or uo,
                    "member_openid": mo,
                    "raw": raw, "nickname": name, "event": t}
-            # 但「@机器人 平原」在全量模式下也走这个事件：机器人占位符带叹号
-            # （<@!bot_openid>），普通成员是 <@openid>、全体是 <@all>。据此点亮 at_me，
-            # 否则免前缀的 @ 指令会被当成闲聊静默 —— 用户看到的就是「@ 了没反应」。
-            # at_me 一旦点亮，回复就和群@事件一样走「@ 回对方」。
-            if _BOT_MENTION_RE.search(raw):
+            # 全量模式下「@机器人 x」也走这个事件：QQ 各版本占位形态不一（<@!id> /
+            # <@//id/> / <@//id>（缺结尾斜杠）/ <@id>（无斜杠无叹号），openid 还可能
+            # 含连字符。识别成 @机器人 才能走「免前缀 + @ 回对方」，否则会被当闲聊静默
+            # —— 用户看到的就是「@ 了没反应」。精确命中（自身 openid / 明文昵称）才清
+            # full_message；宽匹配兜底不清除，避免把 @普通成员 误当 @机器人 去 @ 回。
+            if _is_at_bot(raw, self.bot_openid, self.bot_name):
                 ctx["at_me"] = True
-            elif _text_mentions_bot(raw, self.bot_name):
-                # 有的客户端 / 全量模式下「@机器人」是明文「@昵称」，没有叹号占位符。
-                # 认出来才算 @ 我；认出来就按 @ 消息处理（可以引用回复，不用普通群消息）。
-                ctx["at_me"] = True
-                ctx.pop("full_message", None)
-            elif (self.bot_openid
-                  and ("<@%s>" % self.bot_openid) in (raw or "")):
-                # 全量消息里 QQ 也会把 @机器人 写成不带叹号的 <@机器人openid>：
-                # 用 READY / users/@me 拿到的自身 openid 精确比对，@ 普通成员不误判。
-                ctx["at_me"] = True
-                ctx.pop("full_message", None)
+                bot_id = self.bot_openid or ""
+                precise = bool(bot_id
+                               and re.search(r"<@!?/?%s!?/?>" % re.escape(bot_id), raw or ""))
+                if precise or _text_mentions_bot(raw, self.bot_name):
+                    ctx.pop("full_message", None)
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")

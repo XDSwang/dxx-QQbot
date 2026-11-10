@@ -524,6 +524,44 @@ class TestOnEvent(unittest.TestCase):
         self.bot._on_event(None, self._pkt_group_full("@小明 自检"), "TOK")
         self.assertEqual(self.calls, [])
 
+    def test_group_full_message_at_bot_slash_no_trailing_slash(self):
+        """线上故障根因回归：全量消息里 QQ 把 @机器人 写成 <@//openid>（缺结尾斜杠）。
+        旧正则要求 '/>'，漏掉这种形态 → at_me 不亮，免前缀的 @指令静默（@ 了没反应）。"""
+        self.bot.bot_openid = "9700B570215F656CE30231EE174ED3C1"
+        self.bot._on_event(None, self._pkt_group_full(
+            "<@//9700B570215F656CE30231EE174ED3C1> 监控"), "TOK")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("监控", self.calls[0][2])
+
+    def test_group_full_message_at_bot_slash_fallback_unknown_openid(self):
+        """bot_openid 还没取到时，斜杠包裹的 @机器人 占位也要兜底认成 at_me。"""
+        self.bot.bot_openid = ""
+        self.bot._on_event(None, self._pkt_group_full(
+            "<@//9700B570215F656CE30231EE174ED3C1> 监控"), "TOK")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_is_at_bot_forms(self):
+        """_is_at_bot 覆盖官方全部 @机器人 占位形态，且不误判 @普通成员。"""
+        bid = "9700B570215F656CE30231EE174ED3C1"
+        for raw in ("<@!%s> 监控" % bid,
+                    "<@//%s/> 监控" % bid,
+                    "<@//%s> 监控" % bid,
+                    "<@%s> 监控" % bid):
+            self.assertTrue(qq_official._is_at_bot(raw, bid, ""), raw)
+        # 不同 id（@普通成员）不应误认（bot_openid 已知时）
+        self.assertFalse(qq_official._is_at_bot("<@7A3B9C1D> 监控", bid, ""))
+        # 明文 @昵称
+        self.assertTrue(qq_official._is_at_bot(
+            "@自动化服务查询_D/XX/ 监控", "", "自动化服务查询_D/XX/"))
+        self.assertFalse(qq_official._is_at_bot(
+            "@小明 监控", "", "自动化服务查询_D/XX/"))
+
+    def test_is_at_bot_openid_with_hyphen(self):
+        """openid 含连字符（\\w 匹配不到）时，正则也要认得出 @机器人 占位。"""
+        bid = "ABC-123-XYZ"
+        self.assertTrue(qq_official._is_at_bot("<@!%s> 监控" % bid, bid, ""))
+        self.assertTrue(qq_official._is_at_bot("<@//%s/> 监控" % bid, bid, ""))
+
     def test_fetch_self_fills_bot_name(self):
         """GET /users/@me 的 username 就是群里显示的昵称；只试一次。"""
         orig = qq_official._api_get
