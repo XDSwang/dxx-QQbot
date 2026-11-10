@@ -167,6 +167,32 @@ def main():
     t("恢复后订阅正确", M.subscribers_of("group", "GB") == {"fissures": {"u2"}})
     t("恢复后监控也补回来了", M._monitors.get(("group", "GB")) == {"fissures"})
 
+    # 重启后【必须自动续跑】：以前 load_subs 只恢复注册表、不拉线程，而
+    # ws_switches.json 常常是空的，于是重启后「有监控却永远不推、数据也不刷新」。
+    M._subs.clear()
+    M._monitors.clear()
+    started = []
+    with patch.object(M.ws, "ensure_active",
+                      lambda *a, **k: started.append("active")), \
+         patch.object(M, "_ensure_push_thread",
+                      lambda *a, **k: started.append("thread")):
+        M.load_subs()
+    t("恢复出监控时自动拉起刷新 + 推送线程",
+      started == ["active", "thread"])
+
+    # 盘上没订阅时不该无脑起线程（白跑后台刷新、白占资源）
+    Path(os.environ["WS_SUB_FILE"]).write_text('{"version":1,"sessions":{}}',
+                                              encoding="utf-8")
+    M._subs.clear()
+    M._monitors.clear()
+    started2 = []
+    with patch.object(M.ws, "ensure_active",
+                      lambda *a, **k: started2.append("active")), \
+         patch.object(M, "_ensure_push_thread",
+                      lambda *a, **k: started2.append("thread")):
+        M.load_subs()
+    t("没有监控时不空转线程", started2 == [])
+
     print("== 9) 推送 @ 人 ==")
     reset()
     on(M.start_monitor, "group", "G7", {"alerts"}, at_user="u1")

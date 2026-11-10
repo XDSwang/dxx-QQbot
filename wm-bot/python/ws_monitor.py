@@ -532,6 +532,15 @@ def load_subs():
         for key, cols in _subs.items():
             if cols:
                 _monitors.setdefault(key, set()).update(cols)
+        resumed = bool(_monitors)
+    # 恢复出监控就【必须】把线程拉起来：以前只有 load_switches / auto_start_priority
+    # 会调 ensure_active + _ensure_push_thread，而 ws_switches.json 常常是空的
+    # （用户只发过「监控 警报」，没动过「警报=开启」这类开关），于是重启后
+    # 注册表恢复了、线程却没起 —— 表现就是「监控数据早就更新了却一条都不推」，
+    # 直到有人再发一次监控指令才恢复。这里是重启后自动续跑的唯一入口。
+    if resumed:
+        ws.ensure_active()
+        _ensure_push_thread()
     return len(data)
 
 
