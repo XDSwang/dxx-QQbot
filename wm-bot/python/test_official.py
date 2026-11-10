@@ -580,6 +580,30 @@ class TestOnEvent(unittest.TestCase):
         """bot_name 没从 @me 拿到、但 WM_QQ_BOT_NAME 配了昵称：明文 @昵称 也要认出 at_me。"""
         self.bot.bot_openid = ""
         self.bot.bot_name = "自动化服务查询_D/XX/"
+
+    def test_full_message_at_bot_plain_openid_unknown_fallback(self):
+        """线上真实缺口回归：全量消息里 @机器人 写成纯 <@botid>（无 ! 无 //），
+        且 bot_openid 还没取到（/_users/@me 失败 / 时机未到）。旧代码宽匹配只认
+        <@!>/<@//>，这种形态漏掉 → at_me 不亮 → @机器人 监控 静默。监控类指令 +
+        含 <@> 占位的兜底要保证仍能触发，并回「我的监控」卡片。"""
+        self.bot.bot_openid = ""
+        self.bot.bot_name = ""
+        pkt = {"op": 0, "t": "GROUP_MESSAGE_CREATE",
+               "d": {"group_openid": "G1", "id": "M1",
+                     "content": "<@9700B570215F656CE30231EE174ED3C1> 监控",
+                     "author": {"member_openid": "MO9", "user_openid": "",
+                                "username": "阿明"}}}
+        self.bot._on_event(None, pkt, "TOK")
+        self.assertGreaterEqual(len(self.calls), 1, "纯<@botid>占位 + 监控指令 必须回卡片")
+        # 应回「我的监控」卡片（没订阅时如实写「你还没有开启任何监控」）。
+        # 出图时卡片会被拆成「图片 + 文字」两条，所以只要任一调用含该正文即可。
+        joined = "\n".join(c[2] for c in self.calls)
+        self.assertIn("你还没有开启任何监控", joined)
+
+    def test_full_message_at_bot_env_nickname_fallback(self):
+        """bot_name 没从 @me 拿到、但 WM_QQ_BOT_NAME 配了昵称：明文 @昵称 也要认出 at_me。"""
+        self.bot.bot_openid = ""
+        self.bot.bot_name = "自动化服务查询_D/XX/"
         self.bot._on_event(None, self._pkt_group_full(
             "@自动化服务查询_D/XX/ 监控"), "TOK")
         self.assertEqual(len(self.calls), 1)

@@ -1149,22 +1149,28 @@ class OfficialBot:
                 if precise or _text_mentions_bot(raw, self.bot_name):
                     ctx.pop("full_message", None)
             else:
-                # 兜底：全量模式下，若消息以「@某人」开头、剥掉 @ 后正好是「监控 /
-                # 停止监控」这类机器人控制指令，多半就是「@机器人 监控」之类——宁可误收
-                # 一条，也不能让用户「@ 了没反应」。只限监控类指令（不扩展到警报/平原
-                # 等查询词），避免群里普通聊天被误触发；不清除 full_message（不 @ 回普通人）。
-                if (raw or "").lstrip().startswith("@"):
-                    body_after_at = re.sub(r"^\s*@\S+\s*", "", text or "").strip()
-                    if (body_after_at.startswith("监控")
-                            or body_after_at.startswith("monitor")
-                            or body_after_at.startswith("停止监控")
-                            or body_after_at.startswith("取消监控")
+                # 兜底：全量模式下，消息里带任意 @ 标记（官方 <@...> 占位符 或 开头明文
+                # @昵称），剥掉 @ 后正好是「监控 / 停止监控」这类机器人控制指令，多半就是
+                # 「@机器人 监控」之类——宁可误收一条，也不能让用户「@ 了没反应」。
+                # 只限监控/停止类控制指令，且【必须有 @ 标记】才点亮，确保群里没人 @
+                # 直接发「监控 警报」仍静默、不会被误触发；不清除 full_message（不 @ 回普通人）。
+                # 注意：<@...> 占位符各种形态（<@id>/<@!id>/<@//id/>）都算「有 @ 标记」，
+                # 之前只认字面 @昵称 导致纯占位符形态漏判，@机器人 监控 直接静默。
+                has_at = bool(re.search(r"<@[^>]*>", raw or "")) \
+                    or (raw or "").lstrip().startswith(("@", "＠"))
+                if has_at:
+                    body_after_at = re.sub(
+                        r"^\s*(<@[^>]*>\s*|@[^\s＠]{1,32}\s*)", "",
+                        (raw or "")).strip()
+                    if (body_after_at.startswith(("监控", "monitor", "停止监控",
+                                                 "取消监控", "停止", "取消"))
                             or body_after_at in ("监控", "监控全部", "监控所有",
                                                  "停止监控", "取消监控",
                                                  "停止全部监控", "取消全部监控",
                                                  "主推状态")):
                         ctx["at_me"] = True
-                        flog(f"兜底点亮 at_me（监控类指令 + 字面@）: raw={raw!r} text={text!r}")
+                        flog(f"兜底点亮 at_me（控制类指令 + 含@）: raw={raw!r} "
+                             f"text={text!r} body={body_after_at!r}")
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")
