@@ -562,6 +562,29 @@ class TestOnEvent(unittest.TestCase):
         self.assertTrue(qq_official._is_at_bot("<@!%s> 监控" % bid, bid, ""))
         self.assertTrue(qq_official._is_at_bot("<@//%s/> 监控" % bid, bid, ""))
 
+    def test_full_message_at_bot_literal_nickname_unknown_identity(self):
+        """线上故障回归：全量模式里 @机器人 是明文「@昵称」，而 bot_openid / bot_name
+        都没拿到（/_users/@me 失败 / 时机未到）——旧的昵称兜底直接失效，免前缀的监控
+        指令被当闲聊静默（@ 了没反应）。监控类指令 + 含@ 的兜底要保证仍能触发。"""
+        self.bot.bot_openid = ""
+        self.bot.bot_name = ""
+        for content in ("@自动化服务查询_D/XX/ 监控",
+                        "@自动化服务查询_D/XX/ 监控全部",
+                        "@自动化服务查询_D/XX/ 监控警报"):
+            self.calls = []
+            self.bot._on_event(None, self._pkt_group_full(content), "TOK")
+            self.assertEqual(len(self.calls), 1, content)
+            self.assertIn("监控", self.calls[0][2])
+
+    def test_full_message_at_bot_env_nickname_fallback(self):
+        """bot_name 没从 @me 拿到、但 WM_QQ_BOT_NAME 配了昵称：明文 @昵称 也要认出 at_me。"""
+        self.bot.bot_openid = ""
+        self.bot.bot_name = "自动化服务查询_D/XX/"
+        self.bot._on_event(None, self._pkt_group_full(
+            "@自动化服务查询_D/XX/ 监控"), "TOK")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("监控", self.calls[0][2])
+
     def test_fetch_self_fills_bot_name(self):
         """GET /users/@me 的 username 就是群里显示的昵称；只试一次。"""
         orig = qq_official._api_get

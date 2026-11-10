@@ -599,10 +599,16 @@ def _is_at_bot(raw, bot_openid, bot_name):
       id 与机器人 id 不同）；bot_openid 未知才退到宽匹配 + 明文昵称兜底。
     """
     raw = raw or ""
-    if bot_openid and re.search(r"<@!?/?%s!?/?>" % re.escape(bot_openid), raw):
+    # 1) 已知自身 openid：精确比对，[<@ 与 >] 之间任意装饰（! / // / 单斜杠 / 无装饰）
+    #    都认；只认机器人自身 openid，绝不误判 @普通成员（成员 id 与机器人不同）。
+    #    覆盖 <@id> / <@!id> / <@//id/> / <@/id/> 等所有形态。
+    if bot_openid and re.search(r"<@[^>]*%s[^>]*>" % re.escape(bot_openid), raw):
         return True
+    # 2) 宽匹配：官方 @机器人 占位形态（<@!id> / <@//id/>）；不含纯 <@id>（那是 @成员），
+    #    避免把「@普通成员」误当「@机器人」去 @ 回。
     if _BOT_MENTION_RE.search(raw):
         return True
+    # 3) 明文昵称 @（有的客户端 / 全量消息把「@机器人」发成纯文字「@昵称」）
     if _text_mentions_bot(raw, bot_name):
         return True
     return False
@@ -671,9 +677,11 @@ class OfficialBot:
         self._reply_queues = {}
         self._reply_threads = {}
         self._reply_qlock = threading.Lock()
-        # 机器人自己的名字（GET /users/@me 自动取）；有的客户端把「@机器人」发成
-        # 明文「@昵称」而不是占位符，没有它就没法判断「@ 的是不是我」。
-        self.bot_name = ""
+        # 机器人自己的名字（GET /users/@me 自动取，失败再用 WM_QQ_BOT_NAME 兜底）；
+        # 有的客户端把「@机器人」发成明文「@昵称」而不是占位符，没有它就没法判断
+        # 「@ 的是不是我」。WM_QQ_BOT_NAME 让用户显式写死昵称，避免 @me 接口抽风时
+        # 明文 @机器人 认不出来、免前缀指令静默（线上「@ 了没反应」的根因之一）。
+        self.bot_name = os.environ.get("WM_QQ_BOT_NAME", "") or ""
         # 自身 openid（READY.user.id / /users/@me.id）：全量消息里「@机器人」还会
         # 写成不带叹号的 <@openid>，只能靠它精确比对，别把 @普通成员也当成 @我。
         self.bot_openid = ""
@@ -878,7 +886,10 @@ class OfficialBot:
         接口不可用（老应用 / 权限不足）也不报错，继续用 `<@!openid>` 占位符与
         WM_QQ_BOT_NAME 判定，不影响正常收发。
         """
-        if self.bot_name or self._self_tries >= 3:
+        # 两个身份都拿到了才跳过；只拿到昵称（如来自 WM_QQ_BOT_NAME）时仍要
+        # 去 /users/@me 取 openid（精确比对 @机器人 / @ 回去都靠它）。
+        # 已失败满 3 次（或测试里显式置 3）也跳过，避免反复打接口。
+        if (self.bot_openid and self.bot_name) or self._self_tries >= 3:
             return
         self._self_tries += 1
         ok, info = _api_get(token, self.appid, self.api_base, "/users/@me")
@@ -1134,9 +1145,26 @@ class OfficialBot:
                 ctx["at_me"] = True
                 bot_id = self.bot_openid or ""
                 precise = bool(bot_id
-                               and re.search(r"<@!?/?%s!?/?>" % re.escape(bot_id), raw or ""))
+                               and re.search(r"<@[^>]*%s[^>]*>" % re.escape(bot_id), raw or ""))
                 if precise or _text_mentions_bot(raw, self.bot_name):
                     ctx.pop("full_message", None)
+            else:
+                # 兜底：全量模式下，若消息以「@某人」开头、剥掉 @ 后正好是「监控 /
+                # 停止监控」这类机器人控制指令，多半就是「@机器人 监控」之类——宁可误收
+                # 一条，也不能让用户「@ 了没反应」。只限监控类指令（不扩展到警报/平原
+                # 等查询词），避免群里普通聊天被误触发；不清除 full_message（不 @ 回普通人）。
+                if (raw or "").lstrip().startswith("@"):
+                    body_after_at = re.sub(r"^\s*@\S+\s*", "", text or "").strip()
+                    if (body_after_at.startswith("监控")
+                            or body_after_at.startswith("monitor")
+                            or body_after_at.startswith("停止监控")
+                            or body_after_at.startswith("取消监控")
+                            or body_after_at in ("监控", "监控全部", "监控所有",
+                                                 "停止监控", "取消监控",
+                                                 "停止全部监控", "取消全部监控",
+                                                 "主推状态")):
+                        ctx["at_me"] = True
+                        flog(f"兜底点亮 at_me（监控类指令 + 字面@）: raw={raw!r} text={text!r}")
             self._dispatch_reply(token, "group", group_openid, text, ctx, msg_id)
         elif t == "C2C_MESSAGE_CREATE":
             raw = d.get("content", "")
