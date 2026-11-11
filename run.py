@@ -38,8 +38,14 @@ BOT_DATA_DIR = HERE / "wm-bot" / "python" / "data"
 BOT_CONFIG = BOT_DATA_DIR / "config.txt"
 DEFAULT_RUNTIME_FILES = (
     "ws_switches.json", "ws_filters.json", "ws_at_users.json",
-    "ws_subs.json", "ws_last_sent.json",
+    "ws_subs.json",
 )
+# 注意：ws_last_sent.json（按栏目去重记录）【不能】进同步列表。
+# 它是每台设备的本地运行态（bot 每次成功推送后落盘、重启后恢复），
+# 含时间戳、每次推送都会变；一旦被 updater 推上私有库，私有库数据指纹随之
+# 变化，run.py 每轮轮询发现「数据更新」就停服重启 bot，并把私有库那份空/旧的
+# 覆盖回本地 → 去重记录被清空 → 静态内容（如虚空商人）被当成「从没发过」反复重发。
+# 同理 ws_seen_priority.json（主推基线）也属本地态，暂保留同步但需注意同样风险。
 # 运行记录类（纯文本、条目可增删）：本地优先，同时备份到私有库 data/ 下，本地丢了能恢复。
 DEFAULT_RUNTIME_TEXT_FILES = ("groups.txt",)
 

@@ -12,8 +12,7 @@
         "ws_switches.json",
         "ws_filters.json",
         "ws_at_users.json",
-        "ws_subs.json",
-        "ws_last_sent.json"
+        "ws_subs.json"
       ],
       "runtime_text_files": [
         "groups.txt"
